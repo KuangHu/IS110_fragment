@@ -1,0 +1,6 @@
+*.out
+*.err
+*.png
+__pycache__/
+data/
+.claude/
