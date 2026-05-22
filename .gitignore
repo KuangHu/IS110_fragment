@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.ipynb_checkpoints/
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*~
+
+# Run outputs (these go to /global/scratch, not in repo)
+*.paf
+*.fa.fai
+out/
+out_*/
+runs/
+results/
+output*/
+
+# Logs
+*.log
+slurm-*.out
+slurm-*.err
+*_%j.out
+*_%j.err

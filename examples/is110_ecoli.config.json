@@ -1,0 +1,17 @@
+{
+  "_description": "Original IS110 in E. coli — replicates the records_final dataset",
+  "hmm_profiles": [
+    "hmm/PF01548.hmm",
+    "hmm/PF02371.hmm"
+  ],
+  "require_all_domains": true,
+  "genome_db": "/global/scratch/users/kh36969/empty_filled_pilot/ncbi_ecoli_db.fa",
+  "source_db": "/global/scratch/users/kh36969/empty_filled_pilot/ncbi_ecoli_db.fa",
+  "anchor_distances_bp": [1000, 5000, 20000, 40000, 80000],
+  "anchor_length_bp": 500,
+  "min_identity_pct": 95,
+  "min_coverage_pct": 80,
+  "histogram_bin_bp": 50,
+  "expected_is_size_range": [800, 200000],
+  "threads": 32
+}
