@@ -326,18 +326,31 @@ def main():
                for sid, seq in is_seqs.items()}
     print(f"  dinuc-shuffle controls: {len(shuffle):,}", file=sys.stderr)
 
-    # Write FASTAs
-    fastas = {
-        "IS":      (is_seqs, os.path.join(args.out, "test.fa")),
-        "genomic": (genomic, os.path.join(args.out, "control_genomic.fa")),
-        "shuffle": (shuffle, os.path.join(args.out, "control_shuffle.fa")),
-    }
-    for _set, (seqs, path) in fastas.items():
-        write_fasta(path, seqs)
+    # Write FASTAs with tool-safe integer IDs. ULTRA truncates sequence names at
+    # '|' (and our ref_ids contain '|'), which silently zeroed all ULTRA lookups;
+    # using safe IDs and mapping back fixes it for any caller's name quirks.
+    orig_sets = {"IS": is_seqs, "genomic": genomic, "shuffle": shuffle}
+    prefixes = {"IS": "i", "genomic": "g", "shuffle": "s"}
+    pathnames = {"IS": "test.fa", "genomic": "control_genomic.fa",
+                 "shuffle": "control_shuffle.fa"}
+    safe_seqs_by_set = {}   # setname -> {safe_id: seq}
+    safe2orig_by_set = {}   # setname -> {safe_id: orig_id}
+    fastas = {}             # setname -> fasta path
+    for setname, seqs in orig_sets.items():
+        safe, s2o = {}, {}
+        for i, (orig, seq) in enumerate(seqs.items()):
+            sid = f"{prefixes[setname]}{i}"
+            safe[sid] = seq
+            s2o[sid] = orig
+        safe_seqs_by_set[setname] = safe
+        safe2orig_by_set[setname] = s2o
+        path = os.path.join(args.out, pathnames[setname])
+        fastas[setname] = path
+        write_fasta(path, safe)
 
     mlp = args.min_large_period
 
-    def build_rows(seqs, trf_hits, ultra_hits, setname):
+    def build_rows(seqs, trf_hits, ultra_hits, setname, s2o):
         rows = []
         for sid, seq in seqs.items():
             L = len(seq)
@@ -346,7 +359,7 @@ def main():
             ul_all = covered_bp(ultra_hits.get(sid, []), 0)
             ul_lg = covered_bp(ultra_hits.get(sid, []), mlp)
             rows.append({
-                "seq_id": sid, "set": setname, "length": L,
+                "seq_id": s2o.get(sid, sid), "set": setname, "length": L,
                 "trf_density_all": trf_all / L, "trf_density_large": trf_lg / L,
                 "ultra_density_all": ul_all / L, "ultra_density_large": ul_lg / L,
                 "both_present_all": (trf_all > 0 and ul_all > 0),
@@ -354,9 +367,11 @@ def main():
             })
         return rows
 
-    # Run both callers on each set
+    # Run both callers on each set (keyed by safe IDs)
     rows_by_set = {}
-    for setname, (seqs, path) in fastas.items():
+    for setname in ("IS", "genomic", "shuffle"):
+        seqs = safe_seqs_by_set[setname]
+        path = fastas[setname]
         if not seqs:
             rows_by_set[setname] = []
             continue
@@ -366,7 +381,8 @@ def main():
         ultra_hits = run_ultra(args.ultra, path,
                                os.path.join(args.out, f"ultra_{setname}.tsv"),
                                threads=args.threads)
-        rows_by_set[setname] = build_rows(seqs, trf_hits, ultra_hits, setname)
+        rows_by_set[setname] = build_rows(seqs, trf_hits, ultra_hits, setname,
+                                          safe2orig_by_set[setname])
 
     test_rows = rows_by_set["IS"]
 

@@ -175,15 +175,20 @@ def main():
 
     proteins_faa = os.path.join(work_dir, "proteins.faa")
     proteins_gff = os.path.join(work_dir, "proteins.gff")
+    orf_done_marker = os.path.join(work_dir, ".orf_complete")
 
-    # Step 1: ORFs (with cache: skip if both .faa and .gff exist and are non-empty)
+    # Step 1: ORFs. Cache only if a completion MARKER exists — a partial/killed
+    # pyrodigal leaves a non-empty proteins.faa that would otherwise be mistaken
+    # for a finished run (this silently truncated a 2.3M-contig DB to 15K once).
     if not args.skip_orf:
-        faa_done = os.path.exists(proteins_faa) and os.path.getsize(proteins_faa) > 0
-        gff_done = os.path.exists(proteins_gff) and os.path.getsize(proteins_gff) > 0
-        if faa_done and gff_done:
-            print(f"Step 1: cached ORF outputs found, skipping pyrodigal.",
-                  file=sys.stderr, flush=True)
+        if os.path.exists(orf_done_marker) and os.path.getsize(proteins_faa) > 0:
+            print(f"Step 1: completed ORF outputs found (marker present), "
+                  f"skipping pyrodigal.", file=sys.stderr, flush=True)
         else:
+            if os.path.exists(proteins_faa):
+                print(f"Step 1: existing proteins.faa has no completion marker "
+                      f"(partial/stale) — rerunning pyrodigal.", file=sys.stderr,
+                      flush=True)
             print(f"Step 1: ORF prediction ({args.orf_caller})...", file=sys.stderr)
             if args.orf_caller == "pyrodigal":
                 run_orfs_pyrodigal(args.db, proteins_faa, proteins_gff, args.threads)
@@ -191,6 +196,8 @@ def main():
                 cmd = ["prodigal", "-p", "meta", "-i", args.db,
                        "-a", proteins_faa, "-o", proteins_gff, "-f", "gff"]
                 subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
+            # mark completion only after the ORF caller returns successfully
+            open(orf_done_marker, "w").close()
 
     # Step 1b: filter proteins for hmmsearch (drop sequences > --max-protein-len)
     # hmmsearch hard-rejects sequences > 100K aa; we use a tighter threshold by default.
