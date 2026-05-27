@@ -24,9 +24,11 @@ import argparse
 import json
 import os
 import re
-import subprocess
 import sys
 from collections import defaultdict
+from multiprocessing import Pool
+
+import pysam
 
 
 def parse_args():
@@ -48,6 +50,8 @@ def parse_args():
     p.add_argument("--flank-out-len", type=int, default=5000)
     p.add_argument("--min-identity", type=float, default=95)
     p.add_argument("--min-coverage", type=float, default=80)
+    p.add_argument("--threads", type=int, default=32,
+                   help="Number of worker processes for sequence extraction (default 32)")
     return p.parse_args()
 
 
@@ -56,6 +60,135 @@ ANCHOR_RE = re.compile(r"^(.+)__(up|down)(\d+)$")
 
 def revcomp(seq):
     return seq.translate(str.maketrans("ACGTNacgtn", "TGCANtgcan"))[::-1]
+
+
+# ---- multiprocessing worker for parallel record build ----------------------
+_FA = None  # per-worker pysam.FastaFile handle
+
+
+def _worker_init(genome_db):
+    """Open the indexed FASTA once per worker process (not fork-safe to share)."""
+    global _FA
+    _FA = pysam.FastaFile(genome_db)
+
+
+def _fetch(contig, start_0, end_0):
+    """Fetch [start_0, end_0) from pysam handle; return uppercase or None."""
+    if end_0 <= start_0:
+        return ""
+    try:
+        seq = _FA.fetch(contig, max(0, start_0), end_0)
+    except (KeyError, ValueError):
+        return None
+    return seq.upper() if seq else None
+
+
+def _build_one_record(packed):
+    """Build a single IS record. Returns tuple or None on failure."""
+    (ref_id, info, best, src), genome_db, flank_out_len, top_empty_n, db_label = packed
+
+    # Compute IS size
+    if best["v0_peak"] and best["empty_peak"]:
+        is_length = best["v0_peak"][0] - best["empty_peak"][0]
+    elif best["empty_peak"]:
+        is_length = best["expected_v0"] - best["empty_peak"][0]
+    else:
+        is_length = info["tnp_len"]
+
+    ext_per_side = (is_length - info["tnp_len"]) // 2
+    boundary_5p_offset = -ext_per_side
+    boundary_3p_offset = is_length - info["tnp_len"] - ext_per_side
+
+    # Need full contig length to clamp; pysam provides .get_reference_length
+    try:
+        contig_len = _FA.get_reference_length(src["contig"])
+    except (KeyError, ValueError):
+        return None
+
+    tnp_start_0 = src["start"] - 1
+    tnp_end_0 = src["end"]
+    is_start_0 = max(0, tnp_start_0 + boundary_5p_offset)
+    is_end_0 = min(contig_len, tnp_end_0 + boundary_3p_offset)
+
+    up_flank_start = max(0, is_start_0 - flank_out_len)
+    up_flank_end = is_start_0
+    down_flank_start = is_end_0
+    down_flank_end = min(contig_len, is_end_0 + flank_out_len)
+
+    tnp_seq = _fetch(src["contig"], tnp_start_0, tnp_end_0)
+    is_seq = _fetch(src["contig"], is_start_0, is_end_0)
+    up_seq = _fetch(src["contig"], up_flank_start, up_flank_end)
+    down_seq = _fetch(src["contig"], down_flank_start, down_flank_end)
+    if tnp_seq is None or is_seq is None or up_seq is None or down_seq is None:
+        return None
+
+    if src["strand"] == "-":
+        tnp_seq = revcomp(tnp_seq)
+        is_seq = revcomp(is_seq)
+        up_seq, down_seq = revcomp(down_seq), revcomp(up_seq)
+
+    empty_obs_sorted = sorted(best["empty_obs"], key=lambda x: -x["mean_ident"])
+    top_empty = empty_obs_sorted[:top_empty_n]
+
+    # Empty junction sequences
+    empties_out = []
+    for i, eo in enumerate(top_empty):
+        target = eo.get("tname") or eo.get("contig")
+        if not target:
+            continue
+        if eo["strand"] == "+":
+            junction = _fetch(target, eo["up_te"], eo["down_ts"])
+        else:
+            raw = _fetch(target, eo["down_te"], eo["up_ts"])
+            junction = revcomp(raw) if raw else None
+        if junction:
+            eo["junction_sequence"] = junction
+            eo["junction_length"] = len(junction)
+            tag = eo.get("assembly") or target or "x"
+            empties_out.append((f"{ref_id}__empty{i}_{tag}", junction))
+
+    record = {
+        "ref_id": ref_id,
+        "source": {
+            "assembly": src["assembly"], "contig": src["contig"],
+            "transposase_start": src["start"], "transposase_end": src["end"],
+            "transposase_strand": src["strand"],
+        },
+        "is_element": {
+            "length": is_end_0 - is_start_0,
+            "start_offset_5p": boundary_5p_offset,
+            "end_offset_3p": boundary_3p_offset,
+            "source_start": is_start_0 + 1, "source_end": is_end_0,
+            "sequence": is_seq,
+        },
+        "transposase_cds": {"length": len(tnp_seq), "sequence": tnp_seq},
+        "upstream_flank": {"length": len(up_seq), "sequence": up_seq},
+        "downstream_flank": {"length": len(down_seq), "sequence": down_seq},
+        "boundary_evidence": {
+            "method": "empty_vs_filled",
+            "source_db": db_label,
+            "anchor_distance_D": best["D"],
+            "v0_peak_distance": best["v0_peak"][0] if best["v0_peak"] else None,
+            "v0_peak_count": best["v0_peak"][1] if best["v0_peak"] else 0,
+            "empty_peak_distance": best["empty_peak"][0] if best["empty_peak"] else None,
+            "empty_peak_count": best["empty_peak"][1] if best["empty_peak"] else 0,
+            "is_element_length_inferred": is_length,
+            "n_v0_observations": len(best["v0_obs"]),
+            "n_empty_observations": len(best["empty_obs"]),
+            "n_v1plus_observations": len(best["v1plus_obs"]),
+            "n_top_empty_kept": len(top_empty),
+        },
+        "filled_observations": [
+            {k: v for k, v in p.items() if k != "tname"} for p in best["v0_obs"][:50]
+        ],
+        "empty_observations": [
+            {k: v for k, v in p.items() if k != "tname"} for p in top_empty
+        ],
+        "v1plus_observations": [
+            {k: v for k, v in p.items() if k != "tname"} for p in best["v1plus_obs"][:50]
+        ],
+    }
+    return (record, is_seq, tnp_seq, up_seq, down_seq, empties_out)
 
 
 def load_fasta_index(fna):
@@ -280,36 +413,27 @@ def main():
     print(f"  PAF: {n_total:,} rows, {n_kept:,} kept", file=sys.stderr)
     logan_hits = {}  # legacy compatibility; unused with single-DB design
 
-    # Single indexed FASTA lookup via samtools faidx (cached per contig)
-    seq_cache = {}
+    # Build records — parallelize per-ref using pysam (in-process FASTA reads)
+    n_done = n_neither = 0
+    db_label = os.path.basename(args.genome_db)
 
-    def get_contig_seq(contig):
-        if contig in seq_cache:
-            return seq_cache[contig]
-        res = subprocess.run(["samtools", "faidx", args.genome_db, contig],
-                             capture_output=True, text=True)
-        if res.returncode != 0:
-            seq_cache[contig] = None
-            return None
-        seq = "".join(line.strip() for line in res.stdout.split("\n")
-                      if line and not line.startswith(">")).upper()
-        seq_cache[contig] = seq
-        return seq
+    # Pre-filter refs to those with a valid pick (cheap; no FASTA I/O)
+    work_items = []
+    for ref_id, info in ref_info.items():
+        best = pick_best_d(ncbi_hits, ref_id, info, distances)
+        if not best:
+            n_neither += 1
+            continue
+        src = source_positions.get(ref_id)
+        if not src:
+            continue
+        n_done += 1
+        work_items.append((ref_id, info, best, src))
 
-    def get_target_seq(contig, start_0, end_0):
-        """Fetch [start_0, end_0) from genome_db (0-based half-open)."""
-        if end_0 <= start_0:
-            return ""
-        region = f"{contig}:{max(1, start_0 + 1)}-{end_0}"
-        res = subprocess.run(["samtools", "faidx", args.genome_db, region],
-                             capture_output=True, text=True)
-        if res.returncode != 0:
-            return None
-        seq = "".join(line.strip() for line in res.stdout.split("\n")
-                      if line and not line.startswith(">")).upper()
-        return seq
+    print(f"  Refs to process: {len(work_items):,} (skipped {n_neither:,} with no usable D)",
+          file=sys.stderr, flush=True)
 
-    # Build records
+    # Worker pool: each worker opens its own pysam.FastaFile (not fork-safe to share)
     all_records = []
     is_elem_seqs = []
     tnp_seqs = []
@@ -317,129 +441,25 @@ def main():
     down_flank_seqs = []
     empty_junction_seqs = []
 
-    n_done = n_neither = 0
-    db_label = os.path.basename(args.genome_db)
-
-    for ref_id, info in ref_info.items():
-        best = pick_best_d(ncbi_hits, ref_id, info, distances)
-        source_db = db_label
-        if not best:
-            n_neither += 1
-            continue
-        n_done += 1
-
-        # Compute IS110 size
-        if best["v0_peak"] and best["empty_peak"]:
-            is110_length = best["v0_peak"][0] - best["empty_peak"][0]
-        elif best["empty_peak"]:
-            is110_length = best["expected_v0"] - best["empty_peak"][0]
-        else:
-            is110_length = info["tnp_len"]
-
-        ext_per_side = (is110_length - info["tnp_len"]) // 2
-        boundary_5p_offset = -ext_per_side
-        boundary_3p_offset = is110_length - info["tnp_len"] - ext_per_side
-
-        # Extract source sequences
-        src = source_positions.get(ref_id)
-        if not src:
-            continue
-        contig_seq = get_contig_seq(src["contig"])
-        if not contig_seq:
-            continue
-
-        tnp_start_0 = src["start"] - 1
-        tnp_end_0 = src["end"]
-        is_start_0 = max(0, tnp_start_0 + boundary_5p_offset)
-        is_end_0 = min(len(contig_seq), tnp_end_0 + boundary_3p_offset)
-
-        up_flank_start = max(0, is_start_0 - args.flank_out_len)
-        up_flank_end = is_start_0
-        down_flank_start = is_end_0
-        down_flank_end = min(len(contig_seq), is_end_0 + args.flank_out_len)
-
-        tnp_seq = contig_seq[tnp_start_0:tnp_end_0]
-        is_seq = contig_seq[is_start_0:is_end_0]
-        up_flank_seq = contig_seq[up_flank_start:up_flank_end]
-        down_flank_seq = contig_seq[down_flank_start:down_flank_end]
-
-        if src["strand"] == "-":
-            tnp_seq = revcomp(tnp_seq)
-            is_seq = revcomp(is_seq)
-            up_flank_seq, down_flank_seq = revcomp(down_flank_seq), revcomp(up_flank_seq)
-
-        # Top-N empty observations by mean identity
-        empty_obs_sorted = sorted(best["empty_obs"], key=lambda x: -x["mean_ident"])
-        top_empty = empty_obs_sorted[:args.top_empty]
-
-        # Extract empty junction sequences (single-DB via samtools faidx)
-        for eo in top_empty:
-            junction = None
-            target = eo.get("tname") or eo.get("contig")
-            if not target:
+    pool_args = [(item, args.genome_db, args.flank_out_len, args.top_empty, db_label)
+                 for item in work_items]
+    with Pool(args.threads, initializer=_worker_init,
+              initargs=(args.genome_db,)) as pool:
+        for i, packed in enumerate(pool.imap_unordered(_build_one_record, pool_args,
+                                                       chunksize=8)):
+            if i % 1000 == 0:
+                print(f"    built {i:,}/{len(pool_args):,}", file=sys.stderr, flush=True)
+            if packed is None:
                 continue
-            if eo["strand"] == "+":
-                junction = get_target_seq(target, eo["up_te"], eo["down_ts"])
-            else:
-                raw = get_target_seq(target, eo["down_te"], eo["up_ts"])
-                junction = revcomp(raw) if raw else None
-            if junction:
-                eo["junction_sequence"] = junction
-                eo["junction_length"] = len(junction)
-
-        record = {
-            "ref_id": ref_id,
-            "source": {
-                "assembly": src["assembly"], "contig": src["contig"],
-                "transposase_start": src["start"], "transposase_end": src["end"],
-                "transposase_strand": src["strand"],
-            },
-            "is_element": {
-                "length": is_end_0 - is_start_0,
-                "start_offset_5p": boundary_5p_offset,
-                "end_offset_3p": boundary_3p_offset,
-                "source_start": is_start_0 + 1, "source_end": is_end_0,
-                "sequence": is_seq,
-            },
-            "transposase_cds": {"length": len(tnp_seq), "sequence": tnp_seq},
-            "upstream_flank": {"length": len(up_flank_seq), "sequence": up_flank_seq},
-            "downstream_flank": {"length": len(down_flank_seq), "sequence": down_flank_seq},
-            "boundary_evidence": {
-                "method": "empty_vs_filled",
-                "source_db": source_db,
-                "anchor_distance_D": best["D"],
-                "v0_peak_distance": best["v0_peak"][0] if best["v0_peak"] else None,
-                "v0_peak_count": best["v0_peak"][1] if best["v0_peak"] else 0,
-                "empty_peak_distance": best["empty_peak"][0] if best["empty_peak"] else None,
-                "empty_peak_count": best["empty_peak"][1] if best["empty_peak"] else 0,
-                "is_element_length_inferred": is110_length,
-                "n_v0_observations": len(best["v0_obs"]),
-                "n_empty_observations": len(best["empty_obs"]),
-                "n_v1plus_observations": len(best["v1plus_obs"]),
-                "n_top_empty_kept": len(top_empty),
-            },
-            "filled_observations": [
-                {k: v for k, v in p.items() if k != "tname"} for p in best["v0_obs"][:50]
-            ],
-            "empty_observations": [
-                {k: v for k, v in p.items() if k != "tname"} for p in top_empty
-            ],
-            "v1plus_observations": [
-                {k: v for k, v in p.items() if k != "tname"} for p in best["v1plus_obs"][:50]
-            ],
-        }
-
-        all_records.append(record)
-        is_elem_seqs.append((ref_id, is_seq))
-        tnp_seqs.append((ref_id, tnp_seq))
-        up_flank_seqs.append((ref_id, up_flank_seq))
-        down_flank_seqs.append((ref_id, down_flank_seq))
-        for i, eo in enumerate(top_empty):
-            if "junction_sequence" in eo:
-                tag = eo.get("assembly") or eo.get("tname") or "x"
-                empty_junction_seqs.append(
-                    (f"{ref_id}__empty{i}_{tag}", eo["junction_sequence"])
-                )
+            record, is_seq, tnp_seq, up_seq, down_seq, empties = packed
+            all_records.append(record)
+            ref_id = record["ref_id"]
+            is_elem_seqs.append((ref_id, is_seq))
+            tnp_seqs.append((ref_id, tnp_seq))
+            up_flank_seqs.append((ref_id, up_seq))
+            down_flank_seqs.append((ref_id, down_seq))
+            for tag, seq in empties:
+                empty_junction_seqs.append((tag, seq))
 
     # Write outputs
     json_path = os.path.join(args.out, "records.json")

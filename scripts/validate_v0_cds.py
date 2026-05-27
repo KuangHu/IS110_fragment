@@ -40,28 +40,47 @@ def main():
     with open(args.records) as f:
         records = json.load(f)
 
-    # Build dict: is110_id -> {tnp_start_in_v_ref, tnp_end_in_v_ref, v_ref_len, strand}
-    # Need to convert genomic CDS coords to V_ref-internal coords
+    # Build dict: v1_id -> {tnp_start_in_v_ref, tnp_end_in_v_ref, v_ref_len}
+    # Two record schemas supported:
+    #   (A) records_final/records.json: source.{is_element, transposase_cds} with genomic coords
+    #   (B) build_records.py (Cross_reference_IS Stage 6): top-level is_element + transposase_cds
     tnp_pos = {}
     for r in records:
-        v1_id = r["is110_id"]
-        src = r["source"]
-        is_elem = src["is_element"]
-        tnp = src["transposase_cds"]
-        is_start = is_elem["start"]
-        is_end = is_elem["end"]
-        is_len = is_elem["length"]
-        strand = is_elem["strand"]
-        tnp_start = tnp["start"]
-        tnp_end = tnp["end"]
-        # Convert to V_ref-internal coords (0-based half-open within V_ref)
-        # V_ref sequence in records.json is already strand-corrected
-        if strand == "+":
-            t_s_in_v = max(0, tnp_start - is_start)
-            t_e_in_v = min(is_len, tnp_end - is_start + 1)
+        v1_id = r.get("is110_id") or r.get("ref_id")
+        if not v1_id:
+            continue
+        src = r.get("source", {})
+        # is_element + transposase may be at top level OR under source
+        is_elem = src.get("is_element") or r.get("is_element") or {}
+        tnp = src.get("transposase_cds") or r.get("transposase_cds") or {}
+        if not is_elem or not tnp:
+            continue
+        is_len = is_elem.get("length", 0)
+        if is_len <= 0:
+            continue
+        # Schema A: is_element has start/end/strand (genomic), transposase has start/end (genomic)
+        if "start" in is_elem and "start" in tnp:
+            is_start = is_elem["start"]
+            is_end = is_elem.get("end", is_start + is_len)
+            strand = is_elem.get("strand", "+")
+            tnp_start = tnp["start"]
+            tnp_end = tnp["end"]
+            if strand == "+":
+                t_s_in_v = max(0, tnp_start - is_start)
+                t_e_in_v = min(is_len, tnp_end - is_start + 1)
+            else:
+                t_s_in_v = max(0, is_end - tnp_end)
+                t_e_in_v = min(is_len, is_end - tnp_start + 1)
         else:
-            t_s_in_v = max(0, is_end - tnp_end)
-            t_e_in_v = min(is_len, is_end - tnp_start + 1)
+            # Schema B: derive from start_offset_5p + transposase length
+            #   transposase sits at position [-start_offset_5p, -start_offset_5p + tnp_len]
+            #   in V_ref-internal coords (start_offset_5p is negative offset from tnp start)
+            off5 = is_elem.get("start_offset_5p", 0)
+            tnp_len = tnp.get("length", 0)
+            t_s_in_v = max(0, -off5)
+            t_e_in_v = min(is_len, t_s_in_v + tnp_len)
+        if t_e_in_v <= t_s_in_v:
+            continue
         tnp_pos[v1_id] = {
             "tnp_start_in_v_ref": t_s_in_v,
             "tnp_end_in_v_ref": t_e_in_v,

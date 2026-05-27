@@ -26,8 +26,8 @@ def parse_args():
     p.add_argument("--out", required=True, help="output directory")
     p.add_argument("--min-seq-len", type=int, default=1500,
                    help="Skip sequences shorter than this (default 1500)")
-    p.add_argument("--min-repeat-len", type=int, default=100,
-                   help="Min length of a tandem unit (default 100)")
+    p.add_argument("--min-repeat-len", type=int, default=50,
+                   help="Min length of a tandem unit (default 50)")
     p.add_argument("--min-identity", type=float, default=95,
                    help="Min alignment identity (default 95)")
     p.add_argument("--min-copies", type=int, default=2,
@@ -143,28 +143,42 @@ def main():
     with open(args.records) as f:
         records = json.load(f)
     for r in records:
-        seq = r["source"]["is_element"]["sequence"]
-        ie = r["source"]["is_element"]
-        tn = r["source"]["transposase_cds"]
-        strand = ie["strand"]
-        if strand == "+":
-            cs = max(0, tn["start"] - ie["start"])
-            ce = min(ie["length"], tn["end"] - ie["start"] + 1)
+        v1_id = r.get("is110_id") or r.get("ref_id")
+        if not v1_id: continue
+        src = r.get("source", {})
+        ie = src.get("is_element") or r.get("is_element") or {}
+        tn = src.get("transposase_cds") or r.get("transposase_cds") or {}
+        seq = ie.get("sequence", "")
+        is_len = ie.get("length", 0)
+        if "start" in ie and "start" in tn:
+            strand = ie.get("strand", "+")
+            if strand == "+":
+                cs = max(0, tn["start"] - ie["start"])
+                ce = min(is_len, tn["end"] - ie["start"] + 1)
+            else:
+                cs = max(0, ie["end"] - tn["end"])
+                ce = min(is_len, ie["end"] - tn["start"] + 1)
         else:
-            cs = max(0, ie["end"] - tn["end"])
-            ce = min(ie["length"], ie["end"] - tn["start"] + 1)
-        v_ref_cds[r["is110_id"]] = (cs, ce)
+            off5 = ie.get("start_offset_5p", 0)
+            tnp_len = tn.get("length", 0)
+            cs = max(0, -off5)
+            ce = min(is_len, cs + tnp_len)
+        v_ref_cds[v1_id] = (cs, ce)
         if not seq or len(seq) < args.min_seq_len: continue
-        seq_set[f"vref_{r['is110_id']}"] = {
+        seq_set[f"vref_{v1_id}"] = {
             "seq": seq, "len": len(seq),
-            "kind": "v_ref", "v1_parent": r["is110_id"],
-            "source_target": r["is110_id"],
+            "kind": "v_ref", "v1_parent": v1_id,
+            "source_target": v1_id,
             "cds_intervals": [(cs, ce)],
         }
 
     # Variant sequences (insertion + deletion). CDS mapped from V_ref via blocks.
-    with open(args.obs) as f:
-        obs = json.load(f)
+    if not os.path.exists(args.obs):
+        # No variants stage was run; only V_ref sequences available
+        obs = []
+    else:
+        with open(args.obs) as f:
+            obs = json.load(f)
     seen_vids = set()
     for o in obs:
         if o["category"] not in ("insertion", "deletion"): continue

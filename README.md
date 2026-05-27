@@ -169,6 +169,7 @@ Cross_reference_IS/
 │   ├── detect_tandem.py              — self-alignment tandem-repeat scan (Stage 10b)
 │   ├── viz_lineage.py                — per-lineage PNG/SVG (Stage 11)
 │   ├── viz_tandem.py                 — per-tandem PNG (Stage 11)
+│   ├── verify_tandem_enrichment.py   — verification: TRF+ULTRA tandem enrichment vs controls
 │   └── pipeline.py                   — full orchestration (Python API + CLI)
 ├── templates/
 │   ├── run_pipeline.sh               — SLURM submitter template
@@ -227,13 +228,69 @@ MUMmer installed and a per-assembly genome directory layout
 (`<genome_dir>/<assembly>/*_genomic.fna`) which is too project-specific to
 assume.
 
+## Verification modules
+
+The pipeline *discovers* events (rearrangements, tandem repeats); the
+verification modules *prove* them with independent gold-standard tools. Each
+discovery type has a matching verifier.
+
+### Rearrangements → `rearrangement_validator.py`
+Confirms Stage 7 inversion / translocation / duplication calls with MUMmer
+(`nucmer` + `show-diff`) and flags whether the breakpoint is IS-mediated. See the
+"Rearrangement detection" section above. (Roadmap: add a second caller — `syri`
+— so an event is confirmed only on agreement of two independent tools.)
+
+### Tandem repeats → `verify_tandem_enrichment.py`
+Tests the claim **"tandem repeats are enriched in IS elements vs normal DNA."**
+A single tandem call proves nothing — tandems occur in all DNA — so this module
+measures the *background rate* and asks whether IS elements exceed it.
+
+- **Two independent callers**: TRF (alignment-score model) + ULTRA (HMM model).
+  A sequence is counted tandem-positive only if **both** agree.
+- **Two null controls** per IS element:
+  - `genomic` — length-matched random windows from the same DB (excluding IS
+    loci). Tests enrichment over the genome at large (composition + mechanism).
+  - `shuffle` — dinucleotide-preserving shuffle of each IS (Altschul–Erikson;
+    identical 1-mer + 2-mer frequencies, scrambled order). Isolates a
+    **mechanistic** signal beyond base composition.
+- **Metrics**: per-sequence tandem density + presence, split into *any period*
+  and *large* (period ≥ 50 bp, the structural-duplication track).
+- **Statistics**: Fisher exact (presence → odds ratio), Mann-Whitney U (density),
+  label-permutation (10⁴×), reported as **fold-enrichment + p-values**.
+
+```bash
+python3 scripts/verify_tandem_enrichment.py \
+    --records my_run/records/records.json \
+    --genome-db genomes.fa \
+    --out my_run/tandem_verify/ \
+    --control-ratio 3 --min-large-period 50 --threads 16
+```
+
+Output: `tandem_verify/enrichment_report.txt` (+ `.json`, `per_sequence.tsv`).
+Interpretation: enriched vs **both** controls (especially `shuffle`) ⇒ the IS
+process itself generates tandem arrays beyond what sequence composition predicts.
+
 ## Required tools
 
+Core pipeline (Stages 1–11):
 - minimap2 ≥ 2.30
 - hmmer (hmmsearch)
 - samtools (with .fai index of DB)
-- prodigal or pyrodigal (for ORF calling when running HMM on raw genomes)
-- Python 3.8+ (no extra deps for core; matplotlib + pyGenomeViz optional for viz)
+- prodigal or pyrodigal (ORF calling for HMM on raw genomes)
+- **pysam** (in-process FASTA extraction in Stages 2 & 6 — required, not optional)
+- Python 3.8+; matplotlib + pyGenomeViz for visualisation (Stage 11)
+
+Verification modules (optional, run separately):
+- **TRF** + **ULTRA** — tandem callers for `verify_tandem_enrichment.py`
+- **scipy** + **numpy** — statistics for `verify_tandem_enrichment.py`
+- **MUMmer** (nucmer, show-diff) — for `rearrangement_validator.py`
+
+> **Performance note:** Stages 2 (extract_anchors) and 6 (build_records) use
+> `pysam` for in-process FASTA reads, parallelised across `--threads`. This is
+> essential at scale — the earlier per-record `samtools faidx` subprocess design
+> took >24 h on a 150 GB / 3 M-contig DB; pysam brings it to minutes. Stage 1
+> (`is_detect.py`) streams contigs to pyrodigal, caches `proteins.faa` on rerun,
+> and filters proteins > 10 kb aa before hmmsearch (hmmer rejects > 100 kb aa).
 
 ## Configuration
 

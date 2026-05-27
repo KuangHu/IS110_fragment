@@ -86,7 +86,8 @@ def find_is_boundaries(
                "--out", anchors_prefix,
                "--flank", str(flank),
                "--anchor-length", str(anchor_length),
-               "--distances", ",".join(str(d) for d in distances)]
+               "--distances", ",".join(str(d) for d in distances),
+               "--threads", str(threads)]
         print("=== Stage 2: anchor extraction ===", flush=True)
         subprocess.run(cmd, check=True)
 
@@ -136,7 +137,8 @@ def find_is_boundaries(
                "--genome-db", genome_db,
                "--out", records_dir,
                "--min-identity", str(min_identity),
-               "--min-coverage", str(min_coverage)]
+               "--min-coverage", str(min_coverage),
+               "--threads", str(threads)]
         print("=== Stage 6: build records ===", flush=True)
         subprocess.run(cmd, check=True)
 
@@ -165,7 +167,7 @@ def detect_growing_and_tandem(
     min_step_bp=10,           # in lineage, min length diff between adjacent steps
     cluster_id=0.99,          # cluster near-identical variants
     min_cds_coverage=95,      # V_0 must retain >=95% of V_ref's CDS to be valid
-    min_tandem_repeat_len=100,
+    min_tandem_repeat_len=50,
     min_tandem_copies=2,
     render_figures=True,
 ):
@@ -314,7 +316,7 @@ def main():
     p.add_argument("--min-step-bp", type=int, default=10)
     p.add_argument("--cluster-id", type=float, default=0.99)
     p.add_argument("--min-cds-coverage", type=float, default=95)
-    p.add_argument("--min-tandem-repeat-len", type=int, default=100)
+    p.add_argument("--min-tandem-repeat-len", type=int, default=50)
     p.add_argument("--min-tandem-copies", type=int, default=2)
     p.add_argument("--no-render-figures", action="store_true",
                    help="Skip the figure-rendering stage (Stage 11).")

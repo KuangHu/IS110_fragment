@@ -28,9 +28,11 @@ Usage:
 """
 import argparse
 import os
-import subprocess
 import sys
 from collections import defaultdict
+from multiprocessing import Pool
+
+import pysam
 
 
 def parse_args():
@@ -53,6 +55,8 @@ def parse_args():
                    help="Comma-separated distances from transposase edge")
     p.add_argument("--keep-ids", default="",
                    help="Optional FASTA whose headers list is_id values to keep")
+    p.add_argument("--threads", type=int, default=32,
+                   help="Worker processes for parallel extraction (default 32)")
     return p.parse_args()
 
 
@@ -60,28 +64,77 @@ def revcomp(seq):
     return seq.translate(str.maketrans("ACGTNacgtn", "TGCANtgcan"))[::-1]
 
 
-def extract_region(db_fa, contig, start_1, end_1):
-    """samtools faidx region (1-based inclusive). Returns uppercase string or None."""
-    region = f"{contig}:{max(1, start_1)}-{end_1}"
-    res = subprocess.run(["samtools", "faidx", db_fa, region],
-                         capture_output=True, text=True)
-    if res.returncode != 0:
+# ---- multiprocessing worker (pysam, in-process FASTA reads) ----------------
+_FA = None        # per-worker pysam.FastaFile
+_PARAMS = None    # per-worker (flank, anchor_length, distances)
+
+
+def _worker_init(genome_db, flank, anchor_length, distances):
+    global _FA, _PARAMS
+    _FA = pysam.FastaFile(genome_db)
+    _PARAMS = (flank, anchor_length, distances)
+
+
+def _extract_one(hit):
+    """hit = (is_id, contig, tnp_start_1, tnp_end_1, strand).
+    Returns (ref_record_str, anchors_str, table_row_str) or None (skipped)."""
+    is_id, contig, tnp_start, tnp_end, strand = hit
+    flank, anchor_length, distances = _PARAMS
+    tnp_len = tnp_end - tnp_start + 1
+
+    try:
+        clen = _FA.get_reference_length(contig)
+    except (KeyError, ValueError):
         return None
-    lines = res.stdout.split("\n")
-    return "".join(lines[1:]).strip().upper()
 
+    ref_start_1 = tnp_start - flank
+    ref_end_1 = tnp_end + flank
+    if ref_start_1 < 1 or ref_end_1 > clen:
+        return None
 
-def get_contig_length(db_fa, contig):
-    """Read .fai for contig length."""
-    fai = db_fa + ".fai"
-    if not os.path.exists(fai):
-        raise FileNotFoundError(f"FASTA index missing: {fai}. Run samtools faidx first.")
-    with open(fai) as f:
-        for line in f:
-            parts = line.split("\t")
-            if parts and parts[0] == contig:
-                return int(parts[1])
-    return None
+    # pysam.fetch is 0-based half-open: [start, end)
+    try:
+        ref_seq = _FA.fetch(contig, ref_start_1 - 1, ref_end_1)
+    except (KeyError, ValueError):
+        return None
+    if not ref_seq:
+        return None
+    ref_seq = ref_seq.upper()
+    if len(ref_seq) != flank + tnp_len + flank:
+        return None
+    if strand == "-":
+        ref_seq = revcomp(ref_seq)
+
+    flank_size = flank
+    tnp_offset = flank_size
+    tnp_end_in_ref = flank_size + tnp_len
+    ref_len = len(ref_seq)
+
+    ref_lines = [f">{is_id} ctg={contig} flank={flank_size} "
+                 f"tnp_len={tnp_len} strand={strand}"]
+    for i in range(0, ref_len, 80):
+        ref_lines.append(ref_seq[i:i+80])
+    ref_record = "\n".join(ref_lines) + "\n"
+
+    anchor_parts = []
+    n_anchors = 0
+    for d in distances:
+        up_start = tnp_offset - d - anchor_length
+        up_end = tnp_offset - d
+        down_start = tnp_end_in_ref + d
+        down_end = tnp_end_in_ref + d + anchor_length
+        if up_start < 0 or down_end > ref_len:
+            continue
+        up_seq = ref_seq[up_start:up_end]
+        down_seq = ref_seq[down_start:down_end]
+        anchor_parts.append(f">{is_id}__up{d} d={d} anchor_len={anchor_length}\n{up_seq}")
+        anchor_parts.append(f">{is_id}__down{d} d={d} anchor_len={anchor_length}\n{down_seq}")
+        n_anchors += 2
+    anchors_str = ("\n".join(anchor_parts) + "\n") if anchor_parts else ""
+
+    table_row = (f"{is_id}\t{ref_len}\t{anchor_length}\t{tnp_len}\t"
+                 f"{flank_size}\t{','.join(str(d) for d in distances)}\n")
+    return (ref_record, anchors_str, table_row, n_anchors)
 
 
 def main():
@@ -99,27 +152,15 @@ def main():
         print(f"Restricting to {len(keep_ids)} is_id values from {args.keep_ids}",
               file=sys.stderr)
 
-    # Cache contig lengths
-    contig_lens = {}
-
-    refs_out = open(args.out + "_refs.fa", "w")
-    anchors_out = open(args.out + "_anchors.fa", "w")
-    table_out = open(args.out + "_table.tsv", "w")
-    table_out.write("is_id\tref_len\tanchor_len\ttnp_len\tflank_size\tdistances\n")
-
-    n_refs = 0
-    n_anchors = 0
-    n_skipped = 0
+    # Parse all hits up front (cheap; just the TSV)
+    hits = []
     n_input = 0
-
     with open(args.hits) as fhits:
         header = fhits.readline().rstrip().split("\t")
-        # Build column index: tolerate is_id|assembly|contig|tnp_start|tnp_end|tnp_strand|tnp_len
         col = {name: i for i, name in enumerate(header)}
         for required in ("is_id", "contig", "tnp_start", "tnp_end", "tnp_strand"):
             if required not in col:
                 sys.exit(f"--hits TSV missing column: {required}")
-
         for line in fhits:
             parts = line.rstrip().split("\t")
             if len(parts) < len(header):
@@ -128,61 +169,35 @@ def main():
             is_id = parts[col["is_id"]]
             if keep_ids and is_id not in keep_ids:
                 continue
-            contig = parts[col["contig"]]
-            tnp_start = int(parts[col["tnp_start"]])  # 1-based inclusive
-            tnp_end = int(parts[col["tnp_end"]])      # 1-based inclusive
-            strand = parts[col["tnp_strand"]]
-            tnp_len = tnp_end - tnp_start + 1
+            hits.append((is_id, parts[col["contig"]],
+                         int(parts[col["tnp_start"]]),
+                         int(parts[col["tnp_end"]]),
+                         parts[col["tnp_strand"]]))
 
-            if contig not in contig_lens:
-                cl = get_contig_length(args.genome_db, contig)
-                if cl is None:
-                    n_skipped += 1
-                    continue
-                contig_lens[contig] = cl
-            clen = contig_lens[contig]
+    print(f"Input hits: {n_input:,}; to process: {len(hits):,} "
+          f"(threads={args.threads})", file=sys.stderr, flush=True)
 
-            ref_start_1 = tnp_start - args.flank
-            ref_end_1 = tnp_end + args.flank
-            if ref_start_1 < 1 or ref_end_1 > clen:
+    refs_out = open(args.out + "_refs.fa", "w")
+    anchors_out = open(args.out + "_anchors.fa", "w")
+    table_out = open(args.out + "_table.tsv", "w")
+    table_out.write("is_id\tref_len\tanchor_len\ttnp_len\tflank_size\tdistances\n")
+
+    n_refs = n_anchors = n_skipped = 0
+    with Pool(args.threads, initializer=_worker_init,
+              initargs=(args.genome_db, args.flank, args.anchor_length, distances)) as pool:
+        for i, res in enumerate(pool.imap_unordered(_extract_one, hits, chunksize=16)):
+            if i % 5000 == 0:
+                print(f"  processed {i:,}/{len(hits):,}", file=sys.stderr, flush=True)
+            if res is None:
                 n_skipped += 1
                 continue
-
-            ref_seq = extract_region(args.genome_db, contig, ref_start_1, ref_end_1)
-            if not ref_seq or len(ref_seq) != args.flank + tnp_len + args.flank:
-                n_skipped += 1
-                continue
-            if strand == "-":
-                ref_seq = revcomp(ref_seq)
-
-            flank_size = args.flank
-            tnp_offset = flank_size
-            tnp_end_in_ref = flank_size + tnp_len
-            ref_len = len(ref_seq)
-
-            refs_out.write(f">{is_id} ctg={contig} flank={flank_size} "
-                           f"tnp_len={tnp_len} strand={strand}\n")
-            for i in range(0, ref_len, 80):
-                refs_out.write(ref_seq[i:i+80] + "\n")
-
-            for d in distances:
-                up_start = tnp_offset - d - args.anchor_length
-                up_end = tnp_offset - d
-                down_start = tnp_end_in_ref + d
-                down_end = tnp_end_in_ref + d + args.anchor_length
-                if up_start < 0 or down_end > ref_len:
-                    continue
-                up_seq = ref_seq[up_start:up_end]
-                down_seq = ref_seq[down_start:down_end]
-                anchors_out.write(f">{is_id}__up{d} d={d} "
-                                  f"anchor_len={args.anchor_length}\n{up_seq}\n")
-                anchors_out.write(f">{is_id}__down{d} d={d} "
-                                  f"anchor_len={args.anchor_length}\n{down_seq}\n")
-                n_anchors += 2
-
-            table_out.write(f"{is_id}\t{ref_len}\t{args.anchor_length}\t{tnp_len}\t"
-                            f"{flank_size}\t{','.join(str(d) for d in distances)}\n")
+            ref_record, anchors_str, table_row, na = res
+            refs_out.write(ref_record)
+            if anchors_str:
+                anchors_out.write(anchors_str)
+            table_out.write(table_row)
             n_refs += 1
+            n_anchors += na
 
     refs_out.close()
     anchors_out.close()

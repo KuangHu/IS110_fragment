@@ -38,54 +38,61 @@ def parse_args():
                    choices=["pyrodigal", "prodigal"])
     p.add_argument("--skip-orf", action="store_true",
                    help="Skip ORF prediction (expects <work_dir>/proteins.faa to exist)")
+    p.add_argument("--max-protein-len", type=int, default=10000,
+                   help="Drop proteins longer than N aa before hmmsearch (hmmer's "
+                        "pipeline rejects sequences > 100K). Default 10000.")
     return p.parse_args()
 
 
-def run_orfs_pyrodigal(db_fa, out_faa, out_gff, threads):
-    """Run pyrodigal -meta in parallel via Python multiprocessing."""
+def _pyrodigal_process_one(record_tuple):
+    """Module-level worker so it can be pickled for multiprocessing.Pool."""
+    import io
     import pyrodigal
-    from multiprocessing import Pool
+    name, seq = record_tuple
+    finder = pyrodigal.GeneFinder(meta=True)
+    try:
+        genes = finder.find_genes(seq.encode())
+        faa_io = io.StringIO()
+        gff_io = io.StringIO()
+        genes.write_translations(faa_io, sequence_id=name)
+        genes.write_gff(gff_io, sequence_id=name)
+        return faa_io.getvalue(), gff_io.getvalue()
+    except Exception:
+        return "", ""
 
-    def process_one(record_tuple):
-        name, seq = record_tuple
-        finder = pyrodigal.GeneFinder(meta=True)
-        try:
-            genes = finder.find_genes(seq.encode())
-            faa_lines = []
-            gff_lines = []
-            import io
-            faa_io = io.StringIO()
-            gff_io = io.StringIO()
-            genes.write_translations(faa_io, sequence_id=name)
-            genes.write_gff(gff_io, sequence_id=name)
-            return faa_io.getvalue(), gff_io.getvalue()
-        except Exception as e:
-            return "", ""
 
-    # Read FASTA into list
-    records = []
+def _iter_fasta_records(db_fa):
+    """Stream (name, seq) tuples from a FASTA without holding all in memory."""
     cur_name, cur_seq = None, []
     with open(db_fa) as f:
         for line in f:
             if line.startswith(">"):
-                if cur_name:
-                    records.append((cur_name, "".join(cur_seq)))
+                if cur_name is not None:
+                    yield (cur_name, "".join(cur_seq))
                 cur_name = line[1:].split()[0]
                 cur_seq = []
             else:
                 cur_seq.append(line.strip())
-    if cur_name:
-        records.append((cur_name, "".join(cur_seq)))
+    if cur_name is not None:
+        yield (cur_name, "".join(cur_seq))
 
-    print(f"  ORF calling: {len(records):,} contigs with pyrodigal (n={threads})",
+
+def run_orfs_pyrodigal(db_fa, out_faa, out_gff, threads):
+    """Run pyrodigal -meta in parallel via Python multiprocessing (streaming)."""
+    from multiprocessing import Pool
+
+    print(f"  ORF calling: streaming contigs with pyrodigal (n={threads})",
           file=sys.stderr, flush=True)
     with open(out_faa, "w") as ffaa, open(out_gff, "w") as fgff:
         with Pool(threads) as pool:
-            for i, (faa_part, gff_part) in enumerate(pool.imap_unordered(process_one, records)):
+            for i, (faa_part, gff_part) in enumerate(
+                    pool.imap_unordered(_pyrodigal_process_one,
+                                        _iter_fasta_records(db_fa),
+                                        chunksize=4)):
                 ffaa.write(faa_part)
                 fgff.write(gff_part)
-                if i % 1000 == 0:
-                    print(f"    {i}/{len(records)}", file=sys.stderr, flush=True)
+                if i % 5000 == 0:
+                    print(f"    contigs processed: {i:,}", file=sys.stderr, flush=True)
 
 
 def run_hmmsearch(hmm, faa, domtbl, e_value, threads):
@@ -130,6 +137,37 @@ def parse_gff(gff_path):
     return info
 
 
+def filter_proteins_by_length(in_faa, out_faa, max_len):
+    """Stream-filter a protein FASTA, dropping records longer than max_len aa."""
+    kept = dropped = 0
+    with open(in_faa) as fin, open(out_faa, "w") as fout:
+        header = None
+        seq_parts = []
+
+        def flush():
+            nonlocal kept, dropped
+            if header is None:
+                return
+            seq = "".join(seq_parts)
+            if len(seq) > max_len:
+                dropped += 1
+            else:
+                fout.write(header)
+                # Write seq in 60-char lines (already is; just emit as-is)
+                fout.write(seq + "\n")
+                kept += 1
+
+        for line in fin:
+            if line.startswith(">"):
+                flush()
+                header = line
+                seq_parts = []
+            else:
+                seq_parts.append(line.strip())
+        flush()
+    return kept, dropped
+
+
 def main():
     args = parse_args()
     work_dir = args.work_dir or args.out + "_work"
@@ -138,17 +176,34 @@ def main():
     proteins_faa = os.path.join(work_dir, "proteins.faa")
     proteins_gff = os.path.join(work_dir, "proteins.gff")
 
-    # Step 1: ORFs
+    # Step 1: ORFs (with cache: skip if both .faa and .gff exist and are non-empty)
     if not args.skip_orf:
-        print(f"Step 1: ORF prediction ({args.orf_caller})...", file=sys.stderr)
-        if args.orf_caller == "pyrodigal":
-            run_orfs_pyrodigal(args.db, proteins_faa, proteins_gff, args.threads)
+        faa_done = os.path.exists(proteins_faa) and os.path.getsize(proteins_faa) > 0
+        gff_done = os.path.exists(proteins_gff) and os.path.getsize(proteins_gff) > 0
+        if faa_done and gff_done:
+            print(f"Step 1: cached ORF outputs found, skipping pyrodigal.",
+                  file=sys.stderr, flush=True)
         else:
-            cmd = ["prodigal", "-p", "meta", "-i", args.db,
-                   "-a", proteins_faa, "-o", proteins_gff, "-f", "gff"]
-            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
+            print(f"Step 1: ORF prediction ({args.orf_caller})...", file=sys.stderr)
+            if args.orf_caller == "pyrodigal":
+                run_orfs_pyrodigal(args.db, proteins_faa, proteins_gff, args.threads)
+            else:
+                cmd = ["prodigal", "-p", "meta", "-i", args.db,
+                       "-a", proteins_faa, "-o", proteins_gff, "-f", "gff"]
+                subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
 
-    # Step 2: HMM searches
+    # Step 1b: filter proteins for hmmsearch (drop sequences > --max-protein-len)
+    # hmmsearch hard-rejects sequences > 100K aa; we use a tighter threshold by default.
+    filtered_faa = os.path.join(work_dir, "proteins_filtered.faa")
+    if not (os.path.exists(filtered_faa) and os.path.getsize(filtered_faa) > 0):
+        print(f"Step 1b: filtering proteins (max length {args.max_protein_len:,} aa) ...",
+              file=sys.stderr, flush=True)
+        kept, dropped = filter_proteins_by_length(proteins_faa, filtered_faa,
+                                                  args.max_protein_len)
+        print(f"  kept {kept:,}, dropped {dropped:,} oversized proteins",
+              file=sys.stderr, flush=True)
+
+    # Step 2: HMM searches (use the filtered file)
     hmm_files = args.hmm.split(",")
     hmm_hits = []  # list of (hmm_name, set_of_protein_ids)
     for hmm in hmm_files:
@@ -156,7 +211,7 @@ def main():
         domtbl = os.path.join(work_dir, f"{hmm_name}.domtbl")
         if not os.path.exists(domtbl):
             print(f"Step 2: hmmsearch {hmm_name} ...", file=sys.stderr)
-            run_hmmsearch(hmm, proteins_faa, domtbl, args.e_value, args.threads)
+            run_hmmsearch(hmm, filtered_faa, domtbl, args.e_value, args.threads)
         hits = parse_domtbl(domtbl)
         hmm_hits.append((hmm_name, hits))
         print(f"  {hmm_name}: {len(hits):,} hits", file=sys.stderr)

@@ -62,25 +62,33 @@ def load_v_ref(records_path, v1_id):
     with open(records_path) as f:
         records = json.load(f)
     for r in records:
-        if r["is110_id"] == v1_id:
-            src = r["source"]
-            ie = src["is_element"]
-            tn = src["transposase_cds"]
-            strand = ie["strand"]
+        rid = r.get("is110_id") or r.get("ref_id")
+        if rid != v1_id: continue
+        src = r.get("source", {})
+        ie = src.get("is_element") or r.get("is_element") or {}
+        tn = src.get("transposase_cds") or r.get("transposase_cds") or {}
+        is_len = ie.get("length", 0)
+        if "start" in ie and "start" in tn:
+            strand = ie.get("strand", "+")
             if strand == "+":
                 t_s = max(0, tn["start"] - ie["start"])
-                t_e = min(ie["length"], tn["end"] - ie["start"] + 1)
+                t_e = min(is_len, tn["end"] - ie["start"] + 1)
             else:
                 t_s = max(0, ie["end"] - tn["end"])
-                t_e = min(ie["length"], ie["end"] - tn["start"] + 1)
-            return {
-                "seq": ie.get("sequence", ""),
-                "len": ie["length"],
-                "cds_start": t_s,
-                "cds_end": t_e,
-                "assembly": src.get("assembly", ""),
-                "contig": src.get("contig", ""),
-            }
+                t_e = min(is_len, ie["end"] - tn["start"] + 1)
+        else:
+            off5 = ie.get("start_offset_5p", 0)
+            tnp_len = tn.get("length", 0)
+            t_s = max(0, -off5)
+            t_e = min(is_len, t_s + tnp_len)
+        return {
+            "seq": ie.get("sequence", ""),
+            "len": is_len,
+            "cds_start": t_s,
+            "cds_end": t_e,
+            "assembly": src.get("assembly", ""),
+            "contig": src.get("contig", ""),
+        }
     return None
 
 

@@ -140,10 +140,23 @@ def main():
     is110_list = []
     ref_meta = {}  # v1_id -> metadata
     for r in records:
-        rid = r["is110_id"]
-        up = r["source"]["upstream_flank"]["sequence"]
-        down = r["source"]["downstream_flank"]["sequence"]
-        is110_seq = r["source"]["is_element"]["sequence"]
+        # Field name compatibility: records_final uses "is110_id"; build_records.py
+        # (Cross_reference_IS Stage 6) uses "ref_id". Accept either.
+        rid = r.get("is110_id") or r.get("ref_id")
+        if not rid:
+            continue
+        # Layout compatibility:
+        #   records_final: source.{upstream_flank, downstream_flank, is_element}
+        #   build_records.py: top-level {upstream_flank, downstream_flank, is_element}
+        src = r.get("source", {})
+        up_obj = (src.get("upstream_flank") or r.get("upstream_flank") or {})
+        down_obj = (src.get("downstream_flank") or r.get("downstream_flank") or {})
+        is_obj = (src.get("is_element") or r.get("is_element") or {})
+        up = up_obj.get("sequence", "")
+        down = down_obj.get("sequence", "")
+        is110_seq = is_obj.get("sequence", "")
+        if not (up and down and is110_seq):
+            continue
         if len(up) < args.anchor_len or len(down) < args.anchor_len:
             continue
         # Anchor = innermost 5 kb (closest to IS)
@@ -153,11 +166,11 @@ def main():
         anchors_list.append((f"{rid}__down", down_anchor))
         is110_list.append((rid, is110_seq))
         ref_meta[rid] = {
-            "is110_len": r["source"]["is_element"]["length"],
+            "is110_len": is_obj.get("length") or len(is110_seq),
             "up_anchor_seq": up_anchor,
             "down_anchor_seq": down_anchor,
             "is110_seq": is110_seq,
-            "source": {k: v for k, v in r["source"].items()
+            "source": {k: v for k, v in src.items()
                        if k in ("assembly", "contig")},
         }
     print(f"  Built {len(anchors_list)//2:,} anchor pairs", file=sys.stderr)
