@@ -50,6 +50,7 @@ def find_is_boundaries(
     source_db=None,         # optional — defaults to genome_db
     detect_rearrangements=False,
     anchor_d_rearrangements=1000,
+    max_secondary=50,
 ):
     os.makedirs(output_dir, exist_ok=True)
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -93,9 +94,15 @@ def find_is_boundaries(
 
     # Stage 3
     if not os.path.exists(anchors_paf):
-        # Use 'sr' preset for short anchor queries (500 bp)
+        # Use 'sr' preset for short anchor queries (500 bp).
+        # -N caps secondary alignments PER ANCHOR: each anchor reports at most
+        # N+1 targets. On the 13,027-assembly E. coli DB with -N 50, 91% of
+        # anchors (1,986,882 / 2,179,807) hit exactly 51 rows -- every count
+        # downstream is a sample of the DB, biased to the closest matches.
+        # Raise --max-secondary to at least the number of distinct assemblies
+        # for a census (PAF size grows ~linearly with it).
         cmd = ["minimap2", "-x", "sr", "-c", "--eqx",
-               "--secondary=yes", "-N", "50", "-p", "0.5",
+               "--secondary=yes", "-N", str(max_secondary), "-p", "0.5",
                "-t", str(threads),
                genome_db, anchors_fa, "-o", anchors_paf]
         print("=== Stage 3: anchors vs DB (minimap2) ===", flush=True)
@@ -122,7 +129,8 @@ def find_is_boundaries(
                "--min-coverage", str(min_coverage),
                "--histogram-bin", str(histogram_bin),
                "--min-is-size", str(expected_is_size_range[0]),
-               "--max-is-size", str(expected_is_size_range[1])]
+               "--max-is-size", str(expected_is_size_range[1]),
+               "--max-secondary", str(max_secondary)]
         print("=== Stage 5: boundary peak caller ===", flush=True)
         subprocess.run(cmd, check=True)
 
@@ -303,6 +311,10 @@ def main():
     p.add_argument("--max-is-size", type=int, default=200000)
     p.add_argument("--any-domain", action="store_true")
     p.add_argument("--threads", type=int, default=32)
+    p.add_argument("--max-secondary", type=int, default=50,
+                   help="minimap2 -N for the anchor search: max targets per "
+                        "anchor is N+1. Default 50 samples the DB; set it to at "
+                        "least the number of distinct assemblies for a census")
     p.add_argument("--detect-rearrangements", action="store_true",
                    help="Run Stage 7: classify inversions/translocations/duplications "
                         "from the anchor PAF (off by default)")
@@ -339,6 +351,7 @@ def main():
         threads=args.threads,
         detect_rearrangements=args.detect_rearrangements,
         anchor_d_rearrangements=args.anchor_D_rearrangements,
+        max_secondary=args.max_secondary,
     )
     print(f"\nFinal records: {result}", flush=True)
 

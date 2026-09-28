@@ -21,6 +21,10 @@ Usage:
 import argparse, json, os, re, subprocess, sys, hashlib
 from collections import defaultdict
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from lib_alleles import (parse_paf_line, place_per_assembly,  # noqa: E402
+                         decompose_alleles, canonical_insert_key, canon_key)
+
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--records", required=True,
@@ -35,8 +39,22 @@ def parse_args():
                    help="Min identity for anchor hits")
     p.add_argument("--anchor-cov", type=float, default=80,
                    help="Min query coverage for anchor hits")
-    p.add_argument("--max-pair-dist", type=int, default=500000,
-                   help="Max distance between paired anchor hits (bp)")
+    p.add_argument("--max-pair-dist", type=int, default=100000,
+                   help="Max distance between paired anchor hits (bp, default "
+                        "100000; was 500000, which let anchors pair across "
+                        "distant repeat copies)")
+    p.add_argument("--max-secondary", type=int, default=20,
+                   help="minimap2 -N for the anchor search (targets per anchor "
+                        "<= N+1; raise it for a census of large DBs)")
+    p.add_argument("--max-anchor-overlap", type=int, default=50,
+                   help="Anchors may overlap by this much: at an empty site the "
+                        "anchors abut, or overlap by the TSD (default 50)")
+    p.add_argument("--margin", type=float, default=0.05,
+                   help="Min relative score margin of the best anchor pair over "
+                        "the runner-up, else the site is ambiguous (default 0.05)")
+    p.add_argument("--max-align-cells", type=float, default=2e7,
+                   help="Skip SNP-tolerant decomposition above this "
+                        "len(V1)*len(variant) (default 2e7)")
     p.add_argument("--min-similarity-blocks", type=int, default=2,
                    help="Min # of 95%% identity blocks needed for 'downstream' call")
     p.add_argument("--min-extra-bp", type=int, default=200,
@@ -183,7 +201,7 @@ def main():
         print(f"Running minimap2 anchors vs DB ...", file=sys.stderr, flush=True)
         subprocess.run([
             "minimap2", "-x", "asm10", "-c", "--eqx",
-            "--secondary=yes", "-N", "20", "-p", "0.5",
+            "--secondary=yes", "-N", str(args.max_secondary), "-p", "0.5",
             "-t", str(args.threads), args.db, anchor_fa, "-o", anchor_paf
         ], check=True)
     print(f"  anchor PAF: {anchor_paf} ({os.path.getsize(anchor_paf)/1e6:.1f} MB)",
@@ -192,58 +210,45 @@ def main():
     # === Step 3: Parse anchor hits and find pairs ===
     print(f"Parsing anchor hits ...", file=sys.stderr, flush=True)
     # anchor_id -> [(target, target_start, target_end, strand, ident, cov)]
-    anchor_hits = defaultdict(list)
+    anchor_hits = defaultdict(lambda: defaultdict(list))  # qname -> tname -> [Hit]
     with open(anchor_paf) as f:
         for line in f:
-            c = line.split("\t")
-            if len(c) < 12: continue
-            qname, qlen = c[0], int(c[1])
-            qs, qe = int(c[2]), int(c[3])
-            strand = c[4]
-            tname = c[5]
-            ts, te = int(c[7]), int(c[8])
-            matches, block = int(c[9]), int(c[10])
-            ident = matches / block * 100 if block > 0 else 0
-            cov = (qe - qs) / qlen * 100
-            if ident < args.anchor_identity or cov < args.anchor_cov: continue
-            anchor_hits[qname].append({
-                "target": tname, "ts": ts, "te": te, "strand": strand,
-                "ident": ident, "cov": cov,
-            })
+            h = parse_paf_line(line)
+            if h is None: continue
+            if h.ident < args.anchor_identity or h.cov < args.anchor_cov: continue
+            anchor_hits[h.qname][h.tname].append(h)
 
-    # === Step 4: For each V1, find matching anchor pairs (up + down on same contig) ===
+    # === Step 4: one scored anchor placement per distinct assembly ===
+    # Every up x down combination used to become an observation, so a genome
+    # with two anchor copies was counted several times and anchors could pair
+    # across repeat copies; and `between_end <= between_start` was skipped,
+    # which discarded exactly the clean empty sites (anchors abut, gap 0, or
+    # overlap by the TSD). See lib_alleles.place_pair.
     print(f"Pairing anchors per V1 ...", file=sys.stderr, flush=True)
-    v1_pairs = defaultdict(list)  # v1_id -> list of {target, strand, between_start, between_end}
+    v1_pairs = defaultdict(list)
+    n_ambiguous = 0
     for rid in ref_meta:
-        ups = anchor_hits.get(f"{rid}__up", [])
-        downs = anchor_hits.get(f"{rid}__down", [])
+        ups = anchor_hits.get(f"{rid}__up", {})
+        downs = anchor_hits.get(f"{rid}__down", {})
         if not ups or not downs: continue
-        # Group by target
-        ups_by_t = defaultdict(list)
-        downs_by_t = defaultdict(list)
-        for h in ups: ups_by_t[h["target"]].append(h)
-        for h in downs: downs_by_t[h["target"]].append(h)
-        for tname in set(ups_by_t.keys()) & set(downs_by_t.keys()):
-            for u in ups_by_t[tname]:
-                for d in downs_by_t[tname]:
-                    if u["strand"] != d["strand"]: continue  # skip inversions
-                    # Determine between-anchor region
-                    if u["strand"] == "+":
-                        # up anchor ends at u["te"], down anchor starts at d["ts"]
-                        between_start = u["te"]
-                        between_end = d["ts"]
-                    else:
-                        between_start = d["te"]
-                        between_end = u["ts"]
-                    if between_end <= between_start: continue
-                    dist = between_end - between_start
-                    if dist > args.max_pair_dist: continue
-                    v1_pairs[rid].append({
-                        "target": tname, "strand": u["strand"],
-                        "between_start": between_start, "between_end": between_end,
-                        "between_len": dist,
-                        "up_ident": u["ident"], "down_ident": d["ident"],
-                    })
+        placements = place_per_assembly(
+            ups, downs, min_gap=-args.max_anchor_overlap,
+            max_gap=args.max_pair_dist, margin_ratio=args.margin)
+        for pl in placements.values():
+            if pl["status"] == "ambiguous":
+                n_ambiguous += 1
+                continue
+            v1_pairs[rid].append({
+                "target": pl["tname"], "assembly": pl["assembly"],
+                "strand": pl["strand"],
+                "between_start": pl["start"], "between_end": pl["end"],
+                "between_len": max(0, pl["gap"]),
+                "anchor_overlap": max(0, -pl["gap"]),
+                "placement_status": pl["status"],
+                "placement_margin": round(pl["margin"], 3),
+                "up_ident": pl["up"].ident, "down_ident": pl["down"].ident,
+            })
+    print(f"  Ambiguous placements (not used): {n_ambiguous:,}", file=sys.stderr)
 
     n_pairs = sum(len(v) for v in v1_pairs.values())
     print(f"  Found {n_pairs:,} anchor pairs across {len(v1_pairs):,} V1s",
@@ -259,6 +264,10 @@ def main():
     region_to_pair = {}  # (contig, start, end) -> (rid, i, p)
     for rid, pairs in v1_pairs.items():
         for i, p in enumerate(pairs):
+            p["pair_id"] = f"{rid}__pair{i}__{p['target']}_{p['between_start']}_{p['between_end']}"
+            if p["between_len"] == 0:
+                p["between_seq"] = ""        # abutting / TSD-overlapping anchors
+                continue
             region = (p["target"], p["between_start"] + 1, p["between_end"])
             all_regions.append(region)
             region_to_pair[region] = (rid, i, p)
@@ -275,7 +284,6 @@ def main():
         rid, i, p = region_to_pair[region]
         if p["strand"] == "-": seq = revcomp(seq)
         p["between_seq"] = seq
-        p["pair_id"] = f"{rid}__pair{i}__{p['target']}_{p['between_start']}_{p['between_end']}"
         extracted.append((p["pair_id"], seq))
     write_fasta(extracted, between_fa)
     print(f"  Wrote {len(extracted):,} between-anchor sequences",
@@ -337,8 +345,20 @@ def main():
             #  deletion  : shorter than V1 but contains V1 fragments (>= min_deletion_match bp)
             #  clonal_V1 : matches V1 fully (~same length, >=95% coverage)
             #  insertion : V1's content + extra DNA (>=80% V1 coverage, >=min_extra_bp larger)
+            #              OR the variant decomposes cleanly as V1 + one insert
+            #              (minimap2 often aligns only one side of V1 across a
+            #              large nested insert, leaving too few blocks)
             #  unrelated : virtually no V1 content (<10% coverage)
             #  partial   : everything else (ambiguous)
+            decomp = None
+            if between_len >= v1_len + args.min_extra_bp:
+                v1_seq, seq = ref_meta[rid]["is110_seq"], p["between_seq"]
+                decomp = decompose_alleles(
+                    v1_seq, seq, min_insert=args.min_extra_bp,
+                    tolerant=len(v1_seq) * len(seq) <= args.max_align_cells)
+                if decomp["method"] == "none" or decomp["event_class"] not in (
+                        "insertion_target_retained", "replacement"):
+                    decomp = None
             if between_len < 100:
                 category = "empty"
             elif (between_len < v1_len - args.min_deletion_shortening
@@ -349,6 +369,8 @@ def main():
             elif (len(blocks) >= args.min_similarity_blocks
                   and v1_cov_frac >= min_cov_frac
                   and between_len >= v1_len + args.min_extra_bp):
+                category = "insertion"
+            elif decomp is not None:
                 category = "insertion"
             elif v1_cov_frac < 0.1:
                 category = "unrelated"
@@ -361,11 +383,15 @@ def main():
                 "v1_parent_id": rid,
                 "category": category,
                 "target": p["target"],
+                "assembly": p["assembly"],
                 "target_strand": p["strand"],
                 "anchor_site": {
                     "between_start": p["between_start"],
                     "between_end": p["between_end"],
                     "between_len": between_len,
+                    "anchor_overlap": p["anchor_overlap"],
+                    "placement_status": p["placement_status"],
+                    "placement_margin": p["placement_margin"],
                     "up_anchor_identity": round(p["up_ident"], 1),
                     "down_anchor_identity": round(p["down_ident"], 1),
                 },
@@ -383,6 +409,25 @@ def main():
                 obs["variant_id"] = f"ins_{short_hash(p['between_seq'])}"
                 obs["variant_seq"] = p["between_seq"]
                 obs["variant_len"] = between_len
+                # Explain the variant as V1 + an insert. The insert key is
+                # orientation- and junction-invariant, and the event key adds
+                # the V1 context at the insertion point, so the same nested
+                # insertion keys identically whichever genome/strand it is in.
+                v1_seq, seq = ref_meta[rid]["is110_seq"], p["between_seq"]
+                d = decomp
+                if d is not None:
+                    ctx = v1_seq[max(0, d["offset"] - 100):d["offset"] + 100]
+                    ikey = canonical_insert_key(seq, d["insert_start"], d["insert_len"])
+                    obs["nested_insert"] = {
+                        "method": d["method"], "event_class": d["event_class"],
+                        "offset_in_v1": d["offset"],
+                        "insert_start": d["insert_start"],
+                        "insert_len": d["insert_len"],
+                        "junction_microhomology_bp": d["junction_microhomology_bp"],
+                        "target_lost_bp": d["target_lost_bp"],
+                        "insert_key": ikey,
+                        "event_key": f"{ikey}:{canon_key(ctx)}",
+                    }
             elif category == "deletion":
                 # Save the deletion variant (shorter than V1) + ID
                 obs["variant_id"] = f"del_{short_hash(p['between_seq'])}"
@@ -393,6 +438,9 @@ def main():
     print(f"\n=== Classification counts ===", file=sys.stderr)
     for k in ("empty", "deletion", "clonal_V1", "insertion", "partial", "unrelated"):
         print(f"  {k:>12}: {counts[k]:>8,}", file=sys.stderr)
+    n_ev = len({o["nested_insert"]["event_key"] for o in obs_records
+                if "nested_insert" in o})
+    print(f"  distinct nested-insertion events (event_key): {n_ev:,}", file=sys.stderr)
 
     # === Step 8: Save all observations + extract variant cluster reps ===
     with open(f"{args.out}/observations.json", "w") as f:
@@ -427,6 +475,8 @@ def main():
     summary = {
         "n_v1_records": len(records),
         "n_anchor_pairs": n_pairs,
+        "n_ambiguous_placements": n_ambiguous,
+        "counts_are": "distinct assemblies (GCA/GCF twins collapsed)",
         "n_observations": len(obs_records),
         "counts": dict(counts),
         "n_unique_insertion_variants": len(seen_ins),

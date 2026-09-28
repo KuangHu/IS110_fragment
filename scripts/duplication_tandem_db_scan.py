@@ -81,6 +81,9 @@ def write_fasta(label, seq, path):
 def self_align(contig_fa, work, threads):
     paf = os.path.join(work, "self.paf")
     subprocess.run(["minimap2", "-x", "asm10", "-c", "--eqx", "-X",
+                    "-f", "0",  # keep ALL minimizers: the default drops the most frequent
+                    # ones, which in a self-alignment are exactly the repeats sought
+                    # (fna project: 0 of 60 IS1 copies found without it, 57 with)
                     "-t", str(threads), contig_fa, contig_fa, "-o", paf],
                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     blocks = []

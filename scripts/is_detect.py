@@ -21,6 +21,9 @@ Usage:
 import argparse, csv, os, subprocess, sys, re
 from collections import defaultdict
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from lib_alleles import representative_asm  # noqa: E402
+
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -33,6 +36,9 @@ def parse_args():
     p.add_argument("--any-domain", action="store_true",
                    help="Keep proteins matching ANY of the HMMs (default: ALL)")
     p.add_argument("--e-value", type=float, default=1e-5)
+    p.add_argument("--keep-duplicate-assemblies", action="store_true",
+                   help="Keep hits from both GCA_x and GCF_x copies of an assembly "
+                        "(default: keep one representative per assembly)")
     p.add_argument("--threads", type=int, default=32)
     p.add_argument("--orf-caller", default="pyrodigal",
                    choices=["pyrodigal", "prodigal"])
@@ -236,12 +242,22 @@ def main():
     gff_info = parse_gff(proteins_gff)
     print(f"  GFF entries: {len(gff_info):,}", file=sys.stderr)
 
+    # GenBank/RefSeq twins (GCA_x / GCF_x) are the same genome; keep hits
+    # from one representative per assembly core so every IS is not built,
+    # searched and counted twice (13,027 -> 7,723 on the E. coli DB).
+    def _asm(contig):
+        return contig.split("|")[0] if "|" in contig else contig
+    reps = None
+    if not args.keep_duplicate_assemblies:
+        reps = set(representative_asm(
+            {_asm(gff_info[pid][0]) for pid in combined if pid in gff_info}).values())
+
     # Write output TSV
     domain_names = ",".join(n for n, _ in hmm_hits)
     with open(args.out, "w") as fout:
         fout.write("is_id\tassembly\tcontig\ttnp_start\ttnp_end\ttnp_strand"
                    "\ttnp_len\tdomains_hit\n")
-        n_out = 0
+        n_out = n_twin = 0
         for pid in sorted(combined):
             if pid not in gff_info: continue
             contig, start, end, strand = gff_info[pid]
@@ -249,15 +265,17 @@ def main():
             # Build is_id from contig + protein index (last underscore part)
             # pyrodigal protein IDs look like CONTIG_NNN
             # Try to extract assembly from contig if pipe-delimited
-            if "|" in contig:
-                assembly = contig.split("|")[0]
-            else:
-                assembly = contig
+            assembly = _asm(contig)
+            if reps is not None and assembly not in reps:
+                n_twin += 1
+                continue
             is_id = f"{contig}_{pid.rsplit('_', 1)[-1]}"
             fout.write(f"{is_id}\t{assembly}\t{contig}\t{start}\t{end}"
                        f"\t{strand}\t{tnp_len}\t{domain_names}\n")
             n_out += 1
-        print(f"\nWrote {n_out:,} IS hits to {args.out}", file=sys.stderr)
+        print(f"\nWrote {n_out:,} IS hits to {args.out} "
+              f"({n_twin:,} dropped from duplicate GCA/GCF assemblies)",
+              file=sys.stderr)
 
 
 if __name__ == "__main__":

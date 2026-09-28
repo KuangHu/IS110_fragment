@@ -8,6 +8,14 @@ Algorithm per ref:
      (this gives most direct evidence; smaller D = more genome-specific anchors)
   4. If no D gives both, fall back to D with the most empties (use expected V0)
   5. Compute IS110 size = v0_distance - empty_distance
+  5b. BOUNDARY BY DECOMPOSITION: at the smallest D <= --decompose-max-d with
+     empty sites, extract the filled interval (source) and each empty interval
+     (target) between the anchors and explain filled = empty + insert
+     (lib_alleles.decompose_alleles). The insert coordinates ARE the element
+     boundaries, per side, with junction microhomology/TSD reported. The
+     consensus over empties is used; if nothing decomposes, fall back to the
+     peak difference split symmetrically around the transposase and say so
+     in boundary_evidence.method.
   6. Extract source sequences using the inferred boundaries
   7. Keep top-N empty observations by mean anchor identity
   8. If NCBI gave no empties, also include Logan empties in the record
@@ -25,10 +33,15 @@ import json
 import os
 import re
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from multiprocessing import Pool
 
 import pysam
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from lib_alleles import (load_anchor_hits, place_per_assembly,  # noqa: E402
+                         gap_tolerance, classify_gap, decompose_alleles,
+                         find_tsd, canon_key)
 
 
 def parse_args():
@@ -50,6 +63,16 @@ def parse_args():
     p.add_argument("--flank-out-len", type=int, default=5000)
     p.add_argument("--min-identity", type=float, default=95)
     p.add_argument("--min-coverage", type=float, default=80)
+    p.add_argument("--decompose-max-d", type=int, default=5000,
+                   help="Largest anchor distance D used for boundary decomposition "
+                        "(default 5000)")
+    p.add_argument("--max-align-cells", type=float, default=2e7,
+                   help="Skip the SNP-tolerant alignment when len(empty)*len(filled) "
+                        "exceeds this (exact decomposition is still tried)")
+    p.add_argument("--tol-bp", type=int, default=100)
+    p.add_argument("--tol-frac", type=float, default=0.002)
+    p.add_argument("--margin", type=float, default=0.05)
+    p.add_argument("--max-extra-bp", type=int, default=50000)
     p.add_argument("--threads", type=int, default=32,
                    help="Number of worker processes for sequence extraction (default 32)")
     return p.parse_args()
@@ -85,19 +108,16 @@ def _fetch(contig, start_0, end_0):
 
 def _build_one_record(packed):
     """Build a single IS record. Returns tuple or None on failure."""
-    (ref_id, info, best, src), genome_db, flank_out_len, top_empty_n, db_label = packed
+    ((ref_id, info, best, src), genome_db, flank_out_len, top_empty_n, db_label,
+     max_align_cells) = packed
 
-    # Compute IS size
+    # Compute IS size from the peaks (used only by the fallback)
     if best["v0_peak"] and best["empty_peak"]:
         is_length = best["v0_peak"][0] - best["empty_peak"][0]
     elif best["empty_peak"]:
         is_length = best["expected_v0"] - best["empty_peak"][0]
     else:
         is_length = info["tnp_len"]
-
-    ext_per_side = (is_length - info["tnp_len"]) // 2
-    boundary_5p_offset = -ext_per_side
-    boundary_3p_offset = is_length - info["tnp_len"] - ext_per_side
 
     # Need full contig length to clamp; pysam provides .get_reference_length
     try:
@@ -107,8 +127,24 @@ def _build_one_record(packed):
 
     tnp_start_0 = src["start"] - 1
     tnp_end_0 = src["end"]
-    is_start_0 = max(0, tnp_start_0 + boundary_5p_offset)
-    is_end_0 = min(contig_len, tnp_end_0 + boundary_3p_offset)
+
+    dec = None
+    if best.get("decompose"):
+        dec = decompose_boundary(src, info, best["decompose"], top_empty_n,
+                                 max_align_cells)
+    if dec and dec["ok"]:
+        method = "empty_vs_filled_decomposition"
+        is_start_0, is_end_0 = dec["is_start_0"], dec["is_end_0"]
+        boundary_5p_offset, boundary_3p_offset = dec["off5"], dec["off3"]
+    else:
+        # FALLBACK: the peak difference only gives a length, so the extension
+        # is split evenly between the two sides. It is not a boundary call.
+        method = "peak_symmetric_fallback"
+        ext_per_side = (is_length - info["tnp_len"]) // 2
+        boundary_5p_offset = -ext_per_side
+        boundary_3p_offset = is_length - info["tnp_len"] - ext_per_side
+        is_start_0 = max(0, tnp_start_0 + boundary_5p_offset)
+        is_end_0 = min(contig_len, tnp_end_0 + boundary_3p_offset)
 
     up_flank_start = max(0, is_start_0 - flank_out_len)
     up_flank_end = is_start_0
@@ -149,6 +185,10 @@ def _build_one_record(packed):
 
     record = {
         "ref_id": ref_id,
+        # orientation-invariant key of the element + 100 bp either side:
+        # the same insertion seen in several genomes shares it
+        "event_key": canon_key((up_seq[-100:] if up_seq else "") + is_seq
+                               + (down_seq[:100] if down_seq else "")),
         "source": {
             "assembly": src["assembly"], "contig": src["contig"],
             "transposase_start": src["start"], "transposase_end": src["end"],
@@ -165,7 +205,8 @@ def _build_one_record(packed):
         "upstream_flank": {"length": len(up_seq), "sequence": up_seq},
         "downstream_flank": {"length": len(down_seq), "sequence": down_seq},
         "boundary_evidence": {
-            "method": "empty_vs_filled",
+            "method": method,
+            "decomposition": dec,
             "source_db": db_label,
             "anchor_distance_D": best["D"],
             "v0_peak_distance": best["v0_peak"][0] if best["v0_peak"] else None,
@@ -176,6 +217,8 @@ def _build_one_record(packed):
             "n_v0_observations": len(best["v0_obs"]),
             "n_empty_observations": len(best["empty_obs"]),
             "n_v1plus_observations": len(best["v1plus_obs"]),
+            "n_ambiguous_placements": best.get("n_ambiguous", 0),
+            "counts_are": "distinct assemblies (GCA/GCF twins collapsed)",
             "n_top_empty_kept": len(top_empty),
         },
         "filled_observations": [
@@ -219,135 +262,84 @@ def find_genome_fna(genome_dir, assembly):
     return None
 
 
-def parse_paf_into_hits(paf_path, min_identity, min_cov):
-    """Return dict: (ref_id, side, D) -> {tname: [hit_dict, ...]}"""
-    hits = defaultdict(lambda: defaultdict(list))
-    n_total = n_kept = 0
-    with open(paf_path) as f:
-        for line in f:
-            c = line.rstrip().split("\t")
-            if len(c) < 12:
-                continue
-            n_total += 1
-            qname = c[0]
-            qlen = int(c[1])
-            qs, qe = int(c[2]), int(c[3])
-            strand = c[4]
-            tname = c[5]
-            tlen = int(c[6])
-            ts, te = int(c[7]), int(c[8])
-            matches, block = int(c[9]), int(c[10])
-            ident = matches / block * 100 if block > 0 else 0
-            cov = (qe - qs) / qlen * 100
-            if ident < min_identity or cov < min_cov:
-                continue
-            n_kept += 1
-            m = ANCHOR_RE.match(qname)
-            if not m:
-                continue
-            ref_id, side, D = m.group(1), m.group(2), int(m.group(3))
-            hits[(ref_id, side, D)][tname].append({
-                "strand": strand, "ts": ts, "te": te, "ident": ident, "tlen": tlen,
-            })
-    return hits, n_total, n_kept
+def length_mode(values, bin_size=50):
+    """Median of the most populated bin -> (length, n_in_bin), or None."""
+    if not values:
+        return None
+    bins = defaultdict(list)
+    for v in values:
+        bins[v // bin_size].append(v)
+    best = max(bins.values(), key=len)
+    best.sort()
+    return (best[len(best) // 2], len(best))
 
 
-def histogram_peaks(distances, bin_size=50):
-    if not distances:
-        return []
-    bins = defaultdict(int)
-    for d in distances:
-        bins[d // bin_size] += 1
-    sorted_bins = sorted(bins.items(), key=lambda x: -x[1])
-    return [(k * bin_size + bin_size // 2, count) for k, count in sorted_bins]
+def pair_anchors(hits, ref_id, D, info, opts):
+    """One scored placement per distinct assembly (lib_alleles.place_pair).
 
-
-def pair_anchors(hits, ref_id, D, info, max_pair_distance=200000):
-    """Build anchor pairs and classify by distance."""
-    up_hits = hits.get((ref_id, "up", D), {})
-    down_hits = hits.get((ref_id, "down", D), {})
-    pairs = []
+    Replaces an every-up-x-every-down loop that counted a genome once per
+    anchor-copy combination and could pair anchors on different repeat
+    copies. Ambiguous placements are counted but never used as evidence."""
     expected_v0 = 2 * D + info["tnp_len"]
-
-    for tname in set(up_hits.keys()) & set(down_hits.keys()):
-        tlen = up_hits[tname][0]["tlen"]
-        for up in up_hits[tname]:
-            for down in down_hits[tname]:
-                if up["strand"] != down["strand"]:
-                    continue
-                if up["strand"] == "+":
-                    distance = down["ts"] - up["te"]
-                else:
-                    distance = up["ts"] - down["te"]
-                if distance < -100 or distance > max_pair_distance:
-                    continue
-                if "|" in tname:
-                    assembly, contig = tname.split("|", 1)
-                else:
-                    assembly, contig = "unknown", tname
-                pairs.append({
-                    "assembly": assembly, "contig": contig, "tname": tname,
-                    "strand": up["strand"], "distance": distance,
-                    "up_ts": up["ts"], "up_te": up["te"],
-                    "down_ts": down["ts"], "down_te": down["te"],
-                    "up_ident": up["ident"], "down_ident": down["ident"],
-                    "mean_ident": (up["ident"] + down["ident"]) / 2,
-                    "D": D,
-                })
-    return pairs, expected_v0
-
-
-def categorize_pairs(pairs, expected_v0, D):
-    """Identify V0 peak and empty peak from pair distances."""
-    distances = [p["distance"] for p in pairs]
-    peaks = histogram_peaks(distances, bin_size=50)
-    if not peaks:
-        return None, None, [], [], []
-
-    # V0 peak: closest to expected_v0 (within 10%)
-    v0_peak = None
-    for center, count in peaks:
-        if abs(center - expected_v0) <= max(200, expected_v0 * 0.10) and count >= 1:
-            v0_peak = (center, count)
-            break
-
-    # Empty peak: distance < expected_v0 - tnp_len/2 (at least tnp_len/2 shorter)
-    # Practical: empty range is roughly [2*D - some_extension, expected_v0 - tnp_len + extension]
-    # Use any peak with center < expected_v0 - 500 and count >= 1
-    empty_peak = None
-    for center, count in peaks:
-        if v0_peak and abs(center - v0_peak[0]) < 100:
+    placements = place_per_assembly(
+        hits.get((ref_id, "up", D), {}), hits.get((ref_id, "down", D), {}),
+        min_gap=-50, max_gap=expected_v0 + opts["max_extra_bp"],
+        margin_ratio=opts["margin"])
+    pairs, n_ambiguous = [], 0
+    for pl in placements.values():
+        if pl["status"] == "ambiguous":
+            n_ambiguous += 1
             continue
-        if center < expected_v0 - 500 and count >= 1:
-            empty_peak = (center, count)
-            break
+        u, d = pl["up"], pl["down"]
+        pairs.append({
+            "assembly": pl["assembly"], "contig": pl["tname"].split("|", 1)[-1],
+            "tname": pl["tname"], "strand": pl["strand"], "distance": pl["gap"],
+            "up_ts": u.ts, "up_te": u.te, "down_ts": d.ts, "down_te": d.te,
+            "up_ident": u.ident, "down_ident": d.ident,
+            "mean_ident": (u.ident + d.ident) / 2, "D": D,
+            "placement_status": pl["status"], "placement_margin": round(pl["margin"], 3),
+        })
+    return pairs, expected_v0, n_ambiguous
 
-    # Categorize each pair
-    v0_obs = []
-    empty_obs = []
-    v1plus_obs = []
+
+def categorize_pairs(pairs, expected_v0, tnp_len, opts):
+    """Split placements into V0 / empty / V1+ against the source state.
+
+    The old version called an 'empty peak' any histogram bin > 500 bp short
+    of the source and then took everything within 250 bp of it; with a
+    tolerance tied to D it also let filled sites read as empty at large D.
+    Classification is now lib_alleles.classify_gap with an absolute
+    tolerance; peaks are summaries of the classified sets."""
+    tol = gap_tolerance(expected_v0, opts["tol_bp"], opts["tol_frac"])
+    v0_obs, empty_obs, v1plus_obs = [], [], []
     for p in pairs:
-        d = p["distance"]
-        if v0_peak and abs(d - v0_peak[0]) <= 250:
+        cat = classify_gap(p["distance"], expected_v0, tnp_len, tol)
+        if cat == "v0_filled":
             v0_obs.append(p)
-        elif empty_peak and abs(d - empty_peak[0]) <= 250:
+        elif cat == "empty":
             empty_obs.append(p)
-        elif v0_peak and d > v0_peak[0] + 500:
+        elif cat == "v1plus_filled":
             v1plus_obs.append(p)
-
+    v0_peak = length_mode([p["distance"] for p in v0_obs])
+    empty_peak = length_mode([p["distance"] for p in empty_obs])
     return v0_peak, empty_peak, v0_obs, empty_obs, v1plus_obs
 
 
-def pick_best_d(hits, ref_id, info, distances):
-    """Find the best D for this ref: prefer smallest D with both V0 and empty."""
+def pick_best_d(hits, ref_id, info, distances, opts):
+    """Find the best D for this ref: prefer smallest D with both V0 and empty.
+
+    Also returns, as best['decompose'], the smallest D <= decompose_max_d that
+    has empty sites -- the interval used for base-level decomposition."""
     candidates = []
     for D in distances:
-        pairs, expected_v0 = pair_anchors(hits, ref_id, D, info)
+        pairs, expected_v0, n_amb = pair_anchors(hits, ref_id, D, info, opts)
         if not pairs:
             continue
-        v0_peak, empty_peak, v0_obs, empty_obs, v1plus_obs = categorize_pairs(pairs, expected_v0, D)
+        v0_peak, empty_peak, v0_obs, empty_obs, v1plus_obs = categorize_pairs(
+            pairs, expected_v0, info["tnp_len"], opts)
         candidates.append({
             "D": D, "pairs": pairs, "expected_v0": expected_v0,
+            "n_ambiguous": n_amb,
             "v0_peak": v0_peak, "empty_peak": empty_peak,
             "v0_obs": v0_obs, "empty_obs": empty_obs, "v1plus_obs": v1plus_obs,
         })
@@ -355,18 +347,105 @@ def pick_best_d(hits, ref_id, info, distances):
     if not candidates:
         return None
 
+    best = None
     # Prefer smallest D with both V0 and empty (highest-quality boundary call)
     for c in sorted(candidates, key=lambda x: x["D"]):
         if c["v0_peak"] and c["empty_peak"]:
-            return c
+            best = c
+            break
+    if best is None:
+        # Else: any D with empty
+        for c in sorted(candidates, key=lambda x: x["D"]):
+            if c["empty_peak"]:
+                best = c
+                break
+    if best is None:
+        # Else: just pick the first one (only V0)
+        best = candidates[0]
 
-    # Else: any D with empty
+    best = dict(best)
+    best["decompose"] = None
     for c in sorted(candidates, key=lambda x: x["D"]):
-        if c["empty_peak"]:
-            return c
+        if c["D"] <= opts["decompose_max_d"] and c["empty_obs"]:
+            best["decompose"] = {"D": c["D"], "empty_obs": c["empty_obs"]}
+            break
+    return best
 
-    # Else: just pick the first one (only V0)
-    return candidates[0]
+
+def decompose_boundary(src, info, dec, top_n, max_align_cells):
+    """Base-level element boundaries from empty-vs-filled decomposition.
+
+    filled = source interval between the D-anchors, oriented with the
+    transposase on +; empty = each target's interval between the same anchors.
+    decompose_alleles() explains filled as empty + insert; the insert's
+    coordinates in the filled interval are the element boundaries. Each empty
+    votes (off5, off3) relative to the transposase; the most common call wins.
+    Returns a dict (or None when no empty decomposes to an insert that
+    contains the whole transposase)."""
+    D, tnp_len = dec["D"], info["tnp_len"]
+    g0 = src["start"] - 1 - D                 # genomic 0-based start of filled
+    g1 = src["end"] + D
+    filled = _fetch(src["contig"], g0, g1)
+    if not filled or len(filled) != g1 - g0:
+        return None
+    if src["strand"] == "-":
+        filled = revcomp(filled)
+    cells_ok = lambda e: len(e) * len(filled) <= max_align_cells  # noqa: E731
+
+    votes = Counter()
+    calls = []
+    methods = Counter()
+    n_try = 0
+    for eo in sorted(dec["empty_obs"], key=lambda x: -x["mean_ident"])[:top_n]:
+        n_try += 1
+        if eo["distance"] <= 0:
+            empty = ""
+        elif eo["strand"] == "+":
+            empty = _fetch(eo["tname"], eo["up_te"], eo["down_ts"])
+        else:
+            raw = _fetch(eo["tname"], eo["down_te"], eo["up_ts"])
+            empty = revcomp(raw) if raw else None
+        if empty is None:
+            continue
+        r = decompose_alleles(empty, filled, min_insert=max(50, tnp_len - 20),
+                              tolerant=cells_ok(empty))
+        methods[r["method"]] += 1
+        if r["method"] == "none":
+            continue
+        st, ln = r["insert_start"], r["insert_len"]
+        # the element must contain the whole transposase ORF
+        if st > D + 10 or st + ln < D + tnp_len - 10:
+            methods["insert_misses_tnp"] += 1
+            continue
+        off5, off3 = st - D, (st + ln) - (D + tnp_len)
+        votes[(off5, off3)] += 1
+        calls.append((off5, off3, st, ln, r, eo.get("assembly", "")))
+    if not votes:
+        return {"ok": False, "D": D, "n_attempted": n_try,
+                "method_counts": dict(methods)}
+    (off5, off3), n_cons = votes.most_common(1)[0]
+    off5, off3, st, ln, r, asm = next(c for c in calls if (c[0], c[1]) == (off5, off3))
+    ins = filled[st:st + ln]
+    tsd_len, tsd_seq, tsd_side, tsd_conf = find_tsd(ins, filled[:st], filled[st + ln:])
+    # genomic coordinates of the element (0-based half-open)
+    if src["strand"] == "+":
+        is0, is1 = g0 + st, g0 + st + ln
+    else:
+        is0, is1 = g1 - (st + ln), g1 - st
+    return {"ok": True, "D": D, "is_start_0": is0, "is_end_0": is1,
+            "off5": off5, "off3": off3, "length": ln,
+            "n_attempted": n_try, "n_decomposed": len(calls),
+            "n_consensus": n_cons,
+            "consensus_support": round(n_cons / len(calls), 3),
+            "n_distinct_calls": len(votes),
+            "method_counts": dict(methods),
+            "consensus_method": r["method"], "event_class": r["event_class"],
+            "empty_offset": r["offset"],
+            "junction_microhomology_bp": r["junction_microhomology_bp"],
+            "target_lost_bp": r["target_lost_bp"],
+            "tsd": {"length": tsd_len, "sequence": tsd_seq, "side": tsd_side,
+                    "confidence": tsd_conf},
+            "example_empty_assembly": asm}
 
 
 def main():
@@ -409,7 +488,8 @@ def main():
 
     # Parse anchor PAF
     print(f"Parsing anchor PAF...", file=sys.stderr)
-    ncbi_hits, n_total, n_kept = parse_paf_into_hits(args.paf, args.min_identity, args.min_coverage)
+    ncbi_hits, n_total, n_kept = load_anchor_hits(args.paf, args.min_identity,
+                                                  args.min_coverage)
     print(f"  PAF: {n_total:,} rows, {n_kept:,} kept", file=sys.stderr)
     logan_hits = {}  # legacy compatibility; unused with single-DB design
 
@@ -419,8 +499,11 @@ def main():
 
     # Pre-filter refs to those with a valid pick (cheap; no FASTA I/O)
     work_items = []
+    opts = {"tol_bp": args.tol_bp, "tol_frac": args.tol_frac,
+            "margin": args.margin, "max_extra_bp": args.max_extra_bp,
+            "decompose_max_d": args.decompose_max_d}
     for ref_id, info in ref_info.items():
-        best = pick_best_d(ncbi_hits, ref_id, info, distances)
+        best = pick_best_d(ncbi_hits, ref_id, info, distances, opts)
         if not best:
             n_neither += 1
             continue
@@ -441,7 +524,8 @@ def main():
     down_flank_seqs = []
     empty_junction_seqs = []
 
-    pool_args = [(item, args.genome_db, args.flank_out_len, args.top_empty, db_label)
+    pool_args = [(item, args.genome_db, args.flank_out_len, args.top_empty, db_label,
+                  args.max_align_cells)
                  for item in work_items]
     with Pool(args.threads, initializer=_worker_init,
               initargs=(args.genome_db,)) as pool:
@@ -484,9 +568,12 @@ def main():
     with open(os.path.join(args.out, "summary.tsv"), "w") as f:
         f.write("ref_id\tassembly\tcontig\ttnp_start\ttnp_end\ttnp_strand\t"
                 "is_element_len\ttnp_len\tD_used\tsource_db\tv0_peak\tempty_peak\t"
-                "n_v0\tn_empty\tn_v1plus\tn_top_empty\n")
+                "n_v0\tn_empty\tn_v1plus\tn_top_empty\t"
+                "boundary_method\toffset_5p\toffset_3p\tdecomp_D\tdecomp_support\t"
+                "junction_microhomology_bp\ttsd_len\tevent_key\n")
         for r in all_records:
             be = r["boundary_evidence"]
+            dc = be.get("decomposition") or {}
             f.write(f"{r['ref_id']}\t{r['source']['assembly']}\t{r['source']['contig']}\t"
                     f"{r['source']['transposase_start']}\t{r['source']['transposase_end']}\t"
                     f"{r['source']['transposase_strand']}\t"
@@ -494,10 +581,21 @@ def main():
                     f"{be['anchor_distance_D']}\t{be['source_db']}\t"
                     f"{be['v0_peak_distance']}\t{be['empty_peak_distance']}\t"
                     f"{be['n_v0_observations']}\t{be['n_empty_observations']}\t"
-                    f"{be['n_v1plus_observations']}\t{be['n_top_empty_kept']}\n")
+                    f"{be['n_v1plus_observations']}\t{be['n_top_empty_kept']}\t"
+                    f"{be['method']}\t{r['is_element']['start_offset_5p']}\t"
+                    f"{r['is_element']['end_offset_3p']}\t"
+                    f"{dc.get('D', '')}\t{dc.get('consensus_support', '')}\t"
+                    f"{dc.get('junction_microhomology_bp', '')}\t"
+                    f"{(dc.get('tsd') or {}).get('length', '')}\t{r['event_key']}\n")
 
     print(f"\n=== Build summary ===", file=sys.stderr)
     print(f"  Records built:       {n_done}", file=sys.stderr)
+    n_dec = sum(1 for r in all_records
+                if r["boundary_evidence"]["method"] == "empty_vs_filled_decomposition")
+    print(f"  Boundary by decomposition: {n_dec:,} / {len(all_records):,} "
+          f"(rest: peak_symmetric_fallback)", file=sys.stderr)
+    print(f"  Distinct insertion events (event_key): "
+          f"{len({r['event_key'] for r in all_records}):,}", file=sys.stderr)
     print(f"  No empty found:      {n_neither}", file=sys.stderr)
     print(f"  All outputs in: {args.out}", file=sys.stderr)
 

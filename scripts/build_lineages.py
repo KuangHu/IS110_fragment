@@ -1,9 +1,18 @@
 #!/usr/bin/env python3
-"""Lineage builder v3 — corrected framing: every step is an insertion.
+"""Lineage builder v3 — nested containment series per anchor site.
 
 For each V1 anchor site, sort all observed IS variants by length (shortest to
 longest), with V0=empty at the start. Each step must contain the previous step
-with high identity AND coverage (this defines a true nested insertion).
+with high identity AND coverage (this defines a nested series).
+
+DIRECTION IS NOT INFERRED. A containment series V0 < V1 < V2 is equally
+consistent with successive insertions (V0 -> V1 -> V2) and with successive
+deletions (V2 -> V1 -> V0): `L-X-R` vs `L-R` cannot tell insertion from
+deletion. In the fna project, deciding direction by majority/frequency gave a
+different ancestral allele on 55.7% of loci when the outgroup set changed;
+only a local-flank genealogy with outgroups made the call stable. So every
+lineage is emitted with "direction": "unpolarized", and nothing downstream
+may read step order as time order until a polarity test has been run.
 
 Output per V1:
   [V0 empty,  V1 shortest,  V2 = V1 + insertion,  V3 = V2 + insertion, ...]
@@ -98,6 +107,9 @@ def pairwise_minimap2(seqs, work_dir, threads):
     write_fa(fa, seqs)
     paf = os.path.join(work_dir, "av.paf")
     subprocess.run(["minimap2", "-x", "asm10", "-c", "--eqx",
+                    "-f", "0",  # keep ALL minimizers: the default drops the most frequent
+                    # ones, which in a self-alignment are exactly the repeats sought
+                    # (fna project: 0 of 60 IS1 copies found without it, 57 with)
                     "-t", str(threads), fa, fa, "-o", paf],
                    check=True, capture_output=True)
     seq_lens = {sid: len(s) for sid, s in seqs}
@@ -218,11 +230,15 @@ def main():
                 variants_raw[vid] = {
                     "vid": vid, "seq": seq, "len": o.get("variant_len", len(seq)),
                     "n_observations": 0, "example_target": o["target"],
+                    "nested_event_keys": set(),
                     "v_ref_cov_pct": round(
                         o["comparison_to_v1"]["total_matched_bp"] / v1_len * 100, 1
                     ),
                 }
             variants_raw[vid]["n_observations"] += 1
+            ni = o.get("nested_insert")
+            if ni:
+                variants_raw[vid]["nested_event_keys"].add(ni["event_key"])
 
         # Add V_ref itself as a "variant" entry (if observed clonally)
         v_ref_seq = None
@@ -266,6 +282,9 @@ def main():
                         aggregated[rep]["cluster_members"] = []
                         aggregated[rep]["n_observations"] = 0
                     aggregated[rep]["cluster_members"].append(vid)
+                    aggregated[rep]["nested_event_keys"] = (
+                        set(aggregated[rep].get("nested_event_keys", ()))
+                        | v.get("nested_event_keys", set()))
                     aggregated[rep]["n_observations"] += v["n_observations"]
                 variants_raw = aggregated
 
@@ -287,6 +306,8 @@ def main():
                 bucket.sort(key=lambda v: (-v["n_observations"], -v["len"]))
                 rep = bucket[0].copy()
                 rep["n_observations"] = sum(v["n_observations"] for v in bucket)
+                rep["nested_event_keys"] = set().union(
+                    *(v.get("nested_event_keys", set()) for v in bucket))
                 rep["bucket_size"] = len(bucket)
                 rep["bucket_lengths"] = [v["len"] for v in bucket]
                 collapsed.append(rep)
@@ -345,6 +366,7 @@ def main():
                     "n_observations": v["n_observations"],
                     "v_ref_cov_pct": v["v_ref_cov_pct"],
                     "example_target": v["example_target"],
+                    "nested_event_keys": sorted(v.get("nested_event_keys", ())),
                     "identity_to_prev": id_to_prev,
                     "coverage_to_prev": cov_to_prev,
                     "upstream":   upstream_seq,
@@ -361,6 +383,10 @@ def main():
             "v1_id": v1_id,
             "v_ref_length": v1_len,
             "n_lineages": len(lineages),
+            "direction": "unpolarized",
+            "direction_note": "steps are ordered by length and nested by "
+                              "containment; this is not a time order",
+            "counts_are": "distinct assemblies (GCA/GCF twins collapsed)",
             "lineages": lineages,
         }
 
@@ -375,7 +401,7 @@ def main():
     with open(os.path.join(args.out, "lineages.tsv"), "w") as f:
         f.write("v1_id\tv_ref_length\tlineage_idx\tstep\tlabel\ttype\tlength\t"
                 "variant_id\tn_observations\tv_ref_cov_pct\t"
-                "identity_to_prev\tcoverage_to_prev\texample_target\n")
+                "identity_to_prev\tcoverage_to_prev\texample_target\tdirection\n")
         for v1_id, info in out_lineages.items():
             for li, lineage in enumerate(info["lineages"]):
                 for s in lineage:
@@ -385,7 +411,8 @@ def main():
                             f"{s['n_observations']}\t{s.get('v_ref_cov_pct', '')}\t"
                             f"{s.get('identity_to_prev', '')}\t"
                             f"{s.get('coverage_to_prev', '')}\t"
-                            f"{s.get('example_target', '')}\n")
+                            f"{s.get('example_target', '')}\t"
+                            f"{info['direction']}\n")
 
     print(f"\nSaved: {args.out}/lineages.json", file=sys.stderr)
     print(f"Saved: {args.out}/lineages.tsv", file=sys.stderr)

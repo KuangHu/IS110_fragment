@@ -19,6 +19,9 @@ import re
 import sys
 from collections import defaultdict
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from lib_alleles import representative_asm  # noqa: E402
+
 
 ANCHOR_RE = re.compile(r"^(.+)__(up|down)(\d+)$")
 
@@ -83,6 +86,19 @@ def main():
             })
 
     print(f"PAF: {n_total:,} lines, {n_kept:,} kept (D={args.anchor_D})", file=sys.stderr)
+
+    # GCA_x and GCF_x are the same genome: keep one representative per
+    # assembly core so each rearrangement is not counted twice.
+    asms_per_ref = defaultdict(set)
+    for (ref_id, assembly) in obs:
+        asms_per_ref[ref_id].add(assembly)
+    n_twin = 0
+    for ref_id, asms in asms_per_ref.items():
+        keep = set(representative_asm(asms).values())
+        for a in asms - keep:
+            del obs[(ref_id, a)]
+            n_twin += 1
+    print(f"Dropped {n_twin:,} duplicate GCA/GCF (ref, assembly) pairs", file=sys.stderr)
     print(f"Unique (ref, target_assembly) pairs: {len(obs):,}", file=sys.stderr)
 
     counters = defaultdict(int)

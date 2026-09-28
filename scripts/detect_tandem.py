@@ -43,6 +43,9 @@ def self_minimap2(seq, work_dir, threads):
     with open(fa, "w") as f:
         f.write(">s\n" + seq + "\n")
     subprocess.run(["minimap2", "-x", "asm10", "-c", "--eqx",
+                    "-f", "0",  # keep ALL minimizers: the default drops the most frequent
+                    # ones, which in a self-alignment are exactly the repeats sought
+                    # (fna project: 0 of 60 IS1 copies found without it, 57 with)
                     "-X",  # skip self-self diagonal
                     "-t", str(threads), fa, fa, "-o", paf],
                    check=True, capture_output=True)

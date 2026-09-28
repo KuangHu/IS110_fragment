@@ -33,6 +33,9 @@ MIN_COV="${MIN_COV:-80}"
 HIST_BIN="${HIST_BIN:-50}"
 MIN_IS_SIZE="${MIN_IS_SIZE:-800}"
 MAX_IS_SIZE="${MAX_IS_SIZE:-200000}"
+# minimap2 -N for the anchor search; each anchor reports <= N+1 targets.
+# 50 samples a large DB -- set >= number of distinct assemblies for a census.
+MAX_SECONDARY="${MAX_SECONDARY:-50}"
 THREADS="${SLURM_CPUS_PER_TASK:-32}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/scripts"
@@ -48,4 +51,6 @@ python3 "$SCRIPT_DIR/pipeline.py" \
     --histogram-bin "$HIST_BIN" \
     --min-is-size "$MIN_IS_SIZE" \
     --max-is-size "$MAX_IS_SIZE" \
-    --threads "$THREADS"
+    --max-secondary "$MAX_SECONDARY" \
+    --threads "$THREADS" \
+    "${@:4}"

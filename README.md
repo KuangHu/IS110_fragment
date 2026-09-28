@@ -20,6 +20,10 @@ downstream). Search those anchors across a database of genomes:
 - Anchors paired far apart → V0 (IS still there, plus any cargo)
 
 The difference between the two peak distances **is the IS element length**.
+The element's **boundaries** come from decomposing the filled interval against
+each empty interval (`filled = empty[:offset] + insert + empty[offset:]`): the
+insert's coordinates are the 5' and 3' ends, per side, to the base (up to the
+junction microhomology, which is reported).
 
 ## Pipeline stages
 
@@ -35,13 +39,15 @@ The difference between the two peak distances **is the IS element length**.
 │ 3. Anchor search  (minimap2 anchors vs target genome DB)         │
 │    → PAF                                                         │
 │                                                                  │
-│ 4. Anchor pair finder  (group up+down hits per target)           │
+│ 4. Anchor pair finder  (ONE scored placement per assembly)       │
 │    → TSV: ref_id, D, target, anchor pair distance, category     │
 │                                                                  │
-│ 5. Boundary peak caller  (histogram per ref/D; find V0 + empty)  │
-│    → TSV: ref_id, best D, V0 peak, empty peak, IS_length         │
+│ 5. Boundary caller  (per ref/D: V0 / empty / V1+ counts,         │
+│    element length from empties)                                  │
+│    → TSV: ref_id, D, counts, IS_length, anchor_search_capped     │
 │                                                                  │
-│ 6. Records builder  (assemble per-IS JSON with all metadata)     │
+│ 6. Records builder  (empty-vs-filled DECOMPOSITION → per-side    │
+│    boundaries, microhomology, TSD, event_key)                    │
 │    → JSON: { is_id, boundary, source, empties, fills }           │
 │                                                                  │
 │ 7. Rearrangement detection  (optional, --detect-rearrangements)  │
@@ -56,7 +62,8 @@ The difference between the two peak distances **is the IS element length**.
 │ 9. Lineage building                                              │
 │    Per anchor site, sort variants shortest → longest and verify  │
 │    each step contains the previous (≥95% id, ≥80% cov).          │
-│    → lineages.json (V0 EMPTY → V1 → V2 → … chains)              │
+│    → lineages.json (V0 EMPTY ⊂ V1 ⊂ V2 … containment series,     │
+│      "direction": "unpolarized" — NOT a time order)              │
 │                                                                  │
 │10a. V_0 CDS validation                                           │
 │    Require the smallest variant of each lineage to still         │
@@ -113,6 +120,31 @@ identifier — slot in by producing the same Stage 1 output TSV
 (`is_id, assembly, contig, tnp_start, tnp_end, tnp_strand, tnp_len, domains_hit`).
 Stages 2–7 are IS-family-agnostic and consume only that TSV.
 
+## Correctness notes (2026-09 upgrade, ported from fna_based_mgefinder_project)
+
+Each item below was a measured bug in the fna project and was present here.
+
+| # | was | now |
+|---|---|---|
+| 1 | `find_variants.py` skipped `between_end <= between_start`, so clean empty sites (anchors abut, gap 0, or overlap by the TSD) were **discarded** | gaps down to `-max_anchor_overlap` are kept; 0-bp empties are counted |
+| 2 | every up × down hit pair on a contig was emitted and counted; anchors could pair across repeat copies (up to 200–500 kb apart) | `lib_alleles.place_pair`: one length-normalised, scored placement per assembly, interval cap, runner-up margin → `ambiguous` placements are reported and never used as evidence |
+| 3 | empty tolerance = max(200, 10% of 2D): ±8 kb at D=40 kb, so filled IS110 sites read as empty; boundaries were a 50-bp-bin length split **symmetrically** around the transposase | absolute tolerance (`--tol-bp 100` + `--tol-frac 0.002`); boundaries by decomposition (`boundary_evidence.method = empty_vs_filled_decomposition`, fallback labelled `peak_symmetric_fallback`) |
+| 4 | self-alignments (`detect_tandem`, `duplication_tandem_db_scan`, lineage all-vs-all) ran minimap2 without `-f 0`, which drops the most frequent minimizers — i.e. the repeats being sought | `-f 0` |
+| 5 | GCA_x / GCF_x twins counted twice (E. coli DB: 13,027 assemblies = 7,723 distinct) and counts were per contig | Stage 1 keeps one representative per assembly; every count is per distinct assembly |
+| 6 | lineages were described as successive insertions | labelled `"direction": "unpolarized"`; length order is not time order (see `build_lineages.py`) |
+| 7 | variants keyed by an exact, orientation-dependent hash | `event_key` (records) and `nested_insert.event_key` (variants): orientation- and junction-invariant insert key + canonical context |
+
+**Anchor-search cap.** minimap2 `-N` limits each anchor to N+1 targets. On the
+E. coli DB with the old `-N 50`, 91% of anchors (1,986,882 / 2,179,807) hit
+exactly 51 rows, so every count was a *sample* of the DB biased to the closest
+matches. `--max-secondary` (env `MAX_SECONDARY` in the template) now sets it;
+Stage 5 flags capped anchors in `anchor_search_capped`. For a census set it to
+at least the number of distinct assemblies — PAF size grows with it.
+
+Tests: `sbatch tests/run_tests.sh [WORK_DIR]` runs unit tests and a synthetic
+end-to-end run with known boundaries (both strands, a GCA/GCF twin, a SNP-divergent
+empty and a nested cargo insertion).
+
 ## Usage
 
 ### Quick start (use defaults — IS110)
@@ -156,6 +188,7 @@ results = find_is_boundaries(
 Cross_reference_IS/
 ├── README.md                         — this file
 ├── scripts/
+│   ├── lib_alleles.py                — shared placement / decomposition / dedup helpers
 │   ├── is_detect.py                  — HMM-based IS detection (Stage 1)
 │   ├── extract_anchors.py            — multi-D anchor FASTA builder
 │   ├── find_anchor_pairs.py          — pair up/down anchors per target
