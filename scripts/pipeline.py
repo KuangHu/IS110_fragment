@@ -202,6 +202,7 @@ def detect_growing_and_tandem(
         cmd = ["python3", os.path.join(script_dir, "build_lineages.py"),
                "--obs", obs_json,
                "--out", lineage_dir,
+               "--records", records_json,
                "--cluster-id", str(cluster_id),
                "--min-step-bp", str(min_step_bp),
                "--threads", str(min(threads, 8))]

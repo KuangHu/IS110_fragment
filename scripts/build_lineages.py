@@ -29,13 +29,16 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--obs", required=True)
     p.add_argument("--out", required=True)
+    p.add_argument("--records", default="",
+                   help="Optional records.json — used to attach the real V_ref "
+                        "DNA sequence to v_ref steps (otherwise sequence stays empty).")
     p.add_argument("--anchor-identity", type=float, default=95)
     p.add_argument("--cluster-id", type=float, default=0.99,
                    help="cd-hit-est identity for collapsing variants (default 0.99)")
     p.add_argument("--step-identity", type=float, default=95,
                    help="Min %% identity between adjacent steps (default 95)")
-    p.add_argument("--step-coverage", type=float, default=80,
-                   help="Min %% of shorter step covered by longer step (default 80)")
+    p.add_argument("--step-coverage", type=float, default=95,
+                   help="Min %% of shorter step covered by longer step (default 95)")
     p.add_argument("--min-step-bp", type=int, default=200,
                    help="Min length difference between adjacent steps (smaller diffs "
                         "are treated as the same step, just SNP variants; default 200)")
@@ -157,6 +160,28 @@ def main():
         obs = json.load(f)
     print(f"  {len(obs):,} observations", file=sys.stderr)
 
+    v_ref_seqs = {}      # ref_id -> IS-element nt sequence (for v_ref steps)
+    v_upstreams = {}     # ref_id -> upstream flank sequence (shared by every step in the chain)
+    v_downstreams = {}   # ref_id -> downstream flank sequence
+    if args.records and os.path.exists(args.records):
+        print(f"Loading V_ref + flank sequences from {args.records}...", file=sys.stderr, flush=True)
+        with open(args.records) as f:
+            recs = json.load(f)
+        for r in recs:
+            rid = r.get("ref_id") or r.get("is110_id")
+            src = r.get("source", {})
+            ie = r.get("is_element") or src.get("is_element") or {}
+            up = r.get("upstream_flank") or src.get("upstream_flank") or {}
+            dn = r.get("downstream_flank") or src.get("downstream_flank") or {}
+            if not rid:
+                continue
+            if ie.get("sequence"): v_ref_seqs[rid] = ie["sequence"]
+            if up.get("sequence"): v_upstreams[rid] = up["sequence"]
+            if dn.get("sequence"): v_downstreams[rid] = dn["sequence"]
+        print(f"  V_ref/flanks loaded: ref={len(v_ref_seqs):,}, "
+              f"up={len(v_upstreams):,}, down={len(v_downstreams):,}",
+              file=sys.stderr)
+
     per_v1 = defaultdict(list)
     for o in obs:
         per_v1[o["v1_parent_id"]].append(o)
@@ -208,7 +233,9 @@ def main():
         # Easier: just record V_ref as a placeholder with length=v1_len and no seq.
         if n_clonal > 0:
             variants_raw["V_REF"] = {
-                "vid": "V_REF", "seq": "", "len": v1_len,
+                "vid": "V_REF",
+                "seq": v_ref_seqs.get(v1_id, ""),
+                "len": v1_len,
                 "n_observations": n_clonal, "example_target": v1_id,
                 "v_ref_cov_pct": 100.0,
             }
@@ -220,14 +247,16 @@ def main():
         if len(variants_raw) > 1:
             work_dir = os.path.join(work_root, v1_id.replace("|", "_").replace(".", "_"))
             os.makedirs(work_dir, exist_ok=True)
-            seqs = [(v["vid"], v["seq"]) for v in variants_raw.values() if v["seq"]]
-            # Skip V_REF in clustering since it has no sequence
+            # Exclude V_REF from clustering — it represents the canonical IS and
+            # must stay as its own entry, even though it now carries a sequence.
+            seqs = [(v["vid"], v["seq"]) for v in variants_raw.values()
+                    if v["seq"] and v["vid"] != "V_REF"]
             if seqs:
                 mapping = cluster_variants(seqs, args.cluster_id, work_dir)
                 aggregated = {}
                 for vid, v in variants_raw.items():
-                    if not v["seq"]:
-                        # V_REF kept as-is
+                    if vid == "V_REF" or not v["seq"]:
+                        # V_REF kept as-is (even with sequence populated)
                         aggregated[vid] = v.copy()
                         aggregated[vid]["cluster_members"] = [vid]
                         continue
@@ -276,6 +305,10 @@ def main():
         chains = build_chains(variants_sorted, pair_metrics,
                               args.step_identity, args.step_coverage)
 
+        # flanks for this anchor site (shared across every step of every chain)
+        upstream_seq   = v_upstreams.get(v1_id, "")
+        downstream_seq = v_downstreams.get(v1_id, "")
+
         # Format each chain with the empty prefix
         lineages = []
         for chain in chains:
@@ -287,6 +320,9 @@ def main():
                     "n_observations": n_empty,
                     "identity_to_prev": None,
                     "coverage_to_prev": None,
+                    "upstream":   upstream_seq,
+                    "insertion":  "",
+                    "downstream": downstream_seq,
                 })
             for i, idx in enumerate(chain):
                 v = variants_sorted[idx]
@@ -311,6 +347,9 @@ def main():
                     "example_target": v["example_target"],
                     "identity_to_prev": id_to_prev,
                     "coverage_to_prev": cov_to_prev,
+                    "upstream":   upstream_seq,
+                    "insertion":  v.get("seq", ""),
+                    "downstream": downstream_seq,
                 })
             if len(steps) >= 2:
                 lineages.append(steps)
