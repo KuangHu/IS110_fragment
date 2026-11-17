@@ -13,12 +13,15 @@ import argparse, os, subprocess, tempfile, shutil, sys
 from collections import defaultdict
 import pyrodigal
 
+# Repo-relative so the defaults survive the repo being moved/cloned elsewhere.
+HMM_DIR = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "hmm"))
+
 
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--in-fa",   required=True, help="Input multi-record IS FASTA")
-    p.add_argument("--hmm-dedd", default="/global/home/users/kh36969/Cross_reference_IS/hmm/PF01548.hmm")
-    p.add_argument("--hmm-tnp20", default="/global/home/users/kh36969/Cross_reference_IS/hmm/PF02371.hmm")
+    p.add_argument("--hmm-dedd", default=os.path.join(HMM_DIR, "PF01548.hmm"))
+    p.add_argument("--hmm-tnp20", default=os.path.join(HMM_DIR, "PF02371.hmm"))
     p.add_argument("--out-fa",  required=True, help="Output IS110-only FASTA")
     p.add_argument("--out-tsv", required=True, help="Per-IS hit summary TSV")
     p.add_argument("--threads", type=int, default=16)

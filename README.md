@@ -150,7 +150,7 @@ empty and a nested cargo insertion).
 ### Quick start (use defaults — IS110)
 
 ```bash
-cd /global/home/users/kh36969/Cross_reference_IS
+cd /global/home/users/kh36969/IS110_ecology/Cross_reference_IS
 sbatch templates/run_pipeline.sh \
   --hmm hmm/PF01548.hmm,hmm/PF02371.hmm \
   --db /path/to/genome_db.fa \
