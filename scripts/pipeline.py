@@ -18,7 +18,14 @@ Stages:
  10b. detect_tandem.py        — self-alignment tandem-repeat detection
  11. viz_lineage.py/viz_tandem.py — figures (optional, on by default with --detect-growing-tandem)
 
-Each stage is cacheable: if its output exists, re-running skips it.
+Each stage is cacheable. A stage is skipped only when its completion marker
+(<out>/.stage_<name>.done, written after the stage exits successfully) AND its
+outputs exist. Output existence alone is not enough: a stage killed mid-write
+(SLURM time limit, OOM) leaves a partial file -- a truncated PAF silently
+removes anchors from every later count. Outputs without a marker are re-made;
+pass --trust-existing to adopt the outputs of a run made before markers
+existed. Stage 1 is the exception: is_hits.tsv is written atomically by
+is_detect.py and may also be supplied by hand, so its existence is trusted.
 
 CLI:
     # Boundary call only:
@@ -32,6 +39,49 @@ Python API:
     from pipeline import find_is_boundaries, detect_growing_and_tandem
 """
 import argparse, os, subprocess, sys
+
+
+_STAGE_ORDER = ["2_anchors", "3_minimap2", "4_pairs", "5_boundaries", "6_records",
+                "7_rearrangements", "8_variants", "9_lineages", "10a_v0_cds",
+                "10b_tandem"]
+
+
+def _run_stage(output_dir, name, title, cmd, outputs, trust_existing=False,
+               atomic_o=None):
+    """Run one cached stage. `outputs`: files that must exist for a skip.
+    `atomic_o`: (flag_index_in_cmd) of a single output path that the tool
+    writes itself; it is written to <path>.tmp and renamed on success."""
+    marker = os.path.join(output_dir, f".stage_{name}.done")
+    have = all(os.path.exists(o) for o in outputs)
+    if have and os.path.exists(marker):
+        return
+    if have and trust_existing and all(os.path.getsize(o) > 0 for o in outputs):
+        print(f"=== {title}: adopting existing outputs (--trust-existing) ===",
+              flush=True)
+        open(marker, "w").close()
+        return
+    if any(os.path.exists(o) for o in outputs):
+        print(f"=== {title}: outputs present but no completion marker "
+              f"(interrupted or pre-marker run) -- re-running ===", flush=True)
+    # This stage is about to change its outputs, so every later stage's
+    # result is stale: drop their markers too (they re-run in order).
+    for later in _STAGE_ORDER[_STAGE_ORDER.index(name):]:
+        m = os.path.join(output_dir, f".stage_{later}.done")
+        if os.path.exists(m):
+            os.remove(m)
+    print(f"=== {title} ===", flush=True)
+    if atomic_o is not None:
+        final = cmd[atomic_o]
+        cmd = list(cmd)
+        cmd[atomic_o] = final + ".tmp"
+        subprocess.run(cmd, check=True)
+        os.replace(final + ".tmp", final)
+    else:
+        subprocess.run(cmd, check=True)
+    missing = [o for o in outputs if not os.path.exists(o)]
+    if missing:
+        raise RuntimeError(f"{title}: finished without writing {missing}")
+    open(marker, "w").close()
 
 
 def find_is_boundaries(
@@ -51,8 +101,17 @@ def find_is_boundaries(
     detect_rearrangements=False,
     anchor_d_rearrangements=1000,
     max_secondary=50,
+    trust_existing=False,
 ):
     os.makedirs(output_dir, exist_ok=True)
+    # An anchor at distance D needs D + anchor_length bp of flank; with the
+    # old defaults (flank 80000, D up to 80000) the largest distance was
+    # silently never generated.
+    need = max(distances) + anchor_length
+    if flank < need:
+        print(f"NOTE: --flank {flank} < max distance + anchor length; using {need}",
+              flush=True)
+        flank = need
     script_dir = os.path.dirname(os.path.abspath(__file__))
 
     is_hits_tsv = os.path.join(output_dir, "is_hits.tsv")
@@ -79,89 +138,87 @@ def find_is_boundaries(
         print("=== Stage 1: IS detection ===", flush=True)
         subprocess.run(cmd, check=True)
 
+    def stage(name, title, cmd, outputs, **kw):
+        _run_stage(output_dir, name, title, cmd, outputs,
+                   trust_existing=trust_existing, **kw)
+
     # Stage 2
-    if not os.path.exists(anchors_fa):
-        cmd = ["python3", os.path.join(script_dir, "extract_anchors.py"),
-               "--hits", is_hits_tsv,
-               "--genome-db", src_db,
-               "--out", anchors_prefix,
-               "--flank", str(flank),
-               "--anchor-length", str(anchor_length),
-               "--distances", ",".join(str(d) for d in distances),
-               "--threads", str(threads)]
-        print("=== Stage 2: anchor extraction ===", flush=True)
-        subprocess.run(cmd, check=True)
+    stage("2_anchors", "Stage 2: anchor extraction",
+          ["python3", os.path.join(script_dir, "extract_anchors.py"),
+           "--hits", is_hits_tsv,
+           "--genome-db", src_db,
+           "--out", anchors_prefix,
+           "--flank", str(flank),
+           "--anchor-length", str(anchor_length),
+           "--distances", ",".join(str(d) for d in distances),
+           "--threads", str(threads)],
+          [anchors_fa, ref_table_tsv])
 
     # Stage 3
-    if not os.path.exists(anchors_paf):
-        # Use 'sr' preset for short anchor queries (500 bp).
-        # -N caps secondary alignments PER ANCHOR: each anchor reports at most
-        # N+1 targets. On the 13,027-assembly E. coli DB with -N 50, 91% of
-        # anchors (1,986,882 / 2,179,807) hit exactly 51 rows -- every count
-        # downstream is a sample of the DB, biased to the closest matches.
-        # Raise --max-secondary to at least the number of distinct assemblies
-        # for a census (PAF size grows ~linearly with it).
-        cmd = ["minimap2", "-x", "sr", "-c", "--eqx",
-               "--secondary=yes", "-N", str(max_secondary), "-p", "0.5",
-               "-t", str(threads),
-               genome_db, anchors_fa, "-o", anchors_paf]
-        print("=== Stage 3: anchors vs DB (minimap2) ===", flush=True)
-        subprocess.run(cmd, check=True)
+    # Use 'sr' preset for short anchor queries (500 bp).
+    # -N caps secondary alignments PER ANCHOR: each anchor reports at most
+    # N+1 targets. On the 13,027-assembly E. coli DB with -N 50, 91% of
+    # anchors (1,986,882 / 2,179,807) hit exactly 51 rows -- every count
+    # downstream is a sample of the DB, biased to the closest matches.
+    # Raise --max-secondary to at least the number of distinct assemblies
+    # for a census (PAF size grows ~linearly with it).
+    cmd = ["minimap2", "-x", "sr", "-c", "--eqx",
+           "--secondary=yes", "-N", str(max_secondary), "-p", "0.5",
+           "-t", str(threads),
+           genome_db, anchors_fa, "-o", anchors_paf]
+    stage("3_minimap2", "Stage 3: anchors vs DB (minimap2)", cmd, [anchors_paf],
+          atomic_o=len(cmd) - 1)
 
     # Stage 4
-    if not os.path.exists(pairs_prefix + "_pairs.tsv"):
-        cmd = ["python3", os.path.join(script_dir, "find_anchor_pairs.py"),
-               "--paf", anchors_paf,
-               "--ref-table", ref_table_tsv,
-               "--out", pairs_prefix,
-               "--min-identity", str(min_identity),
-               "--min-coverage", str(min_coverage)]
-        print("=== Stage 4: anchor pair finder ===", flush=True)
-        subprocess.run(cmd, check=True)
+    stage("4_pairs", "Stage 4: anchor pair finder",
+          ["python3", os.path.join(script_dir, "find_anchor_pairs.py"),
+           "--paf", anchors_paf,
+           "--ref-table", ref_table_tsv,
+           "--out", pairs_prefix,
+           "--min-identity", str(min_identity),
+           "--min-coverage", str(min_coverage)],
+          [pairs_prefix + "_pairs.tsv", pairs_prefix + "_summary.tsv"])
 
     # Stage 5
-    if not os.path.exists(boundaries_prefix + "_summary.tsv"):
-        cmd = ["python3", os.path.join(script_dir, "call_boundaries.py"),
-               "--paf", anchors_paf,
-               "--ref-table", ref_table_tsv,
-               "--out", boundaries_prefix,
-               "--min-identity", str(min_identity),
-               "--min-coverage", str(min_coverage),
-               "--histogram-bin", str(histogram_bin),
-               "--min-is-size", str(expected_is_size_range[0]),
-               "--max-is-size", str(expected_is_size_range[1]),
-               "--max-secondary", str(max_secondary)]
-        print("=== Stage 5: boundary peak caller ===", flush=True)
-        subprocess.run(cmd, check=True)
+    stage("5_boundaries", "Stage 5: boundary peak caller",
+          ["python3", os.path.join(script_dir, "call_boundaries.py"),
+           "--paf", anchors_paf,
+           "--ref-table", ref_table_tsv,
+           "--out", boundaries_prefix,
+           "--min-identity", str(min_identity),
+           "--min-coverage", str(min_coverage),
+           "--histogram-bin", str(histogram_bin),
+           "--min-is-size", str(expected_is_size_range[0]),
+           "--max-is-size", str(expected_is_size_range[1]),
+           "--max-secondary", str(max_secondary)],
+          [boundaries_prefix + "_pairs.tsv", boundaries_prefix + "_summary.tsv"])
 
     # Stage 6
     records_json = os.path.join(records_dir, "records.json")
-    if not os.path.exists(records_json):
-        os.makedirs(records_dir, exist_ok=True)
-        cmd = ["python3", os.path.join(script_dir, "build_records.py"),
-               "--paf", anchors_paf,
-               "--ref-table", ref_table_tsv,
-               "--hits", is_hits_tsv,
-               "--genome-db", genome_db,
-               "--out", records_dir,
-               "--min-identity", str(min_identity),
-               "--min-coverage", str(min_coverage),
-               "--threads", str(threads)]
-        print("=== Stage 6: build records ===", flush=True)
-        subprocess.run(cmd, check=True)
+    os.makedirs(records_dir, exist_ok=True)
+    stage("6_records", "Stage 6: build records",
+          ["python3", os.path.join(script_dir, "build_records.py"),
+           "--paf", anchors_paf,
+           "--ref-table", ref_table_tsv,
+           "--hits", is_hits_tsv,
+           "--genome-db", genome_db,
+           "--out", records_dir,
+           "--min-identity", str(min_identity),
+           "--min-coverage", str(min_coverage),
+           "--threads", str(threads)],
+          [records_json, os.path.join(records_dir, "summary.tsv")])
 
     # Stage 7 (optional): rearrangement detection from the same anchor PAF
     if detect_rearrangements:
         rearr_prefix = os.path.join(output_dir, "rearrangements")
-        if not os.path.exists(rearr_prefix + "_examples.tsv"):
-            cmd = ["python3", os.path.join(script_dir, "find_rearrangements.py"),
-                   "--paf", anchors_paf,
-                   "--out", rearr_prefix,
-                   "--min-identity", str(min_identity),
-                   "--min-coverage", str(min_coverage),
-                   "--anchor-D", str(anchor_d_rearrangements)]
-            print("=== Stage 7: rearrangement detection ===", flush=True)
-            subprocess.run(cmd, check=True)
+        stage("7_rearrangements", "Stage 7: rearrangement detection",
+              ["python3", os.path.join(script_dir, "find_rearrangements.py"),
+               "--paf", anchors_paf,
+               "--out", rearr_prefix,
+               "--min-identity", str(min_identity),
+               "--min-coverage", str(min_coverage),
+               "--anchor-D", str(anchor_d_rearrangements)],
+              [rearr_prefix + "_examples.tsv"])
 
     return records_json
 
@@ -178,6 +235,7 @@ def detect_growing_and_tandem(
     min_tandem_repeat_len=50,
     min_tandem_copies=2,
     render_figures=True,
+    trust_existing=False,
 ):
     """Stages 8-11: variant discovery, lineage building, CDS validation, tandem
     detection, optional figure rendering. Outputs land in `output_dir/`."""
@@ -190,59 +248,59 @@ def detect_growing_and_tandem(
     tandem_dir = os.path.join(output_dir, "tandem")
     figs_dir = os.path.join(output_dir, "figures")
 
+    def stage(name, title, cmd, outputs):
+        _run_stage(output_dir, name, title, cmd, outputs,
+                   trust_existing=trust_existing)
+
     # Stage 8: find anchor-site variants (V_ref vs target → empty/clonal/deletion/insertion)
     obs_json = os.path.join(variants_dir, "observations.json")
-    if not os.path.exists(obs_json):
-        os.makedirs(variants_dir, exist_ok=True)
-        cmd = ["python3", os.path.join(script_dir, "find_variants.py"),
-               "--records", records_json,
-               "--db", genome_db,
-               "--out", variants_dir,
-               "--threads", str(threads),
-               "--min-v1-coverage", str(min_v1_coverage)]
-        print("=== Stage 8: anchor-site variant discovery ===", flush=True)
-        subprocess.run(cmd, check=True)
+    os.makedirs(variants_dir, exist_ok=True)
+    stage("8_variants", "Stage 8: anchor-site variant discovery",
+          ["python3", os.path.join(script_dir, "find_variants.py"),
+           "--records", records_json,
+           "--db", genome_db,
+           "--out", variants_dir,
+           "--threads", str(threads),
+           "--min-v1-coverage", str(min_v1_coverage)],
+          [obs_json])
 
     # Stage 9: build size-sorted nested lineages
     lineages_json = os.path.join(lineage_dir, "lineages.json")
-    if not os.path.exists(lineages_json):
-        os.makedirs(lineage_dir, exist_ok=True)
-        cmd = ["python3", os.path.join(script_dir, "build_lineages.py"),
-               "--obs", obs_json,
-               "--out", lineage_dir,
-               "--records", records_json,
-               "--cluster-id", str(cluster_id),
-               "--min-step-bp", str(min_step_bp),
-               "--threads", str(min(threads, 8))]
-        print("=== Stage 9: build lineages ===", flush=True)
-        subprocess.run(cmd, check=True)
+    os.makedirs(lineage_dir, exist_ok=True)
+    stage("9_lineages", "Stage 9: build lineages",
+          ["python3", os.path.join(script_dir, "build_lineages.py"),
+           "--obs", obs_json,
+           "--out", lineage_dir,
+           "--records", records_json,
+           "--cluster-id", str(cluster_id),
+           "--min-step-bp", str(min_step_bp),
+           "--threads", str(min(threads, 8))],
+          [lineages_json])
 
     # Stage 10a: validate V_0 retains the IS110 CDS
     validated_json = os.path.join(validated_dir, "lineages_validated.json")
-    if not os.path.exists(validated_json):
-        os.makedirs(validated_dir, exist_ok=True)
-        cmd = ["python3", os.path.join(script_dir, "validate_v0_cds.py"),
-               "--lineages", lineages_json,
-               "--obs", obs_json,
-               "--records", records_json,
-               "--out", validated_dir,
-               "--min-cds-coverage", str(min_cds_coverage)]
-        print("=== Stage 10a: CDS validation of V_0 ===", flush=True)
-        subprocess.run(cmd, check=True)
+    os.makedirs(validated_dir, exist_ok=True)
+    stage("10a_v0_cds", "Stage 10a: CDS validation of V_0",
+          ["python3", os.path.join(script_dir, "validate_v0_cds.py"),
+           "--lineages", lineages_json,
+           "--obs", obs_json,
+           "--records", records_json,
+           "--out", validated_dir,
+           "--min-cds-coverage", str(min_cds_coverage)],
+          [validated_json])
 
     # Stage 10b: tandem detection (self-alignment, catches even single-observation tandems)
     tandem_json = os.path.join(tandem_dir, "tandem_findings.json")
-    if not os.path.exists(tandem_json):
-        os.makedirs(tandem_dir, exist_ok=True)
-        cmd = ["python3", os.path.join(script_dir, "detect_tandem.py"),
-               "--records", records_json,
-               "--obs", obs_json,
-               "--out", tandem_dir,
-               "--min-repeat-len", str(min_tandem_repeat_len),
-               "--min-copies", str(min_tandem_copies),
-               "--threads", str(min(threads, 8))]
-        print("=== Stage 10b: tandem-repeat detection ===", flush=True)
-        subprocess.run(cmd, check=True)
+    os.makedirs(tandem_dir, exist_ok=True)
+    stage("10b_tandem", "Stage 10b: tandem-repeat detection",
+          ["python3", os.path.join(script_dir, "detect_tandem.py"),
+           "--records", records_json,
+           "--obs", obs_json,
+           "--out", tandem_dir,
+           "--min-repeat-len", str(min_tandem_repeat_len),
+           "--min-copies", str(min_tandem_copies),
+           "--threads", str(min(threads, 8))],
+          [tandem_json])
 
     # Stage 11 (optional): render figures
     if render_figures:
@@ -315,6 +373,10 @@ def main():
                    help="minimap2 -N for the anchor search: max targets per "
                         "anchor is N+1. Default 50 samples the DB; set it to at "
                         "least the number of distinct assemblies for a census")
+    p.add_argument("--trust-existing", action="store_true",
+                   help="Adopt stage outputs that exist but have no completion "
+                        "marker (runs made before markers existed). Without it "
+                        "such outputs are treated as interrupted and re-made")
     p.add_argument("--detect-rearrangements", action="store_true",
                    help="Run Stage 7: classify inversions/translocations/duplications "
                         "from the anchor PAF (off by default)")
@@ -352,6 +414,7 @@ def main():
         detect_rearrangements=args.detect_rearrangements,
         anchor_d_rearrangements=args.anchor_D_rearrangements,
         max_secondary=args.max_secondary,
+        trust_existing=args.trust_existing,
     )
     print(f"\nFinal records: {result}", flush=True)
 
@@ -368,6 +431,7 @@ def main():
             min_tandem_repeat_len=args.min_tandem_repeat_len,
             min_tandem_copies=args.min_tandem_copies,
             render_figures=not args.no_render_figures,
+            trust_existing=args.trust_existing,
         )
         print(f"\nStages 8-11 outputs:", flush=True)
         for k, v in ext.items():

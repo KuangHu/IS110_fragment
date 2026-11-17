@@ -15,6 +15,9 @@ Outputs (one prefix --out):
   - <out>_refs.fa     : full large-flank references
   - <out>_anchors.fa  : all anchors at all distances
   - <out>_table.tsv   : is_id, ref_len, anchor_len, tnp_len, flank_size, distances_csv
+                        (distances_csv = the D values generated for that ref;
+                        flanks are clamped at contig ends, so a ref near an
+                        end keeps its small-D anchors)
 
 Input: a single indexed FASTA (with .fai). Sequence extraction is via samtools.
 
@@ -60,8 +63,8 @@ def parse_args():
     return p.parse_args()
 
 
-def revcomp(seq):
-    return seq.translate(str.maketrans("ACGTNacgtn", "TGCANtgcan"))[::-1]
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from lib_alleles import revcomp  # noqa: E402  (IUPAC-aware)
 
 
 # ---- multiprocessing worker (pysam, in-process FASTA reads) ----------------
@@ -87,37 +90,37 @@ def _extract_one(hit):
     except (KeyError, ValueError):
         return None
 
-    ref_start_1 = tnp_start - flank
-    ref_end_1 = tnp_end + flank
-    if ref_start_1 < 1 or ref_end_1 > clen:
+    # Clamp the flanks to the contig instead of dropping the hit: requiring
+    # the full --flank on both sides discarded every IS within `flank` bp of a
+    # contig end (4.5% of E. coli hits at flank=20 kb, far more on plasmids
+    # and draft assemblies), even when the small-D anchors fit.
+    left_avail = min(flank, tnp_start - 1)
+    right_avail = min(flank, clen - tnp_end)
+    if left_avail < 0 or right_avail < 0 or tnp_len <= 0:
         return None
 
     # pysam.fetch is 0-based half-open: [start, end)
     try:
-        ref_seq = _FA.fetch(contig, ref_start_1 - 1, ref_end_1)
+        ref_seq = _FA.fetch(contig, tnp_start - 1 - left_avail, tnp_end + right_avail)
     except (KeyError, ValueError):
         return None
     if not ref_seq:
         return None
     ref_seq = ref_seq.upper()
-    if len(ref_seq) != flank + tnp_len + flank:
+    if len(ref_seq) != left_avail + tnp_len + right_avail:
         return None
     if strand == "-":
         ref_seq = revcomp(ref_seq)
+        up_flank, down_flank = right_avail, left_avail
+    else:
+        up_flank, down_flank = left_avail, right_avail
 
-    flank_size = flank
-    tnp_offset = flank_size
-    tnp_end_in_ref = flank_size + tnp_len
+    tnp_offset = up_flank
+    tnp_end_in_ref = up_flank + tnp_len
     ref_len = len(ref_seq)
 
-    ref_lines = [f">{is_id} ctg={contig} flank={flank_size} "
-                 f"tnp_len={tnp_len} strand={strand}"]
-    for i in range(0, ref_len, 80):
-        ref_lines.append(ref_seq[i:i+80])
-    ref_record = "\n".join(ref_lines) + "\n"
-
     anchor_parts = []
-    n_anchors = 0
+    used = []
     for d in distances:
         up_start = tnp_offset - d - anchor_length
         up_end = tnp_offset - d
@@ -129,18 +132,39 @@ def _extract_one(hit):
         down_seq = ref_seq[down_start:down_end]
         anchor_parts.append(f">{is_id}__up{d} d={d} anchor_len={anchor_length}\n{up_seq}")
         anchor_parts.append(f">{is_id}__down{d} d={d} anchor_len={anchor_length}\n{down_seq}")
-        n_anchors += 2
-    anchors_str = ("\n".join(anchor_parts) + "\n") if anchor_parts else ""
+        used.append(d)
+    if not used:
+        return None            # not even the smallest D fits on this contig
+    anchors_str = "\n".join(anchor_parts) + "\n"
 
+    ref_lines = [f">{is_id} ctg={contig} flank={up_flank} down_flank={down_flank} "
+                 f"tnp_len={tnp_len} strand={strand}"]
+    for i in range(0, ref_len, 80):
+        ref_lines.append(ref_seq[i:i+80])
+    ref_record = "\n".join(ref_lines) + "\n"
+
+    # `distances` lists only the D values that were actually generated for
+    # this reference, so downstream stages never expect anchors that do not
+    # exist. flank_size is the requested flank (the ref may be shorter).
     table_row = (f"{is_id}\t{ref_len}\t{anchor_length}\t{tnp_len}\t"
-                 f"{flank_size}\t{','.join(str(d) for d in distances)}\n")
-    return (ref_record, anchors_str, table_row, n_anchors)
+                 f"{flank}\t{','.join(str(d) for d in used)}\n")
+    return (ref_record, anchors_str, table_row, 2 * len(used))
 
 
 def main():
     args = parse_args()
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     distances = [int(d) for d in args.distances.split(",")]
+    unreachable = [d for d in distances if d + args.anchor_length > args.flank]
+    if unreachable:
+        # An anchor at distance D needs D + anchor_length bp of flank. These
+        # used to be skipped without a word (default flank 80000 with
+        # D=80000: the largest distance never existed).
+        print(f"WARNING: --flank {args.flank} is too short for D="
+              f"{','.join(map(str, unreachable))} (needs D + anchor length "
+              f"{args.anchor_length}); no anchors will be made at these distances. "
+              f"Raise --flank to >= {max(distances) + args.anchor_length}.",
+              file=sys.stderr, flush=True)
 
     keep_ids = None
     if args.keep_ids:
@@ -206,7 +230,7 @@ def main():
     print(f"Input hits:        {n_input:,}", file=sys.stderr)
     print(f"References built:  {n_refs:,}", file=sys.stderr)
     print(f"Anchors generated: {n_anchors:,}", file=sys.stderr)
-    print(f"Skipped (insufficient flank or missing contig): {n_skipped:,}",
+    print(f"Skipped (smallest D does not fit on the contig, or missing contig): {n_skipped:,}",
           file=sys.stderr)
 
 

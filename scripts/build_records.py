@@ -15,10 +15,11 @@ Algorithm per ref:
      boundaries, per side, with junction microhomology/TSD reported. The
      consensus over empties is used; if nothing decomposes, fall back to the
      peak difference split symmetrically around the transposase and say so
-     in boundary_evidence.method.
+     in boundary_evidence.method (peak_symmetric_fallback). A ref with no
+     empty site at all gets method no_empty_tnp_only: its "element" is the
+     transposase ORF, not a boundary call.
   6. Extract source sequences using the inferred boundaries
   7. Keep top-N empty observations by mean anchor identity
-  8. If NCBI gave no empties, also include Logan empties in the record
 
 Usage:
     build_records.py --paf anchors_vs_db.paf \\
@@ -31,7 +32,6 @@ Usage:
 import argparse
 import json
 import os
-import re
 import sys
 from collections import Counter, defaultdict
 from multiprocessing import Pool
@@ -41,7 +41,7 @@ import pysam
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from lib_alleles import (load_anchor_hits, place_per_assembly,  # noqa: E402
                          gap_tolerance, classify_gap, decompose_alleles,
-                         find_tsd, canon_key)
+                         find_tsd, canon_key, revcomp)
 
 
 def parse_args():
@@ -68,7 +68,8 @@ def parse_args():
                         "(default 5000)")
     p.add_argument("--max-align-cells", type=float, default=2e7,
                    help="Skip the SNP-tolerant alignment when len(empty)*len(filled) "
-                        "exceeds this (exact decomposition is still tried)")
+                        "exceeds this (exact decomposition, then the linear-time "
+                        "hamming split, are used instead)")
     p.add_argument("--tol-bp", type=int, default=100)
     p.add_argument("--tol-frac", type=float, default=0.002)
     p.add_argument("--margin", type=float, default=0.05)
@@ -76,13 +77,6 @@ def parse_args():
     p.add_argument("--threads", type=int, default=32,
                    help="Number of worker processes for sequence extraction (default 32)")
     return p.parse_args()
-
-
-ANCHOR_RE = re.compile(r"^(.+)__(up|down)(\d+)$")
-
-
-def revcomp(seq):
-    return seq.translate(str.maketrans("ACGTNacgtn", "TGCANtgcan"))[::-1]
 
 
 # ---- multiprocessing worker for parallel record build ----------------------
@@ -112,12 +106,18 @@ def _build_one_record(packed):
      max_align_cells) = packed
 
     # Compute IS size from the peaks (used only by the fallback)
+    has_empty = bool(best["empty_peak"])
     if best["v0_peak"] and best["empty_peak"]:
         is_length = best["v0_peak"][0] - best["empty_peak"][0]
     elif best["empty_peak"]:
         is_length = best["expected_v0"] - best["empty_peak"][0]
     else:
         is_length = info["tnp_len"]
+    # classify_gap accepts an empty when removed >= tnp_len - tol, so the peak
+    # difference can come out up to `tol` SHORTER than the transposase; the
+    # symmetric split then put both "boundaries" inside the ORF. An element
+    # cannot be shorter than the ORF that defines it.
+    is_length = max(is_length, info["tnp_len"])
 
     # Need full contig length to clamp; pysam provides .get_reference_length
     try:
@@ -139,7 +139,10 @@ def _build_one_record(packed):
     else:
         # FALLBACK: the peak difference only gives a length, so the extension
         # is split evenly between the two sides. It is not a boundary call.
-        method = "peak_symmetric_fallback"
+        # With no empty site at all there is no length evidence either: the
+        # "element" is just the transposase ORF. Label it so it is never
+        # mistaken for a boundary call (it used to share the fallback label).
+        method = "peak_symmetric_fallback" if has_empty else "no_empty_tnp_only"
         ext_per_side = (is_length - info["tnp_len"]) // 2
         boundary_5p_offset = -ext_per_side
         boundary_3p_offset = is_length - info["tnp_len"] - ext_per_side
@@ -232,34 +235,6 @@ def _build_one_record(packed):
         ],
     }
     return (record, is_seq, tnp_seq, up_seq, down_seq, empties_out)
-
-
-def load_fasta_index(fna):
-    contigs = {}
-    name = None
-    parts = []
-    with open(fna) as f:
-        for line in f:
-            if line.startswith(">"):
-                if name:
-                    contigs[name] = "".join(parts)
-                name = line[1:].split()[0]
-                parts = []
-            else:
-                parts.append(line.strip())
-        if name:
-            contigs[name] = "".join(parts)
-    return contigs
-
-
-def find_genome_fna(genome_dir, assembly):
-    asm_dir = os.path.join(genome_dir, assembly)
-    if not os.path.isdir(asm_dir):
-        return None
-    for f in os.listdir(asm_dir):
-        if f.endswith("_genomic.fna"):
-            return os.path.join(asm_dir, f)
-    return None
 
 
 def length_mode(values, bin_size=50):
@@ -413,6 +388,15 @@ def decompose_boundary(src, info, dec, top_n, max_align_cells):
         if r["method"] == "none":
             continue
         st, ln = r["insert_start"], r["insert_len"]
+        # Canonical placement before voting. With junction microhomology the
+        # same insert can sit anywhere in the repeat; the exact method returns
+        # the rightmost placement, the alignment-based ones whatever the
+        # aligner chose. Unnormalised, identical calls split their votes
+        # (lower consensus_support, more n_distinct_calls) and the reported
+        # boundary depended on which empty happened to be first. Slide every
+        # call to the rightmost placement (= the exact method's convention).
+        while st + ln < len(filled) and filled[st] == filled[st + ln]:
+            st += 1
         # the element must contain the whole transposase ORF
         if st > D + 10 or st + ln < D + tnp_len - 10:
             methods["insert_misses_tnp"] += 1
@@ -440,7 +424,8 @@ def decompose_boundary(src, info, dec, top_n, max_align_cells):
             "n_distinct_calls": len(votes),
             "method_counts": dict(methods),
             "consensus_method": r["method"], "event_class": r["event_class"],
-            "empty_offset": r["offset"],
+            "empty_offset": r["offset"] + (st - r["insert_start"]),
+            "placement": "rightmost_within_microhomology",
             "junction_microhomology_bp": r["junction_microhomology_bp"],
             "target_lost_bp": r["target_lost_bp"],
             "tsd": {"length": tsd_len, "sequence": tsd_seq, "side": tsd_side,
@@ -491,7 +476,6 @@ def main():
     ncbi_hits, n_total, n_kept = load_anchor_hits(args.paf, args.min_identity,
                                                   args.min_coverage)
     print(f"  PAF: {n_total:,} rows, {n_kept:,} kept", file=sys.stderr)
-    logan_hits = {}  # legacy compatibility; unused with single-DB design
 
     # Build records — parallelize per-ref using pysam (in-process FASTA reads)
     n_done = n_neither = 0
@@ -592,8 +576,12 @@ def main():
     print(f"  Records built:       {n_done}", file=sys.stderr)
     n_dec = sum(1 for r in all_records
                 if r["boundary_evidence"]["method"] == "empty_vs_filled_decomposition")
-    print(f"  Boundary by decomposition: {n_dec:,} / {len(all_records):,} "
-          f"(rest: peak_symmetric_fallback)", file=sys.stderr)
+    n_fb = sum(1 for r in all_records
+               if r["boundary_evidence"]["method"] == "peak_symmetric_fallback")
+    print(f"  Boundary by decomposition: {n_dec:,} / {len(all_records):,}; "
+          f"symmetric fallback (length only, NOT a boundary): {n_fb:,}; "
+          f"no empty site (transposase ORF only): "
+          f"{len(all_records) - n_dec - n_fb:,}", file=sys.stderr)
     print(f"  Distinct insertion events (event_key): "
           f"{len({r['event_key'] for r in all_records}):,}", file=sys.stderr)
     print(f"  No empty found:      {n_neither}", file=sys.stderr)

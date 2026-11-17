@@ -62,9 +62,9 @@ def _pyrodigal_process_one(record_tuple):
         gff_io = io.StringIO()
         genes.write_translations(faa_io, sequence_id=name)
         genes.write_gff(gff_io, sequence_id=name)
-        return faa_io.getvalue(), gff_io.getvalue()
-    except Exception:
-        return "", ""
+        return faa_io.getvalue(), gff_io.getvalue(), None
+    except Exception as e:          # report, never drop a contig silently
+        return "", "", f"{name}: {type(e).__name__}: {e}"
 
 
 def _iter_fasta_records(db_fa):
@@ -89,16 +89,24 @@ def run_orfs_pyrodigal(db_fa, out_faa, out_gff, threads):
 
     print(f"  ORF calling: streaming contigs with pyrodigal (n={threads})",
           file=sys.stderr, flush=True)
+    failed = []
     with open(out_faa, "w") as ffaa, open(out_gff, "w") as fgff:
         with Pool(threads) as pool:
-            for i, (faa_part, gff_part) in enumerate(
+            for i, (faa_part, gff_part, err) in enumerate(
                     pool.imap_unordered(_pyrodigal_process_one,
                                         _iter_fasta_records(db_fa),
                                         chunksize=4)):
+                if err:
+                    failed.append(err)
                 ffaa.write(faa_part)
                 fgff.write(gff_part)
                 if i % 5000 == 0:
                     print(f"    contigs processed: {i:,}", file=sys.stderr, flush=True)
+    if failed:
+        # These contigs have no ORFs, so any IS on them is invisible downstream.
+        print(f"WARNING: ORF calling failed on {len(failed):,} contig(s); "
+              f"first: {failed[0]}", file=sys.stderr, flush=True)
+    return failed
 
 
 def run_hmmsearch(hmm, faa, domtbl, e_value, threads):
@@ -136,9 +144,13 @@ def parse_gff(gff_path):
             # Extract ID=...
             m = re.search(r"ID=([^;]+)", parts[8])
             if not m: continue
-            pid = m.group(1)
-            # pyrodigal uses sequence_id_N for protein ID in faa
-            # check if pid format matches the faa header convention
+            # Protein FASTA headers are <contig>_<geneIndex> for both callers,
+            # but the GFF ID is <contig>_<geneIndex> only in pyrodigal;
+            # prodigal writes <contigOrdinal>_<geneIndex> (e.g. ID=1_7). Keying
+            # on the raw ID made every hmmsearch hit miss this table with
+            # --orf-caller prodigal: 0 IS hits, no error. Rebuild the key from
+            # the contig column + gene index, which is right for both.
+            pid = f"{contig}_{m.group(1).rsplit('_', 1)[-1]}"
             info[pid] = (contig, start, end, strand)
     return info
 
@@ -187,7 +199,8 @@ def main():
     # pyrodigal leaves a non-empty proteins.faa that would otherwise be mistaken
     # for a finished run (this silently truncated a 2.3M-contig DB to 15K once).
     if not args.skip_orf:
-        if os.path.exists(orf_done_marker) and os.path.getsize(proteins_faa) > 0:
+        if (os.path.exists(orf_done_marker) and os.path.exists(proteins_faa)
+                and os.path.exists(proteins_gff) and os.path.getsize(proteins_faa) > 0):
             print(f"Step 1: completed ORF outputs found (marker present), "
                   f"skipping pyrodigal.", file=sys.stderr, flush=True)
         else:
@@ -195,6 +208,12 @@ def main():
                 print(f"Step 1: existing proteins.faa has no completion marker "
                       f"(partial/stale) — rerunning pyrodigal.", file=sys.stderr,
                       flush=True)
+            # Everything derived from an older proteins.faa is stale now. The
+            # filtered FASTA and the domtbl files are cached by existence, so
+            # without this a rerun would search the OLD (partial) protein set.
+            for fn in os.listdir(work_dir):
+                if fn in ("proteins_filtered.faa", ".orf_complete") or fn.endswith(".domtbl"):
+                    os.remove(os.path.join(work_dir, fn))
             print(f"Step 1: ORF prediction ({args.orf_caller})...", file=sys.stderr)
             if args.orf_caller == "pyrodigal":
                 run_orfs_pyrodigal(args.db, proteins_faa, proteins_gff, args.threads)
@@ -211,8 +230,9 @@ def main():
     if not (os.path.exists(filtered_faa) and os.path.getsize(filtered_faa) > 0):
         print(f"Step 1b: filtering proteins (max length {args.max_protein_len:,} aa) ...",
               file=sys.stderr, flush=True)
-        kept, dropped = filter_proteins_by_length(proteins_faa, filtered_faa,
+        kept, dropped = filter_proteins_by_length(proteins_faa, filtered_faa + ".tmp",
                                                   args.max_protein_len)
+        os.replace(filtered_faa + ".tmp", filtered_faa)
         print(f"  kept {kept:,}, dropped {dropped:,} oversized proteins",
               file=sys.stderr, flush=True)
 
@@ -224,7 +244,10 @@ def main():
         domtbl = os.path.join(work_dir, f"{hmm_name}.domtbl")
         if not os.path.exists(domtbl):
             print(f"Step 2: hmmsearch {hmm_name} ...", file=sys.stderr)
-            run_hmmsearch(hmm, filtered_faa, domtbl, args.e_value, args.threads)
+            # write-then-rename: a killed hmmsearch must not leave a partial
+            # domtbl that the next run takes for a finished search
+            run_hmmsearch(hmm, filtered_faa, domtbl + ".tmp", args.e_value, args.threads)
+            os.replace(domtbl + ".tmp", domtbl)
         hits = parse_domtbl(domtbl)
         hmm_hits.append((hmm_name, hits))
         print(f"  {hmm_name}: {len(hits):,} hits", file=sys.stderr)
@@ -254,7 +277,12 @@ def main():
 
     # Write output TSV
     domain_names = ",".join(n for n, _ in hmm_hits)
-    with open(args.out, "w") as fout:
+    n_unmapped = sum(1 for pid in combined if pid not in gff_info)
+    if n_unmapped:
+        print(f"WARNING: {n_unmapped:,} of {len(combined):,} HMM-positive proteins "
+              f"have no GFF coordinates and are dropped (protein/GFF ID mismatch?)",
+              file=sys.stderr, flush=True)
+    with open(args.out + ".tmp", "w") as fout:
         fout.write("is_id\tassembly\tcontig\ttnp_start\ttnp_end\ttnp_strand"
                    "\ttnp_len\tdomains_hit\n")
         n_out = n_twin = 0
@@ -273,9 +301,10 @@ def main():
             fout.write(f"{is_id}\t{assembly}\t{contig}\t{start}\t{end}"
                        f"\t{strand}\t{tnp_len}\t{domain_names}\n")
             n_out += 1
-        print(f"\nWrote {n_out:,} IS hits to {args.out} "
-              f"({n_twin:,} dropped from duplicate GCA/GCF assemblies)",
-              file=sys.stderr)
+    os.replace(args.out + ".tmp", args.out)   # atomic: pipeline.py caches on existence
+    print(f"\nWrote {n_out:,} IS hits to {args.out} "
+          f"({n_twin:,} dropped from duplicate GCA/GCF assemblies)",
+          file=sys.stderr)
 
 
 if __name__ == "__main__":

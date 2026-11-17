@@ -18,7 +18,11 @@ from collections import namedtuple
 
 # ---------------------------------------------------------------- sequences
 
-_RC = str.maketrans("ACGTNacgtn", "TGCANtgcan")
+# Full IUPAC table: with only ACGTN, ambiguity codes (R/Y/K/M/...) were left
+# uncomplemented, so a minus-strand sequence carrying one was not the true
+# reverse complement.
+_RC = str.maketrans("ACGTRYKMSWBDHVNacgtrykmswbdhvn",
+                    "TGCAYRMKSWVHDBNtgcayrmkswvhdbn")
 
 
 def revcomp(seq):
@@ -336,13 +340,64 @@ def tolerant_decompose(short, long_, min_cov, min_ident, min_insert, dominance):
             "ambiguity": _slide(long_, bl0, bl1)}
 
 
+def hamming_split(short, long_, min_ident=0.95, min_insert=50,
+                  window=20, max_window_mm=8):
+    """SNP-tolerant, indel-free decomposition in O(len): find the offset where
+    long = short[:off] + insert + short[off:] with the fewest mismatches.
+
+    The alignment in tolerant_decompose() is quadratic, so it is skipped for
+    long intervals (D >= 5 kb: ~10 kb x 11 kb cells). Exact matching then
+    needs a 10 kb empty interval with zero SNPs against the source, which
+    strain-level divergence (~1/100-1/1000 bp) almost never gives -- so
+    elements whose ends lie > 1 kb from the transposase fell back to the
+    symmetric guess. A single insertion needs no gaps elsewhere, only a split
+    point, so mismatches can simply be counted on both sides of every
+    candidate split.
+
+    Refuses (returns None) when the best split is below `min_ident`, or when
+    any `window`-bp stretch holds more than `max_window_mm` mismatches: a
+    small indel elsewhere shifts the frame and shows up as a dense mismatch
+    run, and would make the insert length wrong by the indel size.
+    Ties take the rightmost split, the same convention as decompose().
+    """
+    n, ilen = len(short), len(long_) - len(short)
+    if n == 0 or ilen < min_insert:
+        return None
+    # suf[i] = mismatches of short[i:] against the end of long_
+    suf = [0] * (n + 1)
+    for i in range(n - 1, -1, -1):
+        suf[i] = suf[i + 1] + (short[i] != long_[i + ilen])
+    best, off, pre = None, 0, 0
+    for i in range(n + 1):
+        tot = pre + suf[i]
+        if best is None or tot <= best:
+            best, off = tot, i
+        if i < n:
+            pre += short[i] != long_[i]
+    ident = 1 - best / n
+    if ident < min_ident:
+        return None
+    mm = [i for i in range(off) if short[i] != long_[i]]
+    mm += [i for i in range(off, n) if short[i] != long_[i + ilen]]
+    for k in range(len(mm) - max_window_mm):
+        if mm[k + max_window_mm] - mm[k] < window:
+            return None
+    return {"offset": off, "insert_start_long": off, "insert_len": ilen,
+            "identity": ident, "n_mismatch": best,
+            "ambiguity": _slide(long_, off, off + ilen)}
+
+
 def decompose_alleles(short, long_, min_insert=50, min_cov=0.85,
-                      min_ident=0.95, dominance=3.0, tolerant=True):
+                      min_ident=0.95, dominance=3.0, tolerant=True,
+                      hamming_fallback=True):
     """Explain the long (filled) interval as the short (empty) one plus an
     insert. Exact first, alignment-tolerant fallback.
 
+    When the alignment is skipped (`tolerant=False`, interval too long) and
+    `hamming_fallback` is set, hamming_split() is tried instead.
+
     Returns a dict:
-      method            exact | tolerant_alignment | none
+      method            exact | tolerant_alignment | hamming_split | none
       event_class       pure_insertion | insertion_target_retained |
                         replacement | below_min_insert | substitution_only |
                         undecomposed
@@ -385,6 +440,15 @@ def decompose_alleles(short, long_, min_insert=50, min_cov=0.85,
                        identity=td["identity"], coverage=td["coverage"],
                        event_class="replacement" if td["target_lost"]
                        else "insertion_target_retained")
+    elif hamming_fallback:
+        hs = hamming_split(short, long_, min_ident, min_insert)
+        if hs:
+            st, ln = hs["insert_start_long"], hs["insert_len"]
+            res.update(method="hamming_split", insert_start=st, insert_len=ln,
+                       insert_seq=long_[st:st + ln], offset=hs["offset"],
+                       junction_microhomology_bp=hs["ambiguity"],
+                       target_lost_bp=0, identity=hs["identity"], coverage=1.0,
+                       event_class="insertion_target_retained")
     if res["method"] != "none" and res["insert_len"] < min_insert:
         res["event_class"] = "below_min_insert"
     return res

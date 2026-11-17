@@ -141,6 +141,18 @@ matches. `--max-secondary` (env `MAX_SECONDARY` in the template) now sets it;
 Stage 5 flags capped anchors in `anchor_search_capped`. For a census set it to
 at least the number of distinct assemblies — PAF size grows with it.
 
+### Core-pipeline review fixes (2026-11)
+
+| # | was | now |
+|---|---|---|
+| 8 | `extract_anchors.py` dropped any IS closer than `--flank` to a contig end (4.5% of E. coli hits at flank 20 kb), and silently made no anchors for any D with `D + anchor_len > flank` (default flank 80000 with D=80000) | flanks are clamped to the contig; each ref keeps the D values that fit (`distances` column is per ref); the pipeline raises `flank` to `max(D) + anchor_len` and the script warns |
+| 9 | stages were cached on output *existence*: a stage killed mid-write (time limit, OOM) left a partial file that the next run used as complete | completion markers `.stage_<name>.done`; minimap2 and Stage 1 intermediates are written to `.tmp` and renamed; re-running a stage invalidates the later ones. Use `--trust-existing` once to adopt a pre-marker run directory |
+| 10 | boundary votes were counted per exact `(off5, off3)`; with junction microhomology the exact and alignment methods place the same insert differently, so identical calls split their votes | every call is slid to the rightmost placement before voting (`decomposition.placement`) |
+| 11 | SNP-tolerant decomposition is quadratic and was skipped above 2e7 cells, i.e. always at D=5000, leaving only exact (zero-SNP) matching there | `lib_alleles.hamming_split`: linear-time, SNP-tolerant, indel-refusing split, used when the alignment is skipped (`consensus_method = hamming_split`) |
+| 12 | the symmetric fallback could give an element up to `tol` bp *shorter* than its transposase; refs with no empty site at all carried the same `peak_symmetric_fallback` label | length clamped to the ORF; no-empty refs are labelled `no_empty_tnp_only` (their `is_element` is the transposase ORF, not a boundary) |
+| 13 | `--orf-caller prodigal`: GFF IDs (`1_7`) never matched protein IDs (`contig_7`) → 0 hits, no error; a contig whose ORF call raised was dropped silently; a re-run ORF step reused stale `proteins_filtered.faa` / `*.domtbl` | IDs rebuilt from contig + gene index; failures and unmapped proteins are reported; derived caches are deleted when ORFs are re-called |
+| 14 | reverse complement left IUPAC codes (R/Y/K/M…) uncomplemented | full IUPAC table in `lib_alleles.revcomp`, shared by all stages |
+
 Tests: `sbatch tests/run_tests.sh [WORK_DIR]` runs unit tests and a synthetic
 end-to-end run with known boundaries (both strands, a GCA/GCF twin, a SNP-divergent
 empty and a nested cargo insertion).

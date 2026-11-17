@@ -20,6 +20,7 @@ mkdir -p "$WORK"
 echo "=== unit tests ==="
 python3 "$REPO/tests/test_lib_alleles.py"
 python3 "$REPO/tests/test_self_align.py"
+python3 "$REPO/tests/test_stage_units.py"
 
 echo "=== synthetic data ==="
 python3 "$REPO/tests/make_synthetic.py" "$WORK/syn"
