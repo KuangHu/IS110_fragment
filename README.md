@@ -139,7 +139,9 @@ E. coli DB with the old `-N 50`, 91% of anchors (1,986,882 / 2,179,807) hit
 exactly 51 rows, so every count was a *sample* of the DB biased to the closest
 matches. `--max-secondary` (env `MAX_SECONDARY` in the template) now sets it;
 Stage 5 flags capped anchors in `anchor_search_capped`. For a census set it to
-at least the number of distinct assemblies — PAF size grows with it.
+more than the number of DB sequences an anchor can hit (GCA/GCF twins and extra
+locus copies each take a slot, so the number of distinct assemblies is not enough);
+raise it until no anchor is flagged — PAF size grows with it.
 
 ### Core-pipeline review fixes (2026-11)
 
@@ -152,6 +154,21 @@ at least the number of distinct assemblies — PAF size grows with it.
 | 12 | the symmetric fallback could give an element up to `tol` bp *shorter* than its transposase; refs with no empty site at all carried the same `peak_symmetric_fallback` label | length clamped to the ORF; no-empty refs are labelled `no_empty_tnp_only` (their `is_element` is the transposase ORF, not a boundary) |
 | 13 | `--orf-caller prodigal`: GFF IDs (`1_7`) never matched protein IDs (`contig_7`) → 0 hits, no error; a contig whose ORF call raised was dropped silently; a re-run ORF step reused stale `proteins_filtered.faa` / `*.domtbl` | IDs rebuilt from contig + gene index; failures and unmapped proteins are reported; derived caches are deleted when ORFs are re-called |
 | 14 | reverse complement left IUPAC codes (R/Y/K/M…) uncomplemented | full IUPAC table in `lib_alleles.revcomp`, shared by all stages |
+| 15 | gaps were measured between alignment ENDS; anchors pass at 80% coverage, so a clipped inner end added up to 100 bp per anchor (a 3,200-bp filled gap read 3,400 → `v1plus_filled`) | `place_pair` projects each anchor's inner edge through the unaligned query bases; the same projected edges (`gap_start`/`gap_end`) are used to fetch the empty interval |
+| 16 | the best-scoring up × down combination could pair anchors of two different repeat copies | candidates are loci: each anchor must be the other's nearest valid partner; a stray extra copy of one anchor still makes the placement `ambiguous` |
+| 17 | a target lacking flank DNA but keeping the whole transposase passed the length test for "empty" and produced a fallback element of the deletion's size | such observations are rejected (`n_empty_rejected_flank_deletion`) |
+| 18 | boundary consensus depended on `PYTHONHASHSEED` (set order → which 5 empties were used; vote ties) | deterministic ordering everywhere; ties reported (`consensus_tied`); records.json and FASTAs are sorted |
+| 19 | completion markers did not record parameters; `--trust-existing` could adopt outputs invalidated in the same run | the marker stores the command line; adoption only before any stage has run; `is_hits.tsv` newer than Stage 2 re-runs it |
+| 20 | with `--source-db`, Stage 6 looked up source contigs in the target DB and wrote `records.json = []` on a clean exit | separate source handle (`build_records.py --source-db`); failures are counted; an empty result is an error |
+| 21 | Stage 6 crashed on JSON (`int64`) whenever the consensus call came from the SNP-tolerant alignment | native ints |
+| 22 | `tolerant_decompose` ignored extra blocks at the ends of the long allele in its dominance test; `hamming_split` accepted an indel a few bp from the junction (insert length wrong by the indel size) | terminal gaps are counted; `hamming_split` requires 30 mismatch-free bp on both sides of the junction |
+| 23 | Stage 6 ignored Stage 5's size limits; `--min-is-size` did nothing; the GCF twin was chosen before checking it had a placement; minus-strand fallback offsets disagreed with coordinates by 1 bp; two HMMs with the same file name shared one search; `domains_hit` listed every requested profile; an empty `--keep-ids` kept everything | fixed |
+
+Known limits, reported rather than hidden: a decomposition call may clip up to 10 bp
+of the *predicted* ORF (`orf_clipped_5p/3p`; ORF start codons are often called a few
+bp too far out); `event_key` is an exact element + 100-bp-context hash, so one flank
+SNP gives a new key — it is an upper bound on insertion events, not a count; circular
+contigs are not unrolled, so an IS near a plasmid's linearisation point loses flank.
 
 Tests: `sbatch tests/run_tests.sh [WORK_DIR]` runs unit tests and a synthetic
 end-to-end run with known boundaries (both strands, a GCA/GCF twin, a SNP-divergent

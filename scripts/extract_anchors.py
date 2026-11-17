@@ -191,7 +191,7 @@ def main():
                 continue
             n_input += 1
             is_id = parts[col["is_id"]]
-            if keep_ids and is_id not in keep_ids:
+            if keep_ids is not None and is_id not in keep_ids:
                 continue
             hits.append((is_id, parts[col["contig"]],
                          int(parts[col["tnp_start"]]),

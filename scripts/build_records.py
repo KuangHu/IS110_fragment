@@ -55,6 +55,15 @@ def parse_args():
                         "(is_id, assembly, contig, tnp_start, tnp_end, tnp_strand, ...)")
     p.add_argument("--genome-db", required=True,
                    help="Indexed FASTA (.fai present) containing all source contigs")
+    p.add_argument("--source-db", default="",
+                   help="Indexed FASTA holding the SOURCE contigs of --hits when "
+                        "IS were detected in a different DB than --genome-db "
+                        "(default: --genome-db)")
+    p.add_argument("--min-is-size", type=int, default=0,
+                   help="Smallest removed length accepted as an empty site")
+    p.add_argument("--max-is-size", type=int, default=0,
+                   help="Largest removed length accepted as an empty site (0 = no "
+                        "limit). Same meaning as in call_boundaries.py")
     p.add_argument("--boundaries", default="",
                    help="Optional boundaries TSV from call_boundaries.py")
     p.add_argument("--out", required=True,
@@ -80,24 +89,44 @@ def parse_args():
 
 
 # ---- multiprocessing worker for parallel record build ----------------------
-_FA = None  # per-worker pysam.FastaFile handle
+_FA = None   # per-worker pysam.FastaFile handle: TARGET genomes (empties)
+_SRC = None  # per-worker handle for SOURCE contigs; None -> same as _FA
 
 
-def _worker_init(genome_db):
-    """Open the indexed FASTA once per worker process (not fork-safe to share)."""
-    global _FA
+def _worker_init(genome_db, source_db=None):
+    """Open the indexed FASTA(s) once per worker process (not fork-safe to share).
+
+    Sources and targets are separate handles: with --source-db every source
+    contig used to be looked up in the target DB, failed, and the record was
+    dropped without a word (records.json = [] on a clean exit)."""
+    global _FA, _SRC
     _FA = pysam.FastaFile(genome_db)
+    _SRC = pysam.FastaFile(source_db) if source_db and source_db != genome_db else None
 
 
-def _fetch(contig, start_0, end_0):
-    """Fetch [start_0, end_0) from pysam handle; return uppercase or None."""
+def _fetch(contig, start_0, end_0, source=False):
+    """Fetch [start_0, end_0); return uppercase or None. source=True reads the
+    source DB."""
     if end_0 <= start_0:
         return ""
+    fa = _SRC if (source and _SRC is not None) else _FA
     try:
-        seq = _FA.fetch(contig, max(0, start_0), end_0)
+        seq = fa.fetch(contig, max(0, start_0), end_0)
     except (KeyError, ValueError):
         return None
     return seq.upper() if seq else None
+
+
+def _empty_interval(eo):
+    """Target sequence between the two anchors' inner edges, in transposase
+    orientation. gap_start/gap_end are the PROJECTED edges (lib_alleles.
+    place_pair), already in genomic order for either strand."""
+    if eo["distance"] <= 0:
+        return ""
+    raw = _fetch(eo["tname"], eo["gap_start"], eo["gap_end"])
+    if raw is None:
+        return None
+    return raw if eo["strand"] == "+" else revcomp(raw)
 
 
 def _build_one_record(packed):
@@ -121,7 +150,7 @@ def _build_one_record(packed):
 
     # Need full contig length to clamp; pysam provides .get_reference_length
     try:
-        contig_len = _FA.get_reference_length(src["contig"])
+        contig_len = (_SRC or _FA).get_reference_length(src["contig"])
     except (KeyError, ValueError):
         return None
 
@@ -132,6 +161,27 @@ def _build_one_record(packed):
     if best.get("decompose"):
         dec = decompose_boundary(src, info, best["decompose"], top_empty_n,
                                  max_align_cells)
+    # An "empty" is first called on length alone (removed >= tnp_len). When
+    # decomposition shows that what the target lacks does NOT contain the
+    # transposase, it is a flank deletion next to an intact element, not an
+    # empty site: drop it from the evidence (it used to yield a 1,500-bp
+    # "element" from a 1,500-bp upstream deletion).
+    n_rejected = 0
+    if dec and dec.get("rejected_assemblies"):
+        rej = set(dec["rejected_assemblies"])
+        kept = [e for e in best["empty_obs"] if e.get("assembly") not in rej]
+        n_rejected = len(best["empty_obs"]) - len(kept)
+        best = dict(best, empty_obs=kept,
+                    empty_peak=length_mode([e["distance"] for e in kept]))
+        has_empty = bool(best["empty_peak"])
+        if best["v0_peak"] and best["empty_peak"]:
+            is_length = best["v0_peak"][0] - best["empty_peak"][0]
+        elif best["empty_peak"]:
+            is_length = best["expected_v0"] - best["empty_peak"][0]
+        else:
+            is_length = info["tnp_len"]
+        is_length = max(is_length, info["tnp_len"])
+
     if dec and dec["ok"]:
         method = "empty_vs_filled_decomposition"
         is_start_0, is_end_0 = dec["is_start_0"], dec["is_end_0"]
@@ -143,21 +193,28 @@ def _build_one_record(packed):
         # "element" is just the transposase ORF. Label it so it is never
         # mistaken for a boundary call (it used to share the fallback label).
         method = "peak_symmetric_fallback" if has_empty else "no_empty_tnp_only"
-        ext_per_side = (is_length - info["tnp_len"]) // 2
-        boundary_5p_offset = -ext_per_side
-        boundary_3p_offset = is_length - info["tnp_len"] - ext_per_side
-        is_start_0 = max(0, tnp_start_0 + boundary_5p_offset)
-        is_end_0 = min(contig_len, tnp_end_0 + boundary_3p_offset)
+        ext5 = (is_length - info["tnp_len"]) // 2
+        ext3 = is_length - info["tnp_len"] - ext5
+        # offsets are in TRANSPOSASE orientation: on the minus strand the 5'
+        # side is the genomic right. They used to be applied left/right
+        # regardless of strand, so coordinates and reported offsets disagreed
+        # by 1 bp for odd extensions.
+        left, right = (ext5, ext3) if src["strand"] == "+" else (ext3, ext5)
+        is_start_0 = max(0, tnp_start_0 - left)
+        is_end_0 = min(contig_len, tnp_end_0 + right)
+        left, right = tnp_start_0 - is_start_0, is_end_0 - tnp_end_0   # after clamping
+        ext5, ext3 = (left, right) if src["strand"] == "+" else (right, left)
+        boundary_5p_offset, boundary_3p_offset = -ext5, ext3
 
     up_flank_start = max(0, is_start_0 - flank_out_len)
     up_flank_end = is_start_0
     down_flank_start = is_end_0
     down_flank_end = min(contig_len, is_end_0 + flank_out_len)
 
-    tnp_seq = _fetch(src["contig"], tnp_start_0, tnp_end_0)
-    is_seq = _fetch(src["contig"], is_start_0, is_end_0)
-    up_seq = _fetch(src["contig"], up_flank_start, up_flank_end)
-    down_seq = _fetch(src["contig"], down_flank_start, down_flank_end)
+    tnp_seq = _fetch(src["contig"], tnp_start_0, tnp_end_0, source=True)
+    is_seq = _fetch(src["contig"], is_start_0, is_end_0, source=True)
+    up_seq = _fetch(src["contig"], up_flank_start, up_flank_end, source=True)
+    down_seq = _fetch(src["contig"], down_flank_start, down_flank_end, source=True)
     if tnp_seq is None or is_seq is None or up_seq is None or down_seq is None:
         return None
 
@@ -166,7 +223,8 @@ def _build_one_record(packed):
         is_seq = revcomp(is_seq)
         up_seq, down_seq = revcomp(down_seq), revcomp(up_seq)
 
-    empty_obs_sorted = sorted(best["empty_obs"], key=lambda x: -x["mean_ident"])
+    empty_obs_sorted = sorted(best["empty_obs"],
+                              key=lambda x: (-x["mean_ident"], x["assembly"]))
     top_empty = empty_obs_sorted[:top_empty_n]
 
     # Empty junction sequences
@@ -175,11 +233,7 @@ def _build_one_record(packed):
         target = eo.get("tname") or eo.get("contig")
         if not target:
             continue
-        if eo["strand"] == "+":
-            junction = _fetch(target, eo["up_te"], eo["down_ts"])
-        else:
-            raw = _fetch(target, eo["down_te"], eo["up_ts"])
-            junction = revcomp(raw) if raw else None
+        junction = _empty_interval(eo)
         if junction:
             eo["junction_sequence"] = junction
             eo["junction_length"] = len(junction)
@@ -219,6 +273,7 @@ def _build_one_record(packed):
             "is_element_length_inferred": is_length,
             "n_v0_observations": len(best["v0_obs"]),
             "n_empty_observations": len(best["empty_obs"]),
+            "n_empty_rejected_flank_deletion": n_rejected,
             "n_v1plus_observations": len(best["v1plus_obs"]),
             "n_ambiguous_placements": best.get("n_ambiguous", 0),
             "counts_are": "distinct assemblies (GCA/GCF twins collapsed)",
@@ -270,6 +325,7 @@ def pair_anchors(hits, ref_id, D, info, opts):
             "assembly": pl["assembly"], "contig": pl["tname"].split("|", 1)[-1],
             "tname": pl["tname"], "strand": pl["strand"], "distance": pl["gap"],
             "up_ts": u.ts, "up_te": u.te, "down_ts": d.ts, "down_te": d.te,
+            "gap_start": pl["start"], "gap_end": pl["end"],
             "up_ident": u.ident, "down_ident": d.ident,
             "mean_ident": (u.ident + d.ident) / 2, "D": D,
             "placement_status": pl["status"], "placement_margin": round(pl["margin"], 3),
@@ -288,7 +344,9 @@ def categorize_pairs(pairs, expected_v0, tnp_len, opts):
     tol = gap_tolerance(expected_v0, opts["tol_bp"], opts["tol_frac"])
     v0_obs, empty_obs, v1plus_obs = [], [], []
     for p in pairs:
-        cat = classify_gap(p["distance"], expected_v0, tnp_len, tol)
+        cat = classify_gap(p["distance"], expected_v0, tnp_len, tol,
+                           max_removed=opts.get("max_is_size") or None,
+                           min_removed=opts.get("min_is_size") or None)
         if cat == "v0_filled":
             v0_obs.append(p)
         elif cat == "empty":
@@ -347,6 +405,9 @@ def pick_best_d(hits, ref_id, info, distances, opts):
     return best
 
 
+ORF_SLACK = 10
+
+
 def decompose_boundary(src, info, dec, top_n, max_align_cells):
     """Base-level element boundaries from empty-vs-filled decomposition.
 
@@ -360,7 +421,7 @@ def decompose_boundary(src, info, dec, top_n, max_align_cells):
     D, tnp_len = dec["D"], info["tnp_len"]
     g0 = src["start"] - 1 - D                 # genomic 0-based start of filled
     g1 = src["end"] + D
-    filled = _fetch(src["contig"], g0, g1)
+    filled = _fetch(src["contig"], g0, g1, source=True)
     if not filled or len(filled) != g1 - g0:
         return None
     if src["strand"] == "-":
@@ -371,15 +432,13 @@ def decompose_boundary(src, info, dec, top_n, max_align_cells):
     calls = []
     methods = Counter()
     n_try = 0
-    for eo in sorted(dec["empty_obs"], key=lambda x: -x["mean_ident"])[:top_n]:
+    rejected = []
+    # ties broken by assembly name: the top-N cut must not depend on dict/set
+    # order (identical inputs gave 1,400 bp or 1,600 bp by PYTHONHASHSEED)
+    for eo in sorted(dec["empty_obs"],
+                     key=lambda x: (-x["mean_ident"], x["assembly"]))[:top_n]:
         n_try += 1
-        if eo["distance"] <= 0:
-            empty = ""
-        elif eo["strand"] == "+":
-            empty = _fetch(eo["tname"], eo["up_te"], eo["down_ts"])
-        else:
-            raw = _fetch(eo["tname"], eo["down_te"], eo["up_ts"])
-            empty = revcomp(raw) if raw else None
+        empty = _empty_interval(eo)
         if empty is None:
             continue
         r = decompose_alleles(empty, filled, min_insert=max(50, tnp_len - 20),
@@ -397,17 +456,34 @@ def decompose_boundary(src, info, dec, top_n, max_align_cells):
         # call to the rightmost placement (= the exact method's convention).
         while st + ln < len(filled) and filled[st] == filled[st + ln]:
             st += 1
-        # the element must contain the whole transposase ORF
-        if st > D + 10 or st + ln < D + tnp_len - 10:
+        lo = st
+        while lo > 0 and filled[lo - 1] == filled[lo - 1 + ln]:
+            lo -= 1
+        # The element must contain the transposase ORF. Among the equivalent
+        # placements [lo, st] take the rightmost one that still starts at or
+        # before the ORF, so sliding never pushes the boundary into the ORF.
+        st = max(lo, min(st, D))
+        # ORF_SLACK: the ORF caller may extend the start codon a few bp past
+        # the true element end, so a call that clips <= ORF_SLACK bp of the
+        # predicted ORF is kept -- and REPORTED (orf_clipped_5p/3p), never
+        # silently presented as containing the whole ORF.
+        if st > D + ORF_SLACK or st + ln < D + tnp_len - ORF_SLACK:
             methods["insert_misses_tnp"] += 1
+            rejected.append(eo.get("assembly", ""))
             continue
         off5, off3 = st - D, (st + ln) - (D + tnp_len)
         votes[(off5, off3)] += 1
         calls.append((off5, off3, st, ln, r, eo.get("assembly", "")))
     if not votes:
         return {"ok": False, "D": D, "n_attempted": n_try,
-                "method_counts": dict(methods)}
-    (off5, off3), n_cons = votes.most_common(1)[0]
+                "method_counts": dict(methods), "rejected_assemblies": rejected}
+    # most votes; ties -> the call that keeps the whole ORF, then the shorter
+    # element, then the offsets themselves (fully deterministic)
+    (off5, off3), n_cons = min(
+        votes.items(),
+        key=lambda kv: (-kv[1], max(0, kv[0][0]) + max(0, -kv[0][1]),
+                        kv[0][1] - kv[0][0], kv[0]))
+    n_tied = sum(1 for v in votes.values() if v == n_cons)
     off5, off3, st, ln, r, asm = next(c for c in calls if (c[0], c[1]) == (off5, off3))
     ins = filled[st:st + ln]
     tsd_len, tsd_seq, tsd_side, tsd_conf = find_tsd(ins, filled[:st], filled[st + ln:])
@@ -422,6 +498,9 @@ def decompose_boundary(src, info, dec, top_n, max_align_cells):
             "n_consensus": n_cons,
             "consensus_support": round(n_cons / len(calls), 3),
             "n_distinct_calls": len(votes),
+            "consensus_tied": n_tied > 1,
+            "orf_clipped_5p": max(0, off5), "orf_clipped_3p": max(0, -off3),
+            "rejected_assemblies": rejected,
             "method_counts": dict(methods),
             "consensus_method": r["method"], "event_class": r["event_class"],
             "empty_offset": r["offset"] + (st - r["insert_start"]),
@@ -485,7 +564,8 @@ def main():
     work_items = []
     opts = {"tol_bp": args.tol_bp, "tol_frac": args.tol_frac,
             "margin": args.margin, "max_extra_bp": args.max_extra_bp,
-            "decompose_max_d": args.decompose_max_d}
+            "decompose_max_d": args.decompose_max_d,
+            "min_is_size": args.min_is_size, "max_is_size": args.max_is_size}
     for ref_id, info in ref_info.items():
         best = pick_best_d(ncbi_hits, ref_id, info, distances, opts)
         if not best:
@@ -511,13 +591,15 @@ def main():
     pool_args = [(item, args.genome_db, args.flank_out_len, args.top_empty, db_label,
                   args.max_align_cells)
                  for item in work_items]
+    n_failed = 0
     with Pool(args.threads, initializer=_worker_init,
-              initargs=(args.genome_db,)) as pool:
+              initargs=(args.genome_db, args.source_db)) as pool:
         for i, packed in enumerate(pool.imap_unordered(_build_one_record, pool_args,
                                                        chunksize=8)):
             if i % 1000 == 0:
                 print(f"    built {i:,}/{len(pool_args):,}", file=sys.stderr, flush=True)
             if packed is None:
+                n_failed += 1
                 continue
             record, is_seq, tnp_seq, up_seq, down_seq, empties = packed
             all_records.append(record)
@@ -530,9 +612,26 @@ def main():
                 empty_junction_seqs.append((tag, seq))
 
     # Write outputs
+    # imap_unordered returns in completion order; sort so the files are
+    # reproducible run to run
+    order = sorted(range(len(all_records)), key=lambda i: all_records[i]["ref_id"])
+    all_records = [all_records[i] for i in order]
+    is_elem_seqs = [is_elem_seqs[i] for i in order]
+    tnp_seqs = [tnp_seqs[i] for i in order]
+    up_flank_seqs = [up_flank_seqs[i] for i in order]
+    down_flank_seqs = [down_flank_seqs[i] for i in order]
+    empty_junction_seqs.sort()
+    if n_failed:
+        print(f"WARNING: {n_failed:,} of {len(pool_args):,} refs produced no record "
+              f"(source contig or sequence not found in the FASTA -- wrong "
+              f"--source-db / --genome-db?)", file=sys.stderr, flush=True)
+    if pool_args and not all_records:
+        sys.exit("ERROR: no record could be built; refusing to write an empty "
+                 "records.json")
     json_path = os.path.join(args.out, "records.json")
-    with open(json_path, "w") as f:
+    with open(json_path + ".tmp", "w") as f:
         json.dump(all_records, f, indent=2)
+    os.replace(json_path + ".tmp", json_path)
     print(f"Wrote {len(all_records)} records to {json_path}", file=sys.stderr)
 
     def write_fa(path, seqs):
@@ -573,7 +672,8 @@ def main():
                     f"{(dc.get('tsd') or {}).get('length', '')}\t{r['event_key']}\n")
 
     print(f"\n=== Build summary ===", file=sys.stderr)
-    print(f"  Records built:       {n_done}", file=sys.stderr)
+    print(f"  Records built:       {len(all_records):,} of {n_done:,} refs with "
+          f"anchor placements", file=sys.stderr)
     n_dec = sum(1 for r in all_records
                 if r["boundary_evidence"]["method"] == "empty_vs_filled_decomposition")
     n_fb = sum(1 for r in all_records
@@ -582,8 +682,11 @@ def main():
           f"symmetric fallback (length only, NOT a boundary): {n_fb:,}; "
           f"no empty site (transposase ORF only): "
           f"{len(all_records) - n_dec - n_fb:,}", file=sys.stderr)
-    print(f"  Distinct insertion events (event_key): "
-          f"{len({r['event_key'] for r in all_records}):,}", file=sys.stderr)
+    # event_key hashes the exact element + 100 bp of context: one SNP in the
+    # flank gives a new key, so this is an UPPER bound on insertion events.
+    print(f"  Distinct exact element+context keys (event_key; upper bound on "
+          f"insertion events): {len({r['event_key'] for r in all_records}):,}",
+          file=sys.stderr)
     print(f"  No empty found:      {n_neither}", file=sys.stderr)
     print(f"  All outputs in: {args.out}", file=sys.stderr)
 

@@ -38,7 +38,10 @@ for D in (1000, 5000):
               f"IS1 D={D}: element length from empties ~{truth['IS1']['length']} (got {mode})")
 
 # --- Stage 6: base-level boundaries by decomposition, both strands
-recs = {r["ref_id"]: r for r in json.load(open(os.path.join(run, "records", "records.json")))}
+rec_list = json.load(open(os.path.join(run, "records", "records.json")))
+check(len(rec_list) == 2 and len({r["ref_id"] for r in rec_list}) == 2,
+      f"records.json holds exactly IS1 and IS2, once each (got {[r['ref_id'] for r in rec_list]})")
+recs = {r["ref_id"]: r for r in rec_list}
 for rid in ("IS1", "IS2"):
     r = recs.get(rid)
     check(r is not None, f"{rid}: record built")
@@ -54,10 +57,15 @@ for rid in ("IS1", "IS2"):
                          f"(got {ie['start_offset_5p']})")
     d3 = ie["end_offset_3p"] - t["off3"]
     check(d3 == d5, f"{rid}: 3' offset shifts with 5' (slide) (got {ie['end_offset_3p']})")
-    check(0 <= ie["source_start"] - t["source_start_1"] <= mh
-          or 0 <= t["source_end"] - ie["source_end"] <= mh,
-          f"{rid}: genomic coords match truth ({ie['source_start']}-{ie['source_end']} vs "
-          f"{t['source_start_1']}-{t['source_end']})")
+    ds, de = ie["source_start"] - t["source_start_1"], ie["source_end"] - t["source_end"]
+    check(ds == de and abs(ds) <= mh,
+          f"{rid}: BOTH genomic coords match truth within the slide ({ie['source_start']}-"
+          f"{ie['source_end']} vs {t['source_start_1']}-{t['source_end']})")
+    check(ie["source_end"] - ie["source_start"] + 1 == ie["length"] == len(ie["sequence"]),
+          f"{rid}: coords, length and sequence agree")
+    src = r["source"]
+    check(ie["source_start"] <= src["transposase_start"] and src["transposase_end"] <= ie["source_end"],
+          f"{rid}: element contains the transposase")
     check(be["n_empty_observations"] == 2, f"{rid}: 2 empty assemblies in record")
 
 # --- Stage 8: abutting-anchor empties are kept; twins collapsed; nested insert keyed

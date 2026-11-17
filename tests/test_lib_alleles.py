@@ -65,6 +65,72 @@ def test_place_pair():
                       max_gap=50000) is None
 
 
+def qhit(tname, strand, ts, te, qs, qe, qlen=500):
+    n = qe - qs
+    return Hit("q", qlen, qs, qe, strand, tname, 10 ** 6, ts, te, n, n, 100.0, n / qlen * 100)
+
+
+def test_place_pair_projects_clipped_anchors():
+    """Anchors pass at 80% coverage; the gap is measured between the anchors'
+    true inner edges, not between the alignment ends."""
+    # + strand: up anchor at 1000-1500 aligned only on query [0,400) -> te=1400;
+    # down anchor at 4700-5200 aligned on query [100,500) -> ts=4800. True gap 3200.
+    pl = place_pair([qhit("a|c", "+", 1000, 1400, 0, 400)],
+                    [qhit("a|c", "+", 4800, 5200, 100, 500)])
+    assert pl["gap"] == 3200 and (pl["start"], pl["end"]) == (1500, 4700), pl
+    # - strand: down anchor occupies 1000-1500 (reversed), up anchor 4700-5200.
+    # down aligned on query [100,500) -> target [1000,1400); up aligned on
+    # query [0,400) -> target [4800,5200).
+    pl = place_pair([qhit("a|c", "-", 4800, 5200, 0, 400)],
+                    [qhit("a|c", "-", 1000, 1400, 100, 500)])
+    assert pl["gap"] == 3200 and (pl["start"], pl["end"]) == (1500, 4700), pl
+
+
+def test_place_pair_no_cross_copy():
+    """Two loci; at each, one anchor is full length and the other clipped. The
+    best-scoring combination is the CROSS pair (full up of locus 1 + full down
+    of locus 2) -- it must not be returned."""
+    ups = [qhit("a|c", "+", 1000, 1500, 0, 500),          # locus 1, full
+           qhit("a|c", "+", 10000, 10400, 0, 400)]        # locus 2, clipped outer... inner
+    downs = [qhit("a|c", "+", 4800, 5200, 100, 500),      # locus 1, clipped
+             qhit("a|c", "+", 13700, 14200, 0, 500)]      # locus 2, full
+    pl = place_pair(ups, downs, max_gap=50000)
+    assert pl["gap"] == 3200, pl                          # a same-locus pair
+    assert pl["status"] == "ambiguous"                    # two loci, same score
+    assert pl["n_pairs"] == 2
+
+
+def test_place_per_assembly_twin_fallback():
+    from lib_alleles import place_per_assembly
+    up = {"GCF_000000009.1|x1": [hit("GCF_000000009.1|x1", "+", 0, 500)],
+          "GCA_000000009.1|y": [hit("GCA_000000009.1|y", "+", 0, 500)]}
+    down = {"GCF_000000009.1|x2": [hit("GCF_000000009.1|x2", "+", 900, 1400)],
+            "GCA_000000009.1|y": [hit("GCA_000000009.1|y", "+", 900, 1400)]}
+    out = place_per_assembly(up, down)
+    assert list(out) == ["000000009"] and out["000000009"]["assembly"] == "GCA_000000009.1"
+
+
+def test_tolerant_terminal_gap_and_json():
+    import json
+    from lib_alleles import tolerant_decompose
+    L, R, ins, extra = rseq(900), rseq(900), rseq(1500), rseq(1200)
+    # a second 1,200-bp extra block at the START of the long allele: not one
+    # dominant insertion -> must be refused
+    td = tolerant_decompose(L + R, extra + L + ins + R, 0.85, 0.95, 50, 3.0)
+    assert td is None or not td["ok"], td
+    # SNP-divergent empty -> alignment path; result must be JSON-serialisable
+    r = decompose_alleles(mutate(L, 0.01) + mutate(R, 0.01), L + ins + R)
+    assert r["method"] == "tolerant_alignment" and r["insert_len"] == 1500
+    json.dumps(r)
+
+
+def test_classify_gap_min_max():
+    tol = gap_tolerance(3200)
+    assert classify_gap(2000, 3200, 1200, tol) == "empty"
+    assert classify_gap(2000, 3200, 1200, tol, min_removed=1500) == "intermediate"
+    assert classify_gap(2000, 3200, 1200, tol, max_removed=1000) == "very_short"
+
+
 def test_classify_gap_large_D():
     # D = 40 kb, tnp 1200, filled source gap = 81,200. A target with an
     # intact 1.45 kb IS110 must NOT read as empty (old tolerance: +/-8 kb).

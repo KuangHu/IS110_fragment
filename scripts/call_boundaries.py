@@ -37,7 +37,8 @@ def parse_args():
     p.add_argument("--histogram-bin", type=int, default=50,
                    help="Distance histogram bin size in bp (default: 50)")
     p.add_argument("--min-is-size", type=int, default=800,
-                   help="Min expected IS element size (bp) for peak filter")
+                   help="Min removed length (bp) for an empty site; shorter "
+                        "removals are 'intermediate'")
     p.add_argument("--max-is-size", type=int, default=200000,
                    help="Max expected IS element size (bp); larger removals are "
                         "'very_short'")
@@ -111,7 +112,8 @@ def main():
                     category = "ambiguous"
                 else:
                     category = classify_gap(pl["gap"], expected_v0, info["tnp_len"],
-                                            tol, max_removed=args.max_is_size)
+                                            tol, max_removed=args.max_is_size,
+                                            min_removed=args.min_is_size)
                 rem = expected_v0 - pl["gap"]
                 if category == "empty":
                     removed[(ref_id, D)].append(rem)

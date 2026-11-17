@@ -239,8 +239,14 @@ def main():
     # Step 2: HMM searches (use the filtered file)
     hmm_files = args.hmm.split(",")
     hmm_hits = []  # list of (hmm_name, set_of_protein_ids)
-    for hmm in hmm_files:
-        hmm_name = os.path.basename(hmm).replace(".hmm", "")
+    base_names = [os.path.basename(h).replace(".hmm", "") for h in hmm_files]
+    for i, hmm in enumerate(hmm_files):
+        hmm_name = base_names[i]
+        # Two profiles with the same file name (/a/model.hmm, /b/model.hmm)
+        # shared one cached domtbl, so "ALL domains" checked the first profile
+        # twice. Disambiguate by position when names collide.
+        if base_names.count(hmm_name) > 1:
+            hmm_name = f"{hmm_name}.{i + 1}"
         domtbl = os.path.join(work_dir, f"{hmm_name}.domtbl")
         if not os.path.exists(domtbl):
             print(f"Step 2: hmmsearch {hmm_name} ...", file=sys.stderr)
@@ -276,7 +282,8 @@ def main():
             {_asm(gff_info[pid][0]) for pid in combined if pid in gff_info}).values())
 
     # Write output TSV
-    domain_names = ",".join(n for n, _ in hmm_hits)
+    def domains_of(pid):   # the profiles THIS protein hit, not all requested
+        return ",".join(n for n, h in hmm_hits if pid in h)
     n_unmapped = sum(1 for pid in combined if pid not in gff_info)
     if n_unmapped:
         print(f"WARNING: {n_unmapped:,} of {len(combined):,} HMM-positive proteins "
@@ -299,7 +306,7 @@ def main():
                 continue
             is_id = f"{contig}_{pid.rsplit('_', 1)[-1]}"
             fout.write(f"{is_id}\t{assembly}\t{contig}\t{start}\t{end}"
-                       f"\t{strand}\t{tnp_len}\t{domain_names}\n")
+                       f"\t{strand}\t{tnp_len}\t{domains_of(pid)}\n")
             n_out += 1
     os.replace(args.out + ".tmp", args.out)   # atomic: pipeline.py caches on existence
     print(f"\nWrote {n_out:,} IS hits to {args.out} "

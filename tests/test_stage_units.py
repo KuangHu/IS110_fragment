@@ -42,7 +42,10 @@ def test_hamming_split():
     ins = rseq(1500)
     off = 4200
     filled = empty[:off] + ins + empty[off:]
-    snp = mutate(empty, 0.004)
+    # SNPs everywhere except within 40 bp of the junction
+    snp = (mutate(empty[:off - 40], 0.004) + empty[off - 40:off + 40]
+           + mutate(empty[off + 40:], 0.004))
+    assert snp != empty
     hs = hamming_split(snp, filled, min_ident=0.95, min_insert=50)
     assert hs and hs["insert_len"] == 1500
     assert abs(hs["offset"] - off) <= hs["ambiguity"] + 1, hs
@@ -59,6 +62,14 @@ def test_hamming_split():
     # (accepting it would make the insert 3 bp too long)
     shifted = empty[:2000] + empty[2003:]
     assert hamming_split(shifted, filled, min_insert=50) is None
+    # ... including when it sits a few bp from the junction, where it causes
+    # only a handful of mismatches (was: a confident 1,503-bp call)
+    near = empty[:off - 10] + empty[off - 7:]
+    assert hamming_split(near, filled, min_insert=50) is None
+    assert decompose_alleles(near, filled, tolerant=False)["method"] == "none"
+    # a SNP right at the junction is refused too (cannot be told from a shift)
+    j = list(empty); j[off - 3] = "A" if j[off - 3] != "A" else "C"
+    assert hamming_split("".join(j), filled, min_insert=50) is None
     # too short an insert
     assert hamming_split(empty, empty[:500] + "ACGTACGTAC" + empty[500:]) is None
 
@@ -127,8 +138,28 @@ def test_stage_markers():
         run()                                   # marker present -> skipped
         assert open(out).read() == "partialx"
         os.remove(os.path.join(td, ".stage_3_minimap2.done"))
+        pipeline._RAN.discard(td)
         run(trust_existing=True)                # adopted, not re-run
         assert open(out).read() == "partialx"
+        # ... but never after a stage has already run in this invocation: an
+        # upstream rerun makes the existing downstream file stale
+        os.remove(os.path.join(td, ".stage_3_minimap2.done"))
+        pipeline._RAN.add(td)
+        run(trust_existing=True)
+        assert open(out).read() == "partialxx"
+        # changed parameters -> not skipped, even with a marker
+        cmd_b = cmd + ["--min-identity", "100"]
+        pipeline._run_stage(td, "3_minimap2", "t", cmd_b, [out])
+        assert open(out).read() == "partialxxx"
+        pipeline._run_stage(td, "3_minimap2", "t", cmd_b, [out])
+        assert open(out).read() == "partialxxx"
+        # an input newer than the marker -> re-run
+        inp = os.path.join(td, "in.tsv")
+        open(inp, "w").close()
+        os.utime(inp, (os.path.getmtime(inp) + 5,) * 2)
+        pipeline._run_stage(td, "3_minimap2", "t", cmd_b, [out], inputs=[inp])
+        assert open(out).read() == "partialxxxx"
+        open(out, "w").write("partialx")
         # a failing stage leaves no marker
         os.remove(os.path.join(td, ".stage_3_minimap2.done"))
         bad = [sys.executable, "-c", "import sys; sys.exit(3)"]
@@ -177,8 +208,8 @@ def test_votes_are_placement_invariant():
     for name, seq, ident in (("E1", empty_exact, 100.0), ("E2", empty_snp, 99.6)):
         # the empty interval between the same anchors: [g0, len - (flank right of anchor))
         e = {"tname": name, "strand": "+", "mean_ident": ident, "assembly": name,
-             "up_te": g0, "down_ts": len(seq) - (len(filled_g) - (src["end"] + D))}
-        e["distance"] = e["down_ts"] - e["up_te"]
+             "gap_start": g0, "gap_end": len(seq) - (len(filled_g) - (src["end"] + D))}
+        e["distance"] = e["gap_end"] - e["gap_start"]
         obs.append(e)
     dec = build_records.decompose_boundary(src, {"tnp_len": len(tnp)},
                                            {"D": D, "empty_obs": obs}, 5, 2e7)
@@ -187,6 +218,106 @@ def test_votes_are_placement_invariant():
     assert dec["consensus_support"] == 1.0
     assert dec["length"] == len(element)
     assert dec["junction_microhomology_bp"] >= len(mh)
+    import json
+    json.dumps(dec)          # alignment-derived numbers must be plain ints
+
+
+def _site(D, left, element, right, tnp_off, tnp_len):
+    """Source genome + src dict for an element inserted between left/right."""
+    g = left + element + right
+    t0 = len(left) + tnp_off
+    return g, {"contig": "S", "start": t0 + 1, "end": t0 + tnp_len, "strand": "+"}
+
+
+def _empty_obs(name, seq, g0, right_keep, ident=100.0):
+    e = {"tname": name, "strand": "+", "mean_ident": ident, "assembly": name,
+         "gap_start": g0, "gap_end": len(seq) - right_keep}
+    e["distance"] = e["gap_end"] - e["gap_start"]
+    return e
+
+
+def test_flank_deletion_is_not_an_empty():
+    """A target that lacks 1,500 bp of UPSTREAM flank but keeps the whole
+    transposase passes the length test for 'empty'. It must be rejected, not
+    turned into a 1,500-bp element."""
+    D = 5000
+    left, right, tnp = rseq(6000), rseq(6000), rseq(1200)
+    g, src = _site(D, left, tnp, right, 0, 1200)
+    deleted = left[:2000] + left[3500:] + tnp + right     # flank deletion only
+    build_records._FA = _FakeFasta({"S": g, "T": deleted})
+    build_records._SRC = None
+    g0 = src["start"] - 1 - D
+    eo = _empty_obs("T", deleted, g0, len(g) - (src["end"] + D))
+    dec = build_records.decompose_boundary(src, {"tnp_len": 1200},
+                                           {"D": D, "empty_obs": [eo]}, 5, 2e7)
+    assert not dec["ok"] and dec["rejected_assemblies"] == ["T"], dec
+    best = {"D": D, "expected_v0": 2 * D + 1200, "v0_peak": (2 * D + 1200, 1),
+            "empty_peak": (eo["distance"], 1), "v0_obs": [], "v1plus_obs": [],
+            "empty_obs": [eo], "decompose": {"D": D, "empty_obs": [eo]}}
+    rec = build_records._build_one_record(
+        (("r", {"tnp_len": 1200}, best, dict(src, assembly="S")), "db", 100, 5, "db", 2e7))[0]
+    be = rec["boundary_evidence"]
+    assert be["method"] == "no_empty_tnp_only", be["method"]
+    assert be["n_empty_observations"] == 0 and be["n_empty_rejected_flank_deletion"] == 1
+    assert rec["is_element"]["length"] == 1200
+
+
+def test_boundary_choice_is_deterministic():
+    """Three empties say 1,400 bp, three say 1,600 bp, all equally good and
+    only five are used. The answer must not depend on input order."""
+    D = 1000
+    left, right, core, extra = rseq(1500), rseq(1500), rseq(1400), rseq(200)
+    g, src = _site(D, left, core + extra, right, 100, 1200)
+    seqs = {"S": g}
+    obs = []
+    g0 = src["start"] - 1 - D
+    keep = len(g) - (src["end"] + D)
+    for i in range(3):
+        seqs[f"A{i}"] = left + extra + right            # lacks `core` (1,400)
+        seqs[f"B{i}"] = left + right                    # lacks all (1,600)
+        obs += [_empty_obs(f"A{i}", seqs[f"A{i}"], g0, keep),
+                _empty_obs(f"B{i}", seqs[f"B{i}"], g0, keep)]
+    build_records._FA, build_records._SRC = _FakeFasta(seqs), None
+    got = set()
+    for order in (obs, obs[::-1], sorted(obs, key=lambda e: e["assembly"][::-1])):
+        dec = build_records.decompose_boundary(src, {"tnp_len": 1200},
+                                               {"D": D, "empty_obs": list(order)}, 5, 2e7)
+        got.add((dec["length"], dec["n_consensus"], dec["consensus_tied"]))
+    assert len(got) == 1, got
+
+
+def test_fallback_offsets_match_coordinates_minus_strand():
+    g = rseq(20000)
+    for strand in "+-":
+        src = {"contig": "S", "assembly": "S", "start": 8001, "end": 9200, "strand": strand}
+        build_records._FA, build_records._SRC = _FakeFasta({"S": g}), None
+        best = {"D": 1000, "expected_v0": 3200, "v0_peak": (3200, 3), "empty_peak": (1799, 2),
+                "v0_obs": [], "v1plus_obs": [], "empty_obs": [], "decompose": None}
+        rec = build_records._build_one_record(
+            (("r", {"tnp_len": 1200}, best, src), "db", 100, 5, "db", 2e7))[0]
+        ie = rec["is_element"]
+        assert ie["length"] == 1401
+        left = 8001 - ie["source_start"]            # bp added on the genomic left
+        right = ie["source_end"] - 9200
+        five, three = (left, right) if strand == "+" else (right, left)
+        assert (-ie["start_offset_5p"], ie["end_offset_3p"]) == (five, three), (strand, ie)
+        # and the stored sequence is the element in transposase orientation
+        seq = g[ie["source_start"] - 1:ie["source_end"]]
+        assert ie["sequence"] == (seq if strand == "+" else revcomp(seq))
+
+
+def test_source_db_is_separate():
+    """Sources are read from --source-db; they need not exist in the target DB."""
+    g = rseq(9000)
+    build_records._FA = _FakeFasta({"T": rseq(5000)})
+    build_records._SRC = _FakeFasta({"S": g})
+    src = {"contig": "S", "assembly": "S", "start": 4001, "end": 5200, "strand": "+"}
+    best = {"D": 1000, "expected_v0": 3200, "v0_peak": None, "empty_peak": None,
+            "v0_obs": [], "v1plus_obs": [], "empty_obs": [], "decompose": None}
+    rec = build_records._build_one_record(
+        (("r", {"tnp_len": 1200}, best, src), "db", 100, 5, "db", 2e7))
+    assert rec is not None and rec[0]["transposase_cds"]["sequence"] == g[4000:5200]
+    build_records._SRC = None
 
 
 if __name__ == "__main__":

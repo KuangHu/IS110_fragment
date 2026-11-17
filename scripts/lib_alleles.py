@@ -164,7 +164,8 @@ def gap_tolerance(expected_v0, tol_bp=100, tol_frac=0.002):
     return tol_bp + tol_frac * max(0, expected_v0)
 
 
-def classify_gap(gap, expected_v0, tnp_len, tol, max_removed=None):
+def classify_gap(gap, expected_v0, tnp_len, tol, max_removed=None,
+                 min_removed=None):
     """Classify an anchor gap against the source (filled) state.
 
     removed = expected_v0 - gap is how much DNA the target lacks relative to
@@ -178,7 +179,7 @@ def classify_gap(gap, expected_v0, tnp_len, tol, max_removed=None):
     removed = -delta
     if max_removed is not None and removed > max_removed + tol:
         return "very_short"
-    if removed >= tnp_len - tol:
+    if removed >= tnp_len - tol and (min_removed is None or removed >= min_removed):
         return "empty"
     return "intermediate"
 
@@ -203,24 +204,62 @@ def place_pair(ups, downs, min_gap=-50, max_gap=200000, margin_ratio=0.05):
 
     `ups`/`downs` are Hit lists. Returns a dict or None.
     """
-    cands = []
-    for u in ups:
-        for d in downs:
+    def inner_edges(u, d):
+        # Inward-facing anchor edges on the target, PROJECTED through any
+        # unaligned query bases. Hits pass at >= min_coverage (80%), so up to
+        # 100 bp of a 500-bp anchor may be clipped; using the raw alignment
+        # ends added the clipped inner bases to the gap (a true 3,200-bp
+        # filled gap measured 3,400 -> 'v1plus_filled') and to the fetched
+        # interval.
+        if u.strand == "+":
+            return u.te + (u.qlen - u.qe), d.ts - d.qs
+        # anchors swap sides on the minus strand
+        return d.te + d.qs, u.ts - (u.qlen - u.qe)
+
+    pairs = []
+    for ui, u in enumerate(ups):
+        for di, d in enumerate(downs):
             if u.tname != d.tname or u.strand != d.strand:
                 continue
-            if u.strand == "+":
-                s, e = u.te, d.ts
-            else:                       # anchors swap sides on the minus strand
-                s, e = d.te, u.ts
+            s, e = inner_edges(u, d)
             gap = e - s
             if gap < min_gap or gap > max_gap:
                 continue
             score = u.nmatch / max(1, u.qlen) + d.nmatch / max(1, d.qlen)
-            cands.append((score, u, d, s, e))
-    if not cands:
+            pairs.append((score, gap, ui, di, u, d, s, e))
+    if not pairs:
         return None
-    cands.sort(key=lambda x: -x[0])
-    score, u, d, s, e = cands[0]
+    # One candidate per LOCUS: keep a pair only if each anchor is the other's
+    # nearest valid partner. Ranking every up x down combination by score
+    # alone let a full-length up hit at copy 1 pair with a full-length down
+    # hit at copy 2 and outscore both true (partly clipped) same-locus pairs:
+    # a 'resolved' 12 kb allele that exists in no genome.
+    near_u, near_d = {}, {}
+    for c in pairs:
+        _, gap, ui, di = c[:4]
+        if ui not in near_u or gap < near_u[ui][0]:
+            near_u[ui] = (gap, di)
+        if di not in near_d or gap < near_d[di][0]:
+            near_d[di] = (gap, ui)
+    loci = [c for c in pairs
+            if near_u[c[2]][1] == c[3] and near_d[c[3]][1] == c[2]]
+    if not loci:
+        return None
+    in_locus_u = {c[2] for c in loci}
+    in_locus_d = {c[3] for c in loci}
+    # A stray extra copy of ONE anchor (not part of any locus of its own) is
+    # still a rival for the anchor it could pair with: one up hit with two
+    # equally good down hits must stay ambiguous, not be settled by distance.
+    strays = [c for c in pairs
+              if (c[2] in in_locus_u) != (c[3] in in_locus_d)]
+    cands = [(c[0], c[4], c[5], c[6], c[7]) for c in loci + strays]
+    # deterministic order: score, then target position
+    cands.sort(key=lambda x: (-x[0], x[3], x[4]))
+    # the placement itself is always a locus; strays only compete as runner-up
+    best_locus = min(loci, key=lambda c: (-c[0], c[6], c[7]))
+    score, u, d, s, e = best_locus[0], best_locus[4], best_locus[5], best_locus[6], best_locus[7]
+    cands = [(score, u, d, s, e)] + [c for c in cands
+                                      if not (c[1] is u and c[2] is d)]
     if len(cands) == 1:
         margin, status, second = 1.0, "unique", None
     else:
@@ -244,15 +283,22 @@ def place_per_assembly(up_by_tname, down_by_tname, **kw):
         by_asm_up.setdefault(split_target(t)[0], []).extend(hs)
     for t, hs in down_by_tname.items():
         by_asm_down.setdefault(split_target(t)[0], []).extend(hs)
-    shared = set(by_asm_up) & set(by_asm_down)
-    reps = representative_asm(shared)
+    by_core = {}
+    for asm in set(by_asm_up) & set(by_asm_down):
+        by_core.setdefault(assembly_core(asm), []).append(asm)
     out = {}
-    for core, asm in reps.items():
-        pl = place_pair(by_asm_up[asm], by_asm_down[asm], **kw)
-        if pl is None:
-            continue
-        pl["assembly"], pl["core"] = asm, core
-        out[core] = pl
+    # sorted(): iteration order must not depend on the hash seed -- it decides
+    # which observations survive a top-N cut downstream.
+    for core in sorted(by_core):
+        # Preferred twin first, but fall through to the other one: choosing
+        # the representative BEFORE placing lost the site whenever the
+        # preferred copy had its two anchors on different contigs.
+        for asm in sorted(by_core[core], key=_asm_rank, reverse=True):
+            pl = place_pair(by_asm_up[asm], by_asm_down[asm], **kw)
+            if pl is not None:
+                pl["assembly"], pl["core"] = asm, core
+                out[core] = pl
+                break
     return out
 
 
@@ -304,18 +350,25 @@ def tolerant_decompose(short, long_, min_cov, min_ident, min_insert, dominance):
     sb, lb = aln.aligned
     if len(sb) == 0:
         return None
+    # native ints: Bio's coordinates are numpy.int64, which json.dump rejects
+    # (Stage 6 crashed whenever the consensus call was alignment-based)
+    blocks = [((int(s0), int(s1)), (int(l0), int(l1)))
+              for (s0, s1), (l0, l1) in zip(sb, lb)]
     inserts, dels, cols, matches = [], [], 0, 0
-    prev_s = prev_l = None
-    for (s0, s1), (l0, l1) in zip(sb, lb):
-        if prev_s is not None:
-            sg, lg = s0 - prev_s, l0 - prev_l
-            if sg == 0 and lg > 0:
-                inserts.append((lg, prev_s, prev_l, l0))
-            elif lg == 0 and sg > 0:
-                dels.append(sg)
-            elif sg > 0 and lg > 0:
-                inserts.append((lg, prev_s, prev_l, l0))
-                dels.append(sg)
+    # Terminal gaps count too. Only gaps BETWEEN aligned blocks were tallied,
+    # so a second large extra block at the start or end of the long allele
+    # escaped the dominance test.
+    prev_s, prev_l = 0, 0
+    blocks.append(((len(short), len(short)), (len(long_), len(long_))))
+    for (s0, s1), (l0, l1) in blocks:
+        sg, lg = s0 - prev_s, l0 - prev_l
+        if sg == 0 and lg > 0:
+            inserts.append((lg, prev_s, prev_l, l0))
+        elif lg == 0 and sg > 0:
+            dels.append(sg)
+        elif sg > 0 and lg > 0:
+            inserts.append((lg, prev_s, prev_l, l0))
+            dels.append(sg)
         matches += sum(1 for a, b in zip(short[s0:s1], long_[l0:l1]) if a == b)
         cols += s1 - s0
         prev_s, prev_l = s1, l1
@@ -341,7 +394,7 @@ def tolerant_decompose(short, long_, min_cov, min_ident, min_insert, dominance):
 
 
 def hamming_split(short, long_, min_ident=0.95, min_insert=50,
-                  window=20, max_window_mm=8):
+                  window=20, max_window_mm=8, clean_junction=30):
     """SNP-tolerant, indel-free decomposition in O(len): find the offset where
     long = short[:off] + insert + short[off:] with the fewest mismatches.
 
@@ -354,10 +407,20 @@ def hamming_split(short, long_, min_ident=0.95, min_insert=50,
     point, so mismatches can simply be counted on both sides of every
     candidate split.
 
-    Refuses (returns None) when the best split is below `min_ident`, or when
-    any `window`-bp stretch holds more than `max_window_mm` mismatches: a
-    small indel elsewhere shifts the frame and shows up as a dense mismatch
-    run, and would make the insert length wrong by the indel size.
+    Refuses (returns None) when:
+      * the best split is below `min_ident`;
+      * any mismatch lies within `clean_junction` bp of the junction on
+        either side. Both flanks are compared anchored at their OUTER ends,
+        so an indel anywhere in a flank shifts every base between it and the
+        junction: the shifted run always abuts the junction. A clean junction
+        therefore rules out a net indel in either flank -- which would make
+        the insert length wrong by the indel size (a 3-bp deletion 7 bp from
+        the junction once gave a confident 1,503-bp call for a 1,500-bp
+        element);
+      * any `window`-bp stretch holds more than `max_window_mm` mismatches
+        (compensating indels leave a shifted run that does not reach the
+        junction).
+    A real SNP next to the junction also refuses; another empty will vote.
     Ties take the rightmost split, the same convention as decompose().
     """
     n, ilen = len(short), len(long_) - len(short)
@@ -379,6 +442,8 @@ def hamming_split(short, long_, min_ident=0.95, min_insert=50,
         return None
     mm = [i for i in range(off) if short[i] != long_[i]]
     mm += [i for i in range(off, n) if short[i] != long_[i + ilen]]
+    if any(off - clean_junction <= i < off + clean_junction for i in mm):
+        return None
     for k in range(len(mm) - max_window_mm):
         if mm[k + max_window_mm] - mm[k] < window:
             return None

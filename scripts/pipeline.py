@@ -46,21 +46,48 @@ _STAGE_ORDER = ["2_anchors", "3_minimap2", "4_pairs", "5_boundaries", "6_records
                 "10b_tandem"]
 
 
+_RAN = set()   # output dirs in which some stage has executed in this process
+
+
 def _run_stage(output_dir, name, title, cmd, outputs, trust_existing=False,
-               atomic_o=None):
-    """Run one cached stage. `outputs`: files that must exist for a skip.
-    `atomic_o`: (flag_index_in_cmd) of a single output path that the tool
-    writes itself; it is written to <path>.tmp and renamed on success."""
+               atomic_o=None, inputs=()):
+    """Run one cached stage.
+
+    outputs   files that must all exist for a skip
+    inputs    files whose modification invalidates the stage (newer than marker)
+    atomic_o  index in `cmd` of an output path the tool writes itself; it is
+              written to <path>.tmp and renamed on success
+
+    The marker stores the exact command line. A stage is skipped only if the
+    marker exists, records the SAME command (thresholds, DB paths, ...), all
+    outputs exist and no input is newer than the marker. A marker that only
+    said "done" let a rerun with --min-identity 100 return the 95% results.
+    """
+    import json
     marker = os.path.join(output_dir, f".stage_{name}.done")
+    sig = json.dumps([os.path.basename(cmd[0])] + list(cmd[1:]))
     have = all(os.path.exists(o) for o in outputs)
     if have and os.path.exists(marker):
-        return
-    if have and trust_existing and all(os.path.getsize(o) > 0 for o in outputs):
+        with open(marker) as f:
+            old_sig = f.read().strip()
+        stale_in = [i for i in inputs
+                    if os.path.exists(i) and os.path.getmtime(i) > os.path.getmtime(marker)]
+        if old_sig == sig and not stale_in:
+            return
+        why = (f"input changed: {os.path.basename(stale_in[0])}" if stale_in
+               else "parameters changed since the cached run")
+        print(f"=== {title}: {why} -- re-running ===", flush=True)
+    elif (have and trust_existing and output_dir not in _RAN
+          and all(os.path.getsize(o) > 0 for o in outputs)):
+        # Adoption is only for an untouched legacy directory. Once any stage
+        # has run in this invocation its downstream outputs are stale and
+        # must never be adopted.
         print(f"=== {title}: adopting existing outputs (--trust-existing) ===",
               flush=True)
-        open(marker, "w").close()
+        with open(marker, "w") as f:
+            f.write(sig + "\n")
         return
-    if any(os.path.exists(o) for o in outputs):
+    elif any(os.path.exists(o) for o in outputs):
         print(f"=== {title}: outputs present but no completion marker "
               f"(interrupted or pre-marker run) -- re-running ===", flush=True)
     # This stage is about to change its outputs, so every later stage's
@@ -69,19 +96,21 @@ def _run_stage(output_dir, name, title, cmd, outputs, trust_existing=False,
         m = os.path.join(output_dir, f".stage_{later}.done")
         if os.path.exists(m):
             os.remove(m)
+    _RAN.add(output_dir)
     print(f"=== {title} ===", flush=True)
     if atomic_o is not None:
         final = cmd[atomic_o]
-        cmd = list(cmd)
-        cmd[atomic_o] = final + ".tmp"
-        subprocess.run(cmd, check=True)
+        run_cmd = list(cmd)
+        run_cmd[atomic_o] = final + ".tmp"
+        subprocess.run(run_cmd, check=True)
         os.replace(final + ".tmp", final)
     else:
         subprocess.run(cmd, check=True)
     missing = [o for o in outputs if not os.path.exists(o)]
     if missing:
         raise RuntimeError(f"{title}: finished without writing {missing}")
-    open(marker, "w").close()
+    with open(marker, "w") as f:
+        f.write(sig + "\n")
 
 
 def find_is_boundaries(
@@ -152,7 +181,10 @@ def find_is_boundaries(
            "--anchor-length", str(anchor_length),
            "--distances", ",".join(str(d) for d in distances),
            "--threads", str(threads)],
-          [anchors_fa, ref_table_tsv])
+          [anchors_fa, refs_fa, ref_table_tsv],
+          # Stage 1 is cached on existence; a regenerated or hand-replaced
+          # is_hits.tsv must still invalidate everything built from it
+          inputs=[is_hits_tsv])
 
     # Stage 3
     # Use 'sr' preset for short anchor queries (500 bp).
@@ -203,10 +235,17 @@ def find_is_boundaries(
            "--hits", is_hits_tsv,
            "--genome-db", genome_db,
            "--out", records_dir,
+           "--source-db", src_db,
            "--min-identity", str(min_identity),
            "--min-coverage", str(min_coverage),
+           # same size limits as Stage 5, so the two stages cannot disagree
+           # about what an empty site is
+           "--min-is-size", str(expected_is_size_range[0]),
+           "--max-is-size", str(expected_is_size_range[1]),
            "--threads", str(threads)],
-          [records_json, os.path.join(records_dir, "summary.tsv")])
+          [records_json] + [os.path.join(records_dir, f) for f in (
+              "summary.tsv", "is_elements.fa", "transposase_cds.fa",
+              "upstream_flanks.fa", "downstream_flanks.fa", "empty_junctions.fa")])
 
     # Stage 7 (optional): rearrangement detection from the same anchor PAF
     if detect_rearrangements:
@@ -370,9 +409,12 @@ def main():
     p.add_argument("--any-domain", action="store_true")
     p.add_argument("--threads", type=int, default=32)
     p.add_argument("--max-secondary", type=int, default=50,
-                   help="minimap2 -N for the anchor search: max targets per "
-                        "anchor is N+1. Default 50 samples the DB; set it to at "
-                        "least the number of distinct assemblies for a census")
+                   help="minimap2 -N for the anchor search: max target HITS per "
+                        "anchor is N+1. Default 50 samples the DB. For a census "
+                        "it must exceed the number of DB sequences an anchor can "
+                        "hit -- GCA/GCF twins and extra locus copies each use a "
+                        "slot, so the number of distinct assemblies is NOT "
+                        "enough; raise it until Stage 5 reports no capped anchors")
     p.add_argument("--trust-existing", action="store_true",
                    help="Adopt stage outputs that exist but have no completion "
                         "marker (runs made before markers existed). Without it "
