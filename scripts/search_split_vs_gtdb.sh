@@ -4,8 +4,10 @@
 #SBATCH --cpus-per-task=48
 #SBATCH --mem=64G
 #SBATCH --time=12:00:00
-#SBATCH --output=/groups/rubin/projects/kuang/out/IS110_fragment/hmm_search/split_vs_gtdb_%j.out
-#SBATCH --error=/groups/rubin/projects/kuang/out/IS110_fragment/hmm_search/split_vs_gtdb_%j.err
+#SBATCH --output=split_vs_gtdb_%j.out
+#SBATCH --error=split_vs_gtdb_%j.err
+# (logs go to the directory the job is submitted from; they used to name a
+#  path on the cluster this was first run on, where sbatch here cannot write)
 
 set -euo pipefail
 

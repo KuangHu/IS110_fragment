@@ -7,8 +7,10 @@
 #SBATCH --cpus-per-task=48
 #SBATCH --mem=64G
 #SBATCH --time=24:00:00
-#SBATCH --output=/groups/rubin/projects/kuang/out/IS110_fragment/hmm_search/hmm_IS110_%j.out
-#SBATCH --error=/groups/rubin/projects/kuang/out/IS110_fragment/hmm_search/hmm_IS110_%j.err
+#SBATCH --output=hmm_IS110_%j.out
+#SBATCH --error=hmm_IS110_%j.err
+# (logs go to the directory the job is submitted from; they used to name a
+#  path on the cluster this was first run on, where sbatch here cannot write)
 
 # Pipeline: Find all IS110 transposases in GTDB using Pfam HMMs,
 # then search them back against GTDB to find split CDS cases.
@@ -23,6 +25,7 @@ CPUS=48
 SCRIPTS="${IS110_FRAGMENT_SCRIPTS:-/global/home/users/kh36969/IS110_ecology/IS110_fragment/repo/scripts}"
 # paths above are those of the cluster this was first run on; override by environment
 
+export OUTDIR GTDB_FNA GTDB_FAA HMM_DIR     # read by the embedded Python
 mkdir -p "$OUTDIR"
 
 echo "=== IS110 HMM search pipeline ==="
@@ -77,7 +80,7 @@ echo "Step 3: Finding proteins with both DEDD + Tnp20 domains..."
 
 python3 - << 'PYEOF'
 import os
-outdir = "/groups/rubin/projects/kuang/out/IS110_fragment/hmm_search"
+outdir = os.environ["OUTDIR"]          # exported by the shell part
 
 def parse_domtbl(path):
     hits = set()
@@ -115,9 +118,9 @@ import os
 from collections import defaultdict
 from Bio import SeqIO
 
-outdir = "/groups/rubin/projects/kuang/out/IS110_fragment/hmm_search"
-gtdb_faa = "/groups/rubin/projects/kuang/out/embedding_project/protein_collection/GTDB/GTDB_faa"
-gtdb_fna = "/groups/rubin/databases/GTDB/gtdb_genomes_v2024latest/gtdb_genomes_reps_r220/allfilestogether"
+outdir = os.environ["OUTDIR"]          # exported by the shell part
+gtdb_faa = os.environ["GTDB_FAA"]
+gtdb_fna = os.environ["GTDB_FNA"]
 
 with open(os.path.join(outdir, "is110_protein_ids.txt")) as f:
     target_ids = set(line.strip() for line in f if line.strip())
