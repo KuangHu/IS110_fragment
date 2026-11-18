@@ -1,28 +1,33 @@
 #!/usr/bin/env python3
-"""Strict re-test for confirmed inversions using the MIDDLE-segment geometry.
+"""Strict re-test for confirmed inversions: do the two flanks of the element
+follow their anchors onto OPPOSITE strands of the target?
 
-Biological model for an IS-mediated inversion:
+    REF:    --U--[IS_a]-- M --[IS_b]--D--
+    TARGET: --U--[IS_a]-- rev(M) --[IS_b]--D--
 
-    REF:    --upstream--[IS_a]-- MIDDLE --[IS_b]--downstream--
-    TARGET: --upstream--[IS_a]-- rev(MIDDLE) --[IS_b]--downstream--
+Only M flips. Whichever copy our element is, one of its flanks lies in M and
+the other outside, so in the target the two flanks are on opposite strands of
+one contig -- which is what the Stage 7 candidate says about the two 500-bp
+anchors. This script tests it on the flanks themselves:
 
-Only the MIDDLE segment flips. The ref IS we track could be either IS_a or IS_b,
-so we test BOTH 30 kb flanks (downstream-of-IS as MIDDLE-proxy if our IS is IS_a,
-upstream-of-IS as MIDDLE-proxy if our IS is IS_b) and take the side with the
-better reverse-strand alignment.
+  1. up / down reference flanks (in transposase orientation, like the anchors),
+     --middle-window bp, capped at the estimated inverted span when the
+     candidates file gives one (a flank longer than M cannot be 80% inverted);
+  2. each is aligned to the target window around ITS anchor hit;
+  3. PASS if each flank is covered >= --min-middle-cov (union) at
+     >= --min-identity on the SAME strand as its anchor, and the two anchor
+     strands differ.
 
-For each CONFIRMED_BOTH inversion in a validation.tsv:
-  1. Extract REF DOWN PROXY = ref_contig[IS_end : IS_end + window]
-     Extract REF UP PROXY   = ref_contig[IS_start - window : IS_start]
-  2. Extract TGT REGION = union of up_anchor + down_anchor contig ranges +/- window
-  3. minimap2 -x asm10 -c each ref proxy vs target region
-  4. Find largest reverse-strand block in each alignment
-  5. Pick the side (down or up) with the larger reverse block
-  6. PASS if best block coverage >= --min-middle-cov (default 0.80 of ref proxy)
-          AND identity                  >= --min-identity (default 95.0)
+The previous version took the larger reverse-strand block of either flank and
+passed on that alone: a target contig that is simply stored reverse-
+complemented (no inversion) passed exactly like a real inversion, and anchors
+were looked up by ref_id only (the last target's anchors were used for all).
 """
-import argparse, csv, gzip, json, os, re, shutil, subprocess, tempfile
+import argparse, csv, gzip, json, os, re, shutil, subprocess, tempfile, sys
 import pysam
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import lib_rearr as lr  # noqa: E402
 
 
 def parse_args():
@@ -47,23 +52,6 @@ def parse_args():
     return p.parse_args()
 
 
-def load_loci(records_path):
-    loci = {}
-    with open(records_path) as f:
-        recs = json.load(f)
-    for r in recs:
-        rid = r.get("ref_id") or r.get("is110_id")
-        src = r.get("source", {})
-        ie = r.get("is_element") or src.get("is_element") or {}
-        contig = src.get("contig")
-        s = ie.get("source_start") or src.get("transposase_start")
-        e = ie.get("source_end") or src.get("transposase_end")
-        if rid and contig and s and e:
-            local = contig.split("|", 1)[1] if "|" in contig else contig
-            loci[rid] = (local, int(s), int(e))
-    return loci
-
-
 def find_assembly_fa(src_dir, asm, work):
     for ext in (".fna.gz", ".fa.gz", ".fna", ".fa"):
         cand = os.path.join(src_dir, asm + ext)
@@ -78,92 +66,37 @@ def find_assembly_fa(src_dir, asm, work):
     return None
 
 
-def write_fasta(label, seq, path):
-    with open(path, "w") as fh:
-        fh.write(f">{label}\n")
-        for i in range(0, len(seq), 80):
-            fh.write(seq[i:i+80] + "\n")
-
-
-ANCHOR_RE = re.compile(r"([\w.|]+):(\d+)-(\d+)")
-def anchor_targets(details):
-    return [(m.group(1), int(m.group(2)), int(m.group(3))) for m in ANCHOR_RE.finditer(details)]
-
-
-def best_rev_block(ref_fa_path, tgt_fa_path, work, threads):
-    """Run minimap2 ref vs tgt, return (best_rev_block_bp, best_rev_block_ident)."""
-    paf = os.path.join(work, "aln.paf")
-    subprocess.run(["minimap2", "-x", "asm10", "-c", "--eqx",
-                    "-t", str(threads), ref_fa_path, tgt_fa_path, "-o", paf],
-                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    best_block = 0
-    best_ident = 0.0
-    with open(paf) as f:
-        for line in f:
-            c = line.split("\t")
-            if len(c) < 12: continue
-            if c[4] != "-": continue
-            matches, block = int(c[9]), int(c[10])
-            if block > best_block:
-                best_block = block
-                best_ident = matches / block * 100 if block > 0 else 0
-    return best_block, best_ident
-
-
-def write_target_region(tgt_fa, details, window, out_path):
-    """Union of anchor contig ranges +/- window. Returns total bp written."""
-    anchors = anchor_targets(details)
-    if not anchors:
-        return 0
-    # group anchors by contig and take min/max
-    spans = {}
-    for (c, s, e) in anchors:
-        if c not in spans:
-            spans[c] = [s, e]
-        else:
-            spans[c][0] = min(spans[c][0], s)
-            spans[c][1] = max(spans[c][1], e)
-    total = 0
-    with open(out_path, "w") as fh:
-        for c, (s, e) in spans.items():
-            try:
-                clen = tgt_fa.get_reference_length(c)
-            except (KeyError, ValueError):
-                continue
-            sx = max(0, s - window)
-            ex = min(clen, e + window)
-            seq = tgt_fa.fetch(c, sx, ex)
-            if seq:
-                fh.write(f">TGT_{c}\n")
-                for k in range(0, len(seq), 80):
-                    fh.write(seq[k:k+80] + "\n")
-                total += len(seq)
-    return total
-
 
 def main():
     args = parse_args()
     os.makedirs(args.out, exist_ok=True)
-    loci = load_loci(args.records)
+    loci = lr.load_loci(args.records)
 
-    # Join validation rows (no 'details' col) with the input candidates file
-    details_by_ref = {}
+    # Join validation rows (no 'details' col) with the input candidates file,
+    # per (ref_id, target assembly)
+    cand = {}
     for r in csv.DictReader(open(args.candidates), delimiter="\t"):
         if r.get("details") and r.get("ref_id"):
-            details_by_ref[r["ref_id"]] = r["details"]
+            cand[(r["ref_id"], r.get("assembly") or r.get("tgt_asm"))] = r
 
-    rows = []
+    rows, n_nodetails = [], 0
     for r in csv.DictReader(open(args.validation), delimiter="\t"):
         if r.get("category") != "inversion_only" or r.get("verdict") != "CONFIRMED_BOTH":
             continue
-        r["details"] = details_by_ref.get(r.get("ref_id"), "")
-        if r["details"]:
-            rows.append(r)
+        c = cand.get((r.get("ref_id"), r.get("tgt_asm") or r.get("assembly")))
+        if c is None:
+            n_nodetails += 1
+            continue
+        r["details"] = c["details"]
+        r["_span"] = int(c.get("estimated_inverted_bp") or 0)
+        rows.append(r)
     if args.sample > 0 and len(rows) > args.sample:
         import random
         random.seed(13)
         rows = random.sample(rows, args.sample)
-    print(f"Checking {len(rows)} CONFIRMED_BOTH inversion rows ...", flush=True)
+    print(f"Checking {len(rows)} CONFIRMED_BOTH inversion rows "
+          f"({n_nodetails} more have no candidate row for that ref+target: SKIPPED)",
+          flush=True)
 
     out_path = os.path.join(args.out, "per_candidate_revcomp.tsv")
     work_root = tempfile.mkdtemp(prefix="revcheck_")
@@ -174,77 +107,65 @@ def main():
         fa_cache[asm] = pysam.FastaFile(path) if path else None
         return fa_cache[asm]
 
-    n_pass = 0
+    n_pass = n_assessed = 0
     with open(out_path, "w") as out:
-        out.write("ref_id\ttgt_asm\tbest_side\tref_middle_len\trev_block_bp\t"
-                  "rev_block_ident\trev_block_frac_of_middle\tdown_bp\tdown_ident\t"
-                  "up_bp\tup_ident\tpasses\n")
+        out.write("ref_id\ttgt_asm\tproxy_len\tup_anchor_strand\tdown_anchor_strand\t"
+                  "up_bp\tup_frac\tdown_bp\tdown_frac\tpasses\tstatus\n")
+
+        def skip(ref_id, tgt_asm, why):
+            out.write(f"{ref_id}\t{tgt_asm}\t0\t\t\t0\t0.000\t0\t0.000\tNA\t{why}\n")
+
         for i, r in enumerate(rows):
             if i % 50 == 0:
                 print(f"  {i}/{len(rows)}", flush=True)
             ref_id = r["ref_id"]
             tgt_asm = r.get("tgt_asm") or r.get("assembly")
             locus = loci.get(ref_id)
-            if not locus: continue
-            ref_contig, is_start, is_end = locus
-            ref_asm = ref_id.split("|")[0]
-            ref_fa = open_asm(ref_asm)
+            if not locus:
+                skip(ref_id, tgt_asm, "ref_id not in records"); continue
+            ref_contig, is_s0, is_e, strand = locus
+            ref_fa = open_asm(ref_id.split("|")[0])
             tgt_fa = open_asm(tgt_asm)
-            if not ref_fa or not tgt_fa: continue
+            if not ref_fa or not tgt_fa:
+                skip(ref_id, tgt_asm, "assembly FASTA not found"); continue
+            d = lr.parse_details(r["details"])
+            pair = next(((u, w) for u in d["up"] for w in d["down"]
+                         if u[0] == w[0] and u[3] != w[3]), None)
+            if pair is None:
+                skip(ref_id, tgt_asm, "no opposite-strand anchor pair on one contig"); continue
+            (c, us, ue, ust), (_, ds, de, dst) = pair
+            window = args.middle_window
+            if r["_span"] > 4000:
+                window = min(window, r["_span"] - 3000)
             try:
-                clen = ref_fa.get_reference_length(ref_contig)
+                up_seq, down_seq = lr.ref_proxies(ref_fa, ref_contig, is_s0, is_e, strand, window)
             except (KeyError, ValueError):
-                continue
-
+                skip(ref_id, tgt_asm, "ref contig not in FASTA"); continue
+            if min(len(up_seq), len(down_seq)) < 1000:
+                skip(ref_id, tgt_asm, "reference flank < 1 kb (contig end)"); continue
+            t_up, _ = lr.fetch_window(tgt_fa, c, us, ue, args.tgt_context)
+            t_dn, _ = lr.fetch_window(tgt_fa, c, ds, de, args.tgt_context)
+            if not t_up or not t_dn:
+                skip(ref_id, tgt_asm, "target contig not in FASTA"); continue
             work = tempfile.mkdtemp(prefix="rc_", dir=work_root)
-            # ref MIDDLE proxies: 30kb downstream of IS, and 30kb upstream of IS
-            down_s = is_end
-            down_e = min(clen, is_end + args.middle_window)
-            up_s = max(0, is_start - args.middle_window)
-            up_e = is_start
-            down_seq = ref_fa.fetch(ref_contig, down_s, down_e) if down_e > down_s else ""
-            up_seq   = ref_fa.fetch(ref_contig, up_s, up_e)     if up_e   > up_s   else ""
-            ref_down = os.path.join(work, "ref_down.fa")
-            ref_up   = os.path.join(work, "ref_up.fa")
-            if down_seq: write_fasta("REF_DOWN", down_seq, ref_down)
-            if up_seq:   write_fasta("REF_UP",   up_seq,   ref_up)
-            # target region: union of anchor contig spans +/- context
-            tgt_region = os.path.join(work, "tgt.fa")
-            tgt_bp = write_target_region(tgt_fa, r["details"], args.tgt_context, tgt_region)
-            if tgt_bp == 0:
-                shutil.rmtree(work, ignore_errors=True); continue
-
-            down_block = down_ident = 0
-            up_block = up_ident = 0
-            try:
-                if down_seq:
-                    down_block, down_ident = best_rev_block(ref_down, tgt_region, work, args.threads)
-                if up_seq:
-                    up_block, up_ident = best_rev_block(ref_up, tgt_region, work, args.threads)
-            except Exception:
-                shutil.rmtree(work, ignore_errors=True); continue
-
-            # pick the side with the larger rev block as the MIDDLE candidate
-            if down_block >= up_block:
-                side = "down"; block = down_block; ident = down_ident
-                ref_len = len(down_seq)
-            else:
-                side = "up";   block = up_block;   ident = up_ident
-                ref_len = len(up_seq)
-
-            frac = block / ref_len if ref_len else 0
-            passes = (frac >= args.min_middle_cov) and (ident >= args.min_identity)
-            if passes: n_pass += 1
-            out.write(f"{ref_id}\t{tgt_asm}\t{side}\t{ref_len}\t{block}\t"
-                      f"{ident:.1f}\t{frac:.3f}\t{down_block}\t{down_ident:.1f}\t"
-                      f"{up_block}\t{up_ident:.1f}\t{passes}\n")
+            up_bp = lr.strand_cover(lr.align(up_seq, t_up, work, args.threads), ust,
+                                    args.min_identity)
+            dn_bp = lr.strand_cover(lr.align(down_seq, t_dn, work, args.threads), dst,
+                                    args.min_identity)
             shutil.rmtree(work, ignore_errors=True)
+            uf, df = up_bp / len(up_seq), dn_bp / len(down_seq)
+            passes = uf >= args.min_middle_cov and df >= args.min_middle_cov
+            n_assessed += 1
+            if passes: n_pass += 1
+            out.write(f"{ref_id}\t{tgt_asm}\t{window}\t{ust}\t{dst}\t{up_bp}\t{uf:.3f}\t"
+                      f"{dn_bp}\t{df:.3f}\t{passes}\tassessed\n")
 
     for fa in fa_cache.values():
         if fa: fa.close()
     shutil.rmtree(work_root, ignore_errors=True)
-    print(f"\nDONE: {n_pass}/{len(rows)} pass MIDDLE-segment revcomp check "
-          f"(cov >= {args.min_middle_cov} of {args.middle_window} bp at ident >= {args.min_identity}%)")
+    print(f"\nDONE: {n_pass}/{n_assessed} assessed rows pass (each flank >= "
+          f"{args.min_middle_cov} covered at >= {args.min_identity}% on its anchor's "
+          f"strand, strands opposite); {len(rows) - n_assessed} not assessable")
     print(f"Wrote {out_path}")
 
 

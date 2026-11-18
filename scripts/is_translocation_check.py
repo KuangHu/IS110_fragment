@@ -35,9 +35,12 @@ Pass = bilateral conservation = HR-mediated translocation (Mech B).
 Fail = anchor-only / asymmetric conservation = could be simple transposition
        or partial homology rather than true segment exchange.
 """
-import argparse, csv, gzip, json, os, re, shutil, subprocess, tempfile
+import argparse, csv, gzip, json, os, re, shutil, subprocess, tempfile, sys
 from collections import defaultdict
 import pysam
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import lib_rearr as lr  # noqa: E402
 
 
 def parse_args():
@@ -59,23 +62,6 @@ def parse_args():
     return p.parse_args()
 
 
-def load_loci(records_path):
-    loci = {}
-    with open(records_path) as f:
-        recs = json.load(f)
-    for r in recs:
-        rid = r.get("ref_id") or r.get("is110_id")
-        src = r.get("source", {})
-        ie  = r.get("is_element") or src.get("is_element") or {}
-        contig = src.get("contig")
-        s = ie.get("source_start") or src.get("transposase_start")
-        e = ie.get("source_end")   or src.get("transposase_end")
-        if rid and contig and s and e:
-            local = contig.split("|", 1)[1] if "|" in contig else contig
-            loci[rid] = (local, int(s), int(e))
-    return loci
-
-
 def find_assembly_fa(src_dir, asm, work):
     for ext in (".fna.gz", ".fa.gz", ".fna", ".fa"):
         cand = os.path.join(src_dir, asm + ext)
@@ -90,90 +76,37 @@ def find_assembly_fa(src_dir, asm, work):
     return None
 
 
-def write_fasta(label, seq, path):
-    with open(path, "w") as fh:
-        fh.write(f">{label}\n")
-        for i in range(0, len(seq), 80):
-            fh.write(seq[i:i+80] + "\n")
-
-
-ANCHOR_RE = re.compile(r"([\w.|]+):(\d+)-(\d+)\(([+-])\)")
-def parse_anchors_block(details, side_tag):
-    """Parse all anchor hits in the side_tag (=up or down) block of details.
-    Returns list of (contig, s, e, strand)."""
-    # details ~ "up=[...] down=[...]"
-    m = re.search(rf"{side_tag}=\[([^\]]*)\]", details)
-    if not m:
-        return []
-    return [(mm.group(1), int(mm.group(2)), int(mm.group(3)), mm.group(4))
-            for mm in ANCHOR_RE.finditer(m.group(1))]
-
-
-def write_target_region(tgt_fa, contig, s_min, e_max, window, out_path, label):
-    try:
-        clen = tgt_fa.get_reference_length(contig)
-    except (KeyError, ValueError):
-        return 0
-    sx = max(0, s_min - window)
-    ex = min(clen, e_max + window)
-    seq = tgt_fa.fetch(contig, sx, ex)
-    if not seq:
-        return 0
-    with open(out_path, "w") as fh:
-        fh.write(f">{label}_{contig}_{sx}_{ex}\n")
-        for k in range(0, len(seq), 80):
-            fh.write(seq[k:k+80] + "\n")
-    return len(seq)
-
-
-def best_forward_block(ref_fa_path, tgt_fa_path, work, threads):
-    """Return (best_fwd_block_bp, best_fwd_block_ident) — biggest + strand block."""
-    paf = os.path.join(work, "aln.paf")
-    subprocess.run(["minimap2", "-x", "asm10", "-c", "--eqx",
-                    "-t", str(threads), ref_fa_path, tgt_fa_path, "-o", paf],
-                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    best_block = 0
-    best_ident = 0.0
-    with open(paf) as f:
-        for line in f:
-            c = line.split("\t")
-            if len(c) < 12: continue
-            if c[4] != "+": continue
-            matches, block_len = int(c[9]), int(c[10])
-            if block_len > best_block:
-                best_block = block_len
-                best_ident = matches / block_len * 100 if block_len > 0 else 0
-    return best_block, best_ident
-
-
 def main():
     args = parse_args()
     os.makedirs(args.out, exist_ok=True)
-    loci = load_loci(args.records)
+    loci = lr.load_loci(args.records)
 
     rows = []
+    n_in = n_same_contig = 0
     for r in csv.DictReader(open(args.candidates), delimiter="\t"):
+        if r.get("ref_id") == "ref_id":
+            continue                      # repeated header line in a concatenated input
         # accept either pre-filtered CONFIRMED_BOTH catalogue or raw with verdict col
         verdict = r.get("verdict")
         if verdict and verdict != "CONFIRMED_BOTH":
             continue
-        details = r.get("details", "")
-        if not details: continue
-        ups   = parse_anchors_block(details, "up")
-        downs = parse_anchors_block(details, "down")
-        if not ups or not downs: continue
-        # require they be on DIFFERENT contigs (translocation signature)
-        up_contigs = {a[0] for a in ups}
-        down_contigs = {a[0] for a in downs}
-        if up_contigs == down_contigs: continue
-        r["_up"] = ups[0]      # pick the first up anchor
-        r["_down"] = downs[0]  # pick the first down anchor
+        n_in += 1
+        d = lr.parse_details(r.get("details", ""))
+        # one up and one down anchor on DIFFERENT contigs (the translocation
+        # signature). ups[0]/downs[0] could be on the same contig.
+        pair = next(((u, w) for u in d["up"] for w in d["down"] if u[0] != w[0]), None)
+        if pair is None:
+            n_same_contig += 1
+            continue
+        r["_up"], r["_down"] = pair
         rows.append(r)
     if args.sample > 0 and len(rows) > args.sample:
         import random
         random.seed(13)
         rows = random.sample(rows, args.sample)
-    print(f"Checking {len(rows)} translocation candidates ...", flush=True)
+    print(f"Checking {len(rows)} translocation candidates "
+          f"({n_same_contig} of {n_in} skipped: no up/down pair on different contigs)",
+          flush=True)
 
     out_path = os.path.join(args.out, "per_candidate_translocation.tsv")
     work_root = tempfile.mkdtemp(prefix="trcheck_")
@@ -184,80 +117,77 @@ def main():
         fa_cache[asm] = pysam.FastaFile(path) if path else None
         return fa_cache[asm]
 
-    min_block_bp = int(args.middle_window * args.min_block_cov)
-    n_pass = 0
+    n_pass = n_assessed = 0
     with open(out_path, "w") as out:
         out.write("ref_id\ttgt_asm\tA_proxy_len\tB_proxy_len\t"
                   "A_fwd_block_bp\tA_fwd_block_ident\tA_frac_of_proxy\t"
                   "B_fwd_block_bp\tB_fwd_block_ident\tB_frac_of_proxy\t"
-                  "A_passes\tB_passes\tpasses\n")
+                  "A_passes\tB_passes\tpasses\tstatus\n")
+
+        def skip(ref_id, tgt_asm, why):
+            # every candidate gets a row; these used to disappear
+            out.write(f"{ref_id}\t{tgt_asm}\t0\t0\t0\t0.0\t0.000\t0\t0.0\t0.000\t"
+                      f"NA\tNA\tNA\t{why}\n")
+
         for i, r in enumerate(rows):
             if i % 50 == 0:
                 print(f"  {i}/{len(rows)}", flush=True)
             ref_id  = r.get("ref_id")
             tgt_asm = r.get("tgt_asm") or r.get("assembly")
             locus = loci.get(ref_id)
-            if not locus: continue
-            ref_contig, is_s, is_e = locus
-            ref_asm = ref_id.split("|")[0]
-            ref_fa = open_asm(ref_asm)
+            if not locus:
+                skip(ref_id, tgt_asm, "ref_id not in records"); continue
+            ref_contig, is_s0, is_e, strand = locus
+            ref_fa = open_asm(ref_id.split("|")[0])
             tgt_fa = open_asm(tgt_asm)
-            if not ref_fa or not tgt_fa: continue
+            if not ref_fa or not tgt_fa:
+                skip(ref_id, tgt_asm, "assembly FASTA not found"); continue
             try:
-                clen = ref_fa.get_reference_length(ref_contig)
+                # A = UPSTREAM, B = DOWNSTREAM of the element in transposase
+                # orientation -- the frame the up/down anchors are in. They were
+                # "genomic left/right", so for a minus-strand element A was
+                # aligned to the contig holding the DOWN anchor.
+                A_seq, B_seq = lr.ref_proxies(ref_fa, ref_contig, is_s0, is_e, strand,
+                                              args.middle_window)
             except (KeyError, ValueError):
-                continue
+                skip(ref_id, tgt_asm, "ref contig not in FASTA"); continue
+            (up_c, up_s, up_e, up_st), (dn_c, dn_s, dn_e, dn_st) = r["_up"], r["_down"]
+            t1, _ = lr.fetch_window(tgt_fa, up_c, up_s, up_e, args.tgt_context)
+            t2, _ = lr.fetch_window(tgt_fa, dn_c, dn_s, dn_e, args.tgt_context)
+            if not t1 or not t2:
+                skip(ref_id, tgt_asm, "target contig not in FASTA"); continue
+            if min(len(A_seq), len(B_seq)) < 1000:
+                skip(ref_id, tgt_asm, "reference flank < 1 kb (contig end)"); continue
 
             work = tempfile.mkdtemp(prefix="tr_", dir=work_root)
-            # ref A-proxy (upstream of IS) and B-proxy (downstream of IS)
-            A_s = max(0, is_s - args.middle_window); A_e = is_s
-            B_s = is_e; B_e = min(clen, is_e + args.middle_window)
-            A_seq = ref_fa.fetch(ref_contig, A_s, A_e) if A_e > A_s else ""
-            B_seq = ref_fa.fetch(ref_contig, B_s, B_e) if B_e > B_s else ""
-            A_ref_path = os.path.join(work, "ref_A.fa")
-            B_ref_path = os.path.join(work, "ref_B.fa")
-            if A_seq: write_fasta("REF_A", A_seq, A_ref_path)
-            if B_seq: write_fasta("REF_B", B_seq, B_ref_path)
-
-            # target regions around the two anchors
-            up_c, up_s, up_e, _ = r["_up"]
-            down_c, down_s, down_e, _ = r["_down"]
-            tgt1_path = os.path.join(work, "tgt1.fa")
-            tgt2_path = os.path.join(work, "tgt2.fa")
-            tgt1_bp = write_target_region(tgt_fa, up_c, up_s, up_e,
-                                          args.tgt_context, tgt1_path, "TGT1")
-            tgt2_bp = write_target_region(tgt_fa, down_c, down_s, down_e,
-                                          args.tgt_context, tgt2_path, "TGT2")
-
-            A_block = A_ident = 0; B_block = B_ident = 0
-            try:
-                if A_seq and tgt1_bp > 0:
-                    A_block, A_ident = best_forward_block(A_ref_path, tgt1_path,
-                                                          work, args.threads)
-                if B_seq and tgt2_bp > 0:
-                    B_block, B_ident = best_forward_block(B_ref_path, tgt2_path,
-                                                          work, args.threads)
-            except Exception:
-                pass
-
-            A_len = len(A_seq); B_len = len(B_seq)
-            A_frac = A_block / A_len if A_len else 0
-            B_frac = B_block / B_len if B_len else 0
-            A_pass = (A_block >= min_block_bp and A_ident >= args.min_identity)
-            B_pass = (B_block >= min_block_bp and B_ident >= args.min_identity)
+            # the flank must lie on the SAME target strand as its anchor hit;
+            # coverage is a union over the proxy (was: the single largest '+'
+            # block against a fixed 24 kb)
+            ba = [x for x in lr.align(A_seq, t1, work, args.threads) if x["strand"] == up_st]
+            bb = [x for x in lr.align(B_seq, t2, work, args.threads) if x["strand"] == dn_st]
+            shutil.rmtree(work, ignore_errors=True)
+            A_block = lr.strand_cover(ba, up_st, args.min_identity)
+            B_block = lr.strand_cover(bb, dn_st, args.min_identity)
+            A_ident = max((x["ident"] for x in ba), default=0.0)
+            B_ident = max((x["ident"] for x in bb), default=0.0)
+            A_len, B_len = len(A_seq), len(B_seq)
+            A_frac, B_frac = A_block / A_len, B_block / B_len
+            A_pass = A_frac >= args.min_block_cov
+            B_pass = B_frac >= args.min_block_cov
             passes = A_pass and B_pass
+            n_assessed += 1
             if passes: n_pass += 1
             out.write(f"{ref_id}\t{tgt_asm}\t{A_len}\t{B_len}\t"
                       f"{A_block}\t{A_ident:.1f}\t{A_frac:.3f}\t"
                       f"{B_block}\t{B_ident:.1f}\t{B_frac:.3f}\t"
-                      f"{A_pass}\t{B_pass}\t{passes}\n")
-            shutil.rmtree(work, ignore_errors=True)
+                      f"{A_pass}\t{B_pass}\t{passes}\tassessed\n")
 
     for fa in fa_cache.values():
         if fa: fa.close()
     shutil.rmtree(work_root, ignore_errors=True)
-    print(f"\nDONE: {n_pass}/{len(rows)} pass BILATERAL forward-block check "
-          f"(both A and B proxies >= {args.min_block_cov} cov at >= {args.min_identity}% ident)")
+    print(f"\nDONE: {n_pass}/{n_assessed} assessed candidates pass the BILATERAL check "
+          f"(both flanks >= {args.min_block_cov} of the proxy at >= {args.min_identity}% ident, "
+          f"on the anchor's strand); {len(rows) - n_assessed} not assessable")
     print(f"Wrote {out_path}")
 
 
