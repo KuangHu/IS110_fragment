@@ -51,32 +51,18 @@ def _parse_tags(fields: list[str]) -> dict:
 
 
 def _compute_identity(num_matches: int, aln_block_len: int, tags: dict) -> tuple[float, float]:
-    """Compute identity and divergence from tags or columns 10/11.
-
-    Prefers de:f: (per-base divergence) over dv:f: (gap-compressed),
-    falls back to col10/col11.
-    """
-    # With a CIGAR: matches / aligned columns (M, =, X), the definition used by
-    # every detector here (paf_utils.py). The fallbacks below are NOT the same
-    # quantity: de counts each gap as one difference, col10/col11 counts every
-    # gap column (a perfect copy with a 600-bp insert reads 77%).
+    """Identity = '=' / ('=' + 'X') from the CIGAR, the definition used by every
+    detector here (paf_utils.py). An =/X CIGAR is required (minimap2 -c --eqx);
+    the earlier fallbacks (de/dv tags, col10/col11) measured other things."""
+    import re
     cg = tags.get("cg")
-    if isinstance(cg, str) and cg:
-        import re
-        aligned = sum(int(n) for n, op in re.findall(r"(\d+)([MIDNSHP=X])", cg) if op in "M=X")
-        if aligned > 0:
-            identity = min(1.0, num_matches / aligned)
-            return identity, 1.0 - identity
-    if "de" in tags:
-        div = tags["de"]
-    elif "dv" in tags:
-        div = tags["dv"]
-    elif aln_block_len > 0:
-        div = 1.0 - num_matches / aln_block_len
-    else:
-        div = 1.0
-    identity = 1.0 - div
-    return identity, div
+    if not isinstance(cg, str) or not cg or "M" in cg:
+        raise ValueError("PAF row without an =/X CIGAR: run minimap2 with -c --eqx")
+    ops = re.findall(r"(\d+)([MIDNSHP=X])", cg)
+    eq = sum(int(n) for n, op in ops if op == "=")
+    x = sum(int(n) for n, op in ops if op == "X")
+    identity = eq / (eq + x) if eq + x else 0.0
+    return identity, 1.0 - identity
 
 
 def parse_paf(path: str) -> list[PafHit]:

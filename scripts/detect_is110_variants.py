@@ -25,7 +25,7 @@ import sys
 from collections import defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from paf_utils import aligned_identity, aligned_blocks, identity_kind  # noqa: E402
+from paf_utils import aligned_identity, aligned_blocks  # noqa: E402
 
 
 def parse_args():
@@ -69,7 +69,7 @@ def parse_paf(path, min_identity, ins_min=500, del_min=200, counts=None):
     blocks, exactly like two separate rows would. Query bases inside a large
     'I' run are in no block (they are absent from the genome)."""
     blocks = defaultdict(list)
-    total = kept = inexact = 0
+    total = kept = 0
     row_id = 0
     with open(path) as fh:
         for line in fh:
@@ -81,7 +81,6 @@ def parse_paf(path, min_identity, ins_min=500, del_min=200, counts=None):
             if ident < min_identity:
                 continue
             kept += 1
-            inexact += identity_kind(c) != "cigar"
             row_id += 1
             for qs, qe, ts, te in aligned_blocks(c, ins_min, del_min):
                 blocks[(c[0], c[5], c[4])].append({
@@ -90,12 +89,9 @@ def parse_paf(path, min_identity, ins_min=500, del_min=200, counts=None):
                     "ts": ts, "te": te, "ident": ident, "row": row_id,
                 })
     print(f"Parsed {total} alignments, {kept} pass identity >= {min_identity}%")
-    if inexact:
-        print(f"WARNING: {inexact} of them have no CIGAR: identity is approximate and "
-              "indels inside a row cannot be seen (run minimap2 with -c)")
     print(f"Unique queries with hits: {len(set(k[0] for k in blocks))}")
     if counts is not None:
-        counts.update(total=total, kept=kept, inexact=inexact)
+        counts.update(total=total, kept=kept)
     return blocks
 
 

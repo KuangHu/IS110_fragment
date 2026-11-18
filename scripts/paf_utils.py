@@ -10,11 +10,10 @@ Identity
     minimap2 leaves ambiguous bases out of the block length, also those inside
     a gap, so that difference can be smaller than the number of matches.)
 
-    Without a CIGAR the exact value cannot be had. `identity_kind()` says what
-    `aligned_identity()` falls back to:
-        cigar        exact
-        de           1 - de (each gap counts as one difference: slightly lower)
-        col10/col11  gap columns counted as mismatches (much lower with an indel)
+    Every reader REQUIRES a CIGAR with =/X operations (minimap2 -c --eqx):
+    a row without one raises an error. The earlier fallbacks (1 - de, or
+    matches / block) were approximations and are gone -- every minimap2 call
+    in this repository uses --eqx.
 
 Coordinates
     PAF is 0-based half-open. Query coordinates are always on the query's
@@ -37,25 +36,24 @@ def cigar_of(cols):
     return ""
 
 
-def identity_kind(cols):
-    if cigar_of(cols):
-        return "cigar"
-    if any(t.startswith("de:f:") for t in cols[12:]):
-        return "de"
-    return "col10/col11"
+def require_eqx(cols):
+    """The row's CIGAR; raises unless it is an =/X CIGAR."""
+    cg = cigar_of(cols)
+    if not cg or "M" in cg:
+        raise ValueError(f"PAF row without an =/X CIGAR (query {cols[0]}): "
+                         "run minimap2 with -c --eqx")
+    return cg
 
 
 def aligned_identity(cols):
-    """Percent identity over aligned columns (gaps excluded). See module text."""
-    matches, block = int(cols[9]), int(cols[10])
-    cg = cigar_of(cols)
-    if cg:
-        aligned = sum(int(n) for n, op in _CG.findall(cg) if op in "M=X")
-        return min(100.0, 100.0 * matches / aligned) if aligned > 0 else 0.0
-    for t in cols[12:]:
-        if t.startswith("de:f:"):          # gap-compressed divergence
-            return 100.0 * (1.0 - float(t[5:]))
-    return 100.0 * matches / block if block > 0 else 0.0
+    """Percent identity over aligned columns: '=' / ('=' + 'X'). Exact."""
+    eq = x = 0
+    for n, op in _CG.findall(require_eqx(cols)):
+        if op == "=":
+            eq += int(n)
+        elif op == "X":
+            x += int(n)
+    return 100.0 * eq / (eq + x) if eq + x else 0.0
 
 
 def aligned_blocks(cols, min_target_only=None, min_query_only=None):
@@ -68,8 +66,8 @@ def aligned_blocks(cols, min_target_only=None, min_query_only=None):
     limits None, or without a CIGAR, the row is one block.
     The bases of a large 'I' belong to NO block: they are not aligned."""
     qs, qe, strand, ts, te = int(cols[2]), int(cols[3]), cols[4], int(cols[7]), int(cols[8])
-    cg = cigar_of(cols)
-    if not cg or (min_target_only is None and min_query_only is None):
+    cg = require_eqx(cols)
+    if min_target_only is None and min_query_only is None:
         return [(qs, qe, ts, te)]
     plus = strand == "+"
     q = qs if plus else qe          # query position at the target-left end
@@ -102,10 +100,7 @@ def aligned_query_bases(cols):
     """Query bases that are aligned to the target (CIGAR M/=/X). A query span
     qe - qs also contains the 'I' runs, i.e. query sequence that is ABSENT
     from the target. Without a CIGAR the span is returned."""
-    cg = cigar_of(cols)
-    if not cg:
-        return int(cols[3]) - int(cols[2])
-    return sum(int(n) for n, op in _CG.findall(cg) if op in "M=X")
+    return sum(int(n) for n, op in _CG.findall(require_eqx(cols)) if op in "=X")
 
 
 def large_indels(cols, min_len):
@@ -142,17 +137,12 @@ def _main(argv):
     p.add_argument("--query", default=None, help="keep only this query name")
     a = p.parse_args(argv)
     thr = a.min_identity * 100 if a.min_identity <= 1 else a.min_identity
-    inexact = 0
     for line in sys.stdin:
         c = line.rstrip("\n").split("\t")
         if len(c) < 12 or (a.query is not None and c[0] != a.query):
             continue
         if aligned_identity(c) >= thr:
             sys.stdout.write(line)
-            inexact += identity_kind(c) != "cigar"
-    if inexact:
-        sys.stderr.write(f"paf_utils: {inexact} kept rows have no CIGAR; their identity "
-                         "is an approximation (see paf_utils.py)\n")
 
 
 if __name__ == "__main__":

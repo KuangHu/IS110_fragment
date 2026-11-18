@@ -43,6 +43,18 @@ def test_identity():
           pu.aligned_blocks(c, 500, 200) == [(800, 2000, 100, 1300), (0, 800, 1900, 2700)],
           str(pu.aligned_blocks(c, 500, 200)))
 
+def test_eqx_is_required():
+    for cg in ("1000M", None):
+        c = row("q", 1000, 0, 1000, "+", "t", 9000, 0, 1000, cg).split("\t")
+        for fn in (pu.aligned_identity, pu.aligned_query_bases, lambda x: pu.aligned_blocks(x, 500, 200)):
+            try:
+                fn(c); ok = False
+            except ValueError:
+                ok = True
+            check(f"row with CIGAR {cg!r} is refused (no approximate identity)", ok)
+    c = row("q", 1000, 0, 1000, "+", "t", 9000, 0, 1000, "950=50X").split("\t")
+    check("identity is '=' / ('=' + 'X')", abs(pu.aligned_identity(c) - 95.0) < 1e-9)
+
 def test_detector():
     two = [row("q", 2000, 0, 1000, "+", "t", 9000, 0, 1000, "1000="),
            row("q", 2000, 1000, 2000, "+", "t", 9000, 1600, 2600, "1000="),
@@ -209,7 +221,7 @@ def test_minimap2_round_trip():
                     ("two", "insertion"), ("two", "insertion")]
             check(f"minimap2 {preset} round trip: events on the right contigs only", got == want, str(got))
 
-for t in (test_identity, test_detector, test_multisplit, test_lineage, test_ref_core_and_origin, test_stage_lib,
+for t in (test_identity, test_eqx_is_required, test_detector, test_multisplit, test_lineage, test_ref_core_and_origin, test_stage_lib,
           test_minimap2_round_trip):
 
 
