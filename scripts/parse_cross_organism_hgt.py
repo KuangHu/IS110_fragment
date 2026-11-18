@@ -58,7 +58,7 @@ def parse_args():
 def main():
     args = parse_args()
 
-    hits = []
+    all_blocks = []
     for paf in sorted(glob.glob(f"{args.paf_dir}/hits_vs_*.paf")):
         target_sp = os.path.basename(paf).replace("hits_vs_", "").replace(".paf", "")
         with open(paf) as fh:
@@ -81,9 +81,9 @@ def main():
                 ident = matches / block * 100 if block > 0 else 0
                 cov = (qe - qs) / qlen if qlen > 0 else 0
                 if ident < args.min_identity: continue
-                if cov < args.min_cov: continue
-                is_strict = (ident >= args.strict_identity and cov >= args.strict_cov)
-                hits.append({
+                is_strict = False
+                all_blocks.append({
+                    "matches": matches, "block": block,
                     "source_species": source_sp,
                     "ref_id": ref_id,
                     "query_bp": qlen,
@@ -96,6 +96,35 @@ def main():
                     "strict": is_strict,
                     "distance": distance_tier(source_sp, target_sp),
                 })
+
+    # Coverage per (element, target contig, strand) as a UNION of query
+    # intervals: a copy reported as two blocks failed the per-block 0.5 / 0.9
+    # thresholds. (The thresholds above were applied per block; blocks are
+    # re-evaluated here per placement.)
+    by_place = {}
+    for h in all_blocks:
+        by_place.setdefault((h["source_species"], h["ref_id"], h["target_species"],
+                             h["target_assembly"], h["target_contig"], h["strand"]), []).append(h)
+    hits = []
+    for key, bl in sorted(by_place.items()):
+        iv = sorted((b["qs"], b["qe"]) for b in bl)
+        cov_bp, cs, ce = 0, None, None
+        for s0, e0 in iv:
+            if ce is None or s0 > ce:
+                if ce is not None: cov_bp += ce - cs
+                cs, ce = s0, e0
+            else:
+                ce = max(ce, e0)
+        cov_bp += ce - cs
+        cov = cov_bp / bl[0]["query_bp"]
+        ident = sum(b["matches"] for b in bl) / max(1, sum(b["block"] for b in bl)) * 100
+        if cov < args.min_cov:
+            continue
+        h = dict(max(bl, key=lambda b: b["qe"] - b["qs"]))
+        h.update(qs=iv[0][0], qe=max(e0 for _, e0 in iv), ts=min(b["ts"] for b in bl),
+                 te=max(b["te"] for b in bl), cov=cov, identity=ident,
+                 strict=(ident >= args.strict_identity and cov >= args.strict_cov))
+        hits.append(h)
 
     # Write catalogue
     with open(args.out, "w") as fo:
@@ -110,7 +139,19 @@ def main():
                 f"{h['cov']:.3f}", f"{h['identity']:.1f}",
                 str(h["strict"]), h["distance"],
             ]) + "\n")
-    print(f"Total cross-species hits (id>={args.min_identity}%, cov>={args.min_cov}): {len(hits)}")
+    print(f"Total cross-species PLACEMENTS (id>={args.min_identity}%, cov>={args.min_cov}): {len(hits)}")
+    # A placement is one copy in one target genome. One element present in
+    # 1,000 genomes of another species is 1,000 rows -- and its GCA/GCF twins
+    # again. The numbers that describe transfer are distinct elements and
+    # distinct target genomes:
+    def _core(a):
+        return a[4:] if a[:4] in ("GCA_", "GCF_") else a
+    for label, sel in (("all", hits), ("strict", [h for h in hits if h["strict"]])):
+        print(f"  {label}: {len({(h['source_species'], h['ref_id']) for h in sel})} distinct "
+              f"query elements in {len({_core(h['target_assembly']) for h in sel})} distinct "
+              f"target genomes ({len(sel)} placements)")
+    print("  NOTE: no contamination / shared-plasmid filter is applied; a hit on a short "
+          "target contig is not evidence of transfer by itself.")
     print(f"Wrote {args.out}")
 
     # Summarise by distance tier
@@ -118,7 +159,7 @@ def main():
     dist_all = Counter(h["distance"] for h in hits)
     dist_strict = Counter(h["distance"] for h in hits if h["strict"])
     print(f"\nBy distance tier:")
-    for tier in ["same_family", "same_class", "same_phylum", "different_phylum"]:
+    for tier in ["same_family", "same_class", "same_phylum", "different_phylum", "unknown"]:
         print(f"  {tier:<20}: all={dist_all.get(tier, 0):>6}  strict={dist_strict.get(tier, 0):>5}")
 
     # Cross-species pair matrix

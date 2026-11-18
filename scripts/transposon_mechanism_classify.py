@@ -84,22 +84,38 @@ def write_fasta(label, seq, path):
             fh.write(seq[i:i+80] + "\n")
 
 
-def best_forward_block(ref_path, query_path, work, threads):
+def flank_landing(tgt_path, query_path, work, threads, prox_end, min_ident=90.0,
+                  min_frac=0.5):
+    """Where does a reference flank land in the target assembly?
+
+    Returns (contig, strand, pos) or None. `pos` is where the flank's
+    ELEMENT-PROXIMAL end (prox_end = 'end' for the left flank A, 'start' for
+    the right flank B) projects onto the target. Only a block at >= min_ident
+    covering >= min_frac of the flank counts, on either strand. (It used to be
+    the longest '+' block of any quality: a partial or repeat hit gave a
+    meaningless distance, and a target contig stored in the other orientation
+    was 'ORIGIN_DIVERGED'.)"""
     paf = os.path.join(work, "_aln.paf")
     subprocess.run(["minimap2", "-x", "asm10", "-c", "--eqx",
-                    "-t", str(threads), ref_path, query_path, "-o", paf],
+                    "-t", str(threads), tgt_path, query_path, "-o", paf],
                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     best = None
     with open(paf) as fh:
         for line in fh:
             c = line.split("\t")
             if len(c) < 12: continue
-            if c[4] != "+": continue
-            matches, block_len = int(c[9]), int(c[10])
-            if best is None or block_len > best[3]:
-                ident = matches / block_len * 100 if block_len > 0 else 0
-                best = (c[5], int(c[7]), int(c[8]), block_len, ident)
-    return best
+            qlen, qs, qe = int(c[1]), int(c[2]), int(c[3])
+            ident = int(c[9]) / int(c[10]) * 100 if int(c[10]) else 0
+            if ident < min_ident or (qe - qs) < min_frac * qlen:
+                continue
+            ts, te, strand = int(c[7]), int(c[8]), c[4]
+            if prox_end == "end":
+                pos = te + (qlen - qe) if strand == "+" else ts - (qlen - qe)
+            else:
+                pos = ts - qs if strand == "+" else te + qs
+            if best is None or (qe - qs) > best[3]:
+                best = (c[5], strand, pos, qe - qs)
+    return best[:3] if best else None
 
 
 def main():
@@ -132,13 +148,13 @@ def main():
             clen = ref_fa.get_reference_length(contig)
         except (KeyError, ValueError):
             flank_cache[key] = None; continue
-        lf_s = max(0, is_a[0] - args.flank); lf_e = is_a[0]
+        lf_s = max(0, is_a[0] - 1 - args.flank); lf_e = is_a[0] - 1   # 1-based start
         rf_s = is_b[1]; rf_e = min(clen, is_b[1] + args.flank)
         A = ref_fa.fetch(contig, lf_s, lf_e) if lf_e > lf_s else ""
         B = ref_fa.fetch(contig, rf_s, rf_e) if rf_e > rf_s else ""
         expected_with_DNA = (is_b[0] - is_a[1])  # = |IS_a|+|DNA|+|IS_b|, but is_a[1] is IS_a end, is_b[0] is IS_b start
         # actually we want full IS_a-DNA-IS_b length = is_b[1] - is_a[0]
-        expected_with_DNA = is_b[1] - is_a[0]
+        expected_with_DNA = is_b[1] - is_a[0] + 1
         flank_cache[key] = {"A_seq": A, "B_seq": B,
                             "is_a": is_a, "is_b": is_b,
                             "expected_with_DNA": expected_with_DNA}
@@ -156,39 +172,46 @@ def main():
                 print(f"  {i}/{len(moved_rows)}", flush=True)
             key = (r['ref_contig'], int(r['ref_is_a_start']), int(r['ref_is_b_start']))
             fc = flank_cache.get(key)
-            if fc is None:
-                n["FAILED"] += 1; continue
-            tgt_path = find_assembly_fa(args.src_dir, r['tgt_asm'], work_root)
-            if not tgt_path:
-                n["FAILED"] += 1; continue
-            work = tempfile.mkdtemp(prefix=f"m{i}_", dir=work_root)
-            A_path = os.path.join(work, "A.fa")
-            B_path = os.path.join(work, "B.fa")
-            write_fasta("A", fc["A_seq"], A_path)
-            write_fasta("B", fc["B_seq"], B_path)
-            try:
-                A_blk = best_forward_block(tgt_path, A_path, work, args.threads)
-                B_blk = best_forward_block(tgt_path, B_path, work, args.threads)
-            except Exception:
-                n["FAILED"] += 1
-                shutil.rmtree(work, ignore_errors=True); continue
-            if A_blk is None or B_blk is None:
-                mechanism = "ORIGIN_DIVERGED"
-                Apos = Bpos = "NA"; dist = -1
-            elif A_blk[0] != B_blk[0]:
-                mechanism = "ORIGIN_DIVERGED"
-                Apos = f"{A_blk[0]}:{A_blk[2]}"; Bpos = f"{B_blk[0]}:{B_blk[1]}"; dist = -1
+            Apos = Bpos = "NA"; dist = "NA"
+            tgt_path = find_assembly_fa(args.src_dir, r['tgt_asm'], work_root) if fc else None
+            # rows that cannot be classified are WRITTEN (they used to be
+            # counted and dropped from the table)
+            if fc is None or min(len(fc["A_seq"]), len(fc["B_seq"])) < 1000:
+                mechanism = "FAILED_NO_REF_FLANK"
+            elif not tgt_path:
+                mechanism = "FAILED_NO_TARGET_FASTA"
             else:
-                # both on same tgt contig
-                Apos = f"{A_blk[0]}:{A_blk[2]}"
-                Bpos = f"{B_blk[0]}:{B_blk[1]}"
-                dist = abs(B_blk[1] - A_blk[2])
-                if abs(dist - fc["expected_with_DNA"]) <= args.copy_paste_margin:
-                    mechanism = "COPY_PASTE"
-                elif dist <= args.cut_paste_max:
-                    mechanism = "CUT_PASTE"
+                work = tempfile.mkdtemp(prefix=f"m{i}_", dir=work_root)
+                A_path = os.path.join(work, "A.fa")
+                B_path = os.path.join(work, "B.fa")
+                write_fasta("A", fc["A_seq"], A_path)
+                write_fasta("B", fc["B_seq"], B_path)
+                # (no try/except: a tool failure is not a class of result)
+                A_l = flank_landing(tgt_path, A_path, work, args.threads, "end")
+                B_l = flank_landing(tgt_path, B_path, work, args.threads, "start")
+                shutil.rmtree(work, ignore_errors=True)
+                if A_l: Apos = f"{A_l[0]}:{A_l[2]}({A_l[1]})"
+                if B_l: Bpos = f"{B_l[0]}:{B_l[2]}({B_l[1]})"
+                if A_l is None or B_l is None:
+                    mechanism = "ORIGIN_NOT_FOUND"          # a flank is absent/diverged
+                elif A_l[0] != B_l[0]:
+                    mechanism = "ORIGIN_ON_TWO_CONTIGS"     # assembly break or rearrangement
+                elif A_l[1] != B_l[1]:
+                    mechanism = "ORIGIN_REARRANGED"
                 else:
-                    mechanism = "AMBIGUOUS"
+                    # SIGNED distance from the end of A to the start of B along
+                    # the flank orientation; abs() hid B landing upstream of A
+                    dist = (B_l[2] - A_l[2]) if A_l[1] == "+" else (A_l[2] - B_l[2])
+                    if dist < -500:
+                        mechanism = "ORIGIN_REARRANGED"
+                    elif abs(dist - fc["expected_with_DNA"]) <= args.copy_paste_margin:
+                        mechanism = "COPY_PASTE"            # origin still occupied
+                    elif dist <= 500:
+                        mechanism = "CUT_PASTE"             # clean empty site
+                    elif dist <= args.cut_paste_max:
+                        mechanism = "CUT_PASTE_IS_LEFT"     # one IS copy remains at the origin
+                    else:
+                        mechanism = "AMBIGUOUS"
             n[mechanism] = n.get(mechanism, 0) + 1
             out.write(f"{r['ref_asm']}\t{r['ref_contig']}\t{r['ref_is_a_start']}\t"
                       f"{r['ref_is_b_start']}\t{r['segment_bp']}\t"
@@ -196,7 +219,6 @@ def main():
                       f"{r['tgt_contig']}\t{r['tgt_pos']}\t"
                       f"{Apos}\t{Bpos}\t{dist}\t{fc['expected_with_DNA']}\t"
                       f"{mechanism}\n")
-            shutil.rmtree(work, ignore_errors=True)
 
     ref_fa.close()
     shutil.rmtree(work_root, ignore_errors=True)

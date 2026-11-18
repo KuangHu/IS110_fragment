@@ -17,9 +17,12 @@ For each assembly:
 Reads sequences directly from the species DB (one indexed FASTA), so no need
 to load 22,886 per-assembly FASTAs.
 """
-import argparse, csv, os, re, shutil, subprocess, tempfile
+import argparse, csv, os, re, shutil, subprocess, tempfile, sys
 from collections import defaultdict
 import pysam
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from lib_alleles import assembly_core, _asm_rank  # noqa: E402
 
 
 def parse_args():
@@ -110,13 +113,24 @@ def main():
     n_pass = 0
     n_size_fail = 0
     n_align_fail = 0
+    n_nofetch = 0
+    arrays = []
     require_same_strand = args.require_same_strand and not args.allow_any_strand
 
     with open(out_path, "w") as out:
         out.write("assembly\tcontig\tIS1_start\tIS1_end\tIS2_start\tIS2_end\t"
                   "IS3_start\tIS3_end\tstrand\tDNA1_bp\tDNA2_bp\t"
                   "fwd_block_bp\tidentity\tcov\tpasses\n")
-        for ai, (asm, contigs) in enumerate(is_hits.items()):
+        # one of each GCA/GCF pair
+        best_twin = {}
+        for asm in is_hits:
+            c = assembly_core(asm)
+            if c not in best_twin or _asm_rank(asm) > _asm_rank(best_twin[c]):
+                best_twin[c] = asm
+        keep_asm = set(best_twin.values())
+        for ai, (asm, contigs) in enumerate(sorted(is_hits.items())):
+            if asm not in keep_asm:
+                continue
             if ai % 1000 == 0:
                 print(f"  asm {ai}/{len(is_hits)}  triplets={n_triplets}  pass={n_pass}",
                       flush=True)
@@ -130,8 +144,10 @@ def main():
                     if require_same_strand:
                         if not (is1[2] == is2[2] == is3[2]):
                             continue
-                    dna1_s, dna1_e = is1[1], is2[0]
-                    dna2_s, dna2_e = is2[1], is3[0]
+                    # tnp coordinates are 1-based inclusive: the bases strictly
+                    # between two IS are [end, next_start - 1) 0-based
+                    dna1_s, dna1_e = is1[1], is2[0] - 1
+                    dna2_s, dna2_e = is2[1], is3[0] - 1
                     dna1_len = dna1_e - dna1_s
                     dna2_len = dna2_e - dna2_s
                     if dna1_len < args.min_dna_bp or dna1_len > args.max_dna_bp:
@@ -149,23 +165,34 @@ def main():
                         dna1 = db.fetch(db_key_full, dna1_s, dna1_e)
                         dna2 = db.fetch(db_key_full, dna2_s, dna2_e)
                     except (KeyError, ValueError):
+                        n_nofetch += 1
                         continue
                     if not dna1 or not dna2:
+                        n_nofetch += 1
                         continue
                     work = tempfile.mkdtemp(prefix=f"t{n_triplets}_", dir=work_root)
                     d1p = os.path.join(work, "d1.fa")
                     d2p = os.path.join(work, "d2.fa")
                     write_fasta("DNA1", dna1, d1p)
                     write_fasta("DNA2", dna2, d2p)
-                    try:
-                        bp, id_ = align_dna1_vs_dna2(d1p, d2p, work, args.threads)
-                    except Exception:
-                        bp, id_ = 0, 0.0
+                    # a minimap2 failure raises (it was scored as "no alignment")
+                    bp, id_ = align_dna1_vs_dna2(d1p, d2p, work, args.threads)
                     shutil.rmtree(work, ignore_errors=True)
                     cov = bp / min(dna1_len, dna2_len) if min(dna1_len, dna2_len) else 0
                     passes = cov >= args.min_cov and id_ >= args.min_identity
                     if passes:
                         n_pass += 1
+                        # consecutive passing triplets on one contig are ONE
+                        # array: IS-S-IS-S-IS-S-IS gave two "duplications"
+                        k = (asm, contig_local)
+                        if arrays and arrays[-1]["key"] == k and arrays[-1]["last_i"] == i - 1:
+                            arrays[-1]["last_i"] = i
+                            arrays[-1]["n_copies"] += 1
+                            arrays[-1]["end"] = is3[1]
+                        else:
+                            arrays.append({"key": k, "last_i": i, "n_copies": 2,
+                                           "start": is1[0], "end": is3[1],
+                                           "unit_bp": dna1_len})
                     else:
                         n_align_fail += 1
                     out.write(f"{asm}\t{contig_local}\t{is1[0]}\t{is1[1]}\t"
@@ -178,7 +205,17 @@ def main():
     print(f"  total triplets evaluated:  {n_triplets}")
     print(f"  size-tol failures:         {n_size_fail}")
     print(f"  alignment failures:        {n_align_fail}")
-    print(f"  PASS (tandem duplication): {n_pass}")
+    print(f"  not similar enough:        (counted above as 'alignment failures')")
+    print(f"  sequence not in DB:        {n_nofetch}")
+    print(f"  PASS triplets:             {n_pass}")
+    arr_path = os.path.join(args.out, "tandem_self_arrays.tsv")
+    with open(arr_path, "w") as fh:
+        fh.write("assembly\tcontig\tarray_start\tarray_end\tn_copies\tunit_dna_bp\n")
+        for a in arrays:
+            fh.write(f"{a['key'][0]}\t{a['key'][1]}\t{a['start']}\t{a['end']}\t"
+                     f"{a['n_copies']}\t{a['unit_bp']}\n")
+    print(f"  tandem duplication EVENTS: {len(arrays)}  (one per array; a k-copy array "
+          f"is k-1 passing triplets)  -> {arr_path}")
     print(f"Wrote {out_path}")
 
 
