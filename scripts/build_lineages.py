@@ -67,7 +67,7 @@ def write_fa(path, seqs):
                 f.write(seq[i:i+80] + "\n")
 
 
-def cluster_variants(seqs, identity, work_dir):
+def cluster_variants(seqs, identity, work_dir, min_step_bp=0):
     """cd-hit-est; return mapping seq_id -> cluster_rep_id."""
     if len(seqs) <= 1:
         return {sid: sid for sid, _ in seqs}
@@ -87,21 +87,33 @@ def cluster_variants(seqs, identity, work_dir):
     if r.returncode != 0:
         # was: silently "no clustering", which changes every count downstream
         raise RuntimeError(f"cd-hit-est failed: {r.stderr.strip()[:500]}")
-    mapping = {}
-    rep = None
+    # Read whole clusters first: the starred representative is not always
+    # the first line, and members listed before it used to be left unmapped.
+    clusters, cur = [], None
     with open(out_fa + ".clstr") as f:
         for line in f:
             if line.startswith(">Cluster"):
-                rep = None
+                cur = {"rep": None, "members": []}
+                clusters.append(cur)
                 continue
             parts = line.split(">")
-            if len(parts) < 2: continue
+            if len(parts) < 2 or cur is None: continue
             sid = parts[1].split("...")[0].strip()
-            if "*" in line:
-                rep = sid
+            cur["members"].append(sid)
+            if line.rstrip().endswith("*"):
+                cur["rep"] = sid
+    lens = {sid: len(sq) for sid, sq in seqs}
+    mapping = {}
+    for c in clusters:
+        rep_id = c["rep"] or c["members"][0]
+        for sid in c["members"]:
+            # a member that differs from the representative by a whole step
+            # (>= min_step_bp) is its own variant even at 99% identity:
+            # 30,000 bp vs 30,250 bp is a 250-bp step, not a SNP variant
+            if min_step_bp and abs(lens[sid] - lens[rep_id]) >= min_step_bp:
                 mapping[sid] = sid
-            elif rep:
-                mapping[sid] = rep
+            else:
+                mapping[sid] = rep_id
     return mapping
 
 
@@ -127,21 +139,29 @@ def pairwise_minimap2(seqs, work_dir, threads):
                    check=True, capture_output=True)
     seq_lens = {sid: len(s) for sid, s in seqs}
     ivs = defaultdict(list)
-    matches_bp = defaultdict(int)
-    block_bp = defaultdict(int)
     with open(paf) as f:
         for line in f:
             c = line.split("\t")
             if len(c) < 12: continue
             q, t = c[0], c[5]
             if q == t: continue
-            ivs[(q, t)].append((int(c[2]), int(c[3])))
-            matches_bp[(q, t)] += int(c[9])
-            block_bp[(q, t)] += int(c[10])
+            if c[4] != "+":
+                continue           # containment is same-strand
+            ivs[(q, t)].append((int(c[2]), int(c[3]), int(c[7]), int(c[8]),
+                                int(c[9]), int(c[10])))
     out = {}
     for (q, t), iv in ivs.items():
+        # Containment needs ONE consistent path: blocks in the same order in
+        # both sequences, no stretch of t used twice. Coverage alone said
+        # X+Y is "contained" in Y+X, and X+X in a sequence with one X.
+        kept = []
+        for b in sorted(iv, key=lambda b: -(b[1] - b[0])):
+            if all(((b[0] < k[0]) == (b[2] < k[2]))
+                   and min(b[3], k[3]) - max(b[2], k[2]) <= 50
+                   and min(b[1], k[1]) - max(b[0], k[0]) <= 50 for k in kept):
+                kept.append(b)
         covered, cur_s, cur_e = 0, None, None
-        for s0, e0 in sorted(iv):
+        for s0, e0 in sorted((b[0], b[1]) for b in kept):
             if cur_e is None or s0 > cur_e:
                 if cur_e is not None:
                     covered += cur_e - cur_s
@@ -150,8 +170,11 @@ def pairwise_minimap2(seqs, work_dir, threads):
                 cur_e = max(cur_e, e0)
         covered += cur_e - cur_s
         out[(q, t)] = {"cov_of_q": covered / max(1, seq_lens.get(q, 1)) * 100,
-                       "ident": matches_bp[(q, t)] / max(1, block_bp[(q, t)]) * 100}
+                       "ident": sum(b[4] for b in kept) / max(1, sum(b[5] for b in kept)) * 100}
     return out
+
+
+MAX_CHAINS = 500
 
 
 def build_chains(variant_list, pair_metrics, step_identity, step_coverage):
@@ -188,7 +211,10 @@ def build_chains(variant_list, pair_metrics, step_identity, step_coverage):
                     new.append(list(branch))
         if not seen:
             new.append([i])   # not a child of anything seen so far
-        chains.extend(new)
+        # Branching can double the number of chains at every layer (4,096
+        # chains for 24 variants; memory error at 40). Past MAX_CHAINS no new
+        # branches are opened: existing chains still grow.
+        chains.extend(new[:max(0, MAX_CHAINS - len(chains))] if seen else new)
     # drop chains that are a prefix of another (left behind by branching)
     uniq = []
     for c in sorted(set(map(tuple, chains)), key=lambda c: (-len(c), c)):
@@ -304,7 +330,8 @@ def main():
             seqs = [(v["vid"], v["seq"]) for v in variants_raw.values()
                     if v["seq"] and v["vid"] != "V_REF"]
             if seqs:
-                mapping = cluster_variants(seqs, args.cluster_id, work_dir)
+                mapping = cluster_variants(seqs, args.cluster_id, work_dir,
+                                           min_step_bp=args.min_step_bp)
                 aggregated = {}
                 for vid, v in variants_raw.items():
                     if vid == "V_REF" or not v["seq"]:
@@ -353,9 +380,11 @@ def main():
         if args.min_step_bp > 0 and len(variants_sorted) > 1:
             buckets = []
             for v in variants_sorted:
+                # similar to EVERY member (complete linkage): similarity to
+                # the first member alone chained B and C together through A
                 home = next((bk for bk in reversed(buckets)
                              if v["len"] - bk[0]["len"] < args.min_step_bp
-                             and same_seq(bk[0], v)), None)
+                             and all(same_seq(m, v) for m in bk)), None)
                 if home is not None:
                     home.append(v)
                 else:
@@ -433,6 +462,7 @@ def main():
             "v1_id": v1_id,
             "v_ref_length": v1_len,
             "n_lineages": len(lineages),
+            "chains_truncated": len(chains) >= MAX_CHAINS,
             "direction": "unpolarized",
             "direction_note": "steps are ordered by length and nested by "
                               "containment; this is not a time order",

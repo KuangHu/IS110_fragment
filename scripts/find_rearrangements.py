@@ -20,7 +20,7 @@ import sys
 from collections import defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from lib_alleles import representative_asm, split_target  # noqa: E402
+from lib_alleles import assembly_core, _asm_rank, split_target  # noqa: E402
 
 
 ANCHOR_RE = re.compile(r"^(.+)__(up|down)(\d+)$")
@@ -35,6 +35,10 @@ def parse_args():
     p.add_argument("--anchor-D", type=int, default=1000,
                    help="Use this anchor distance for classification (default 1000)")
     p.add_argument("--max-examples", type=int, default=50)
+    p.add_argument("--max-normal-gap", type=int, default=200000,
+                   help="up and down anchors on the same strand, in order and at "
+                        "most this far apart count as an intact ('normal') locus "
+                        "(default 200000)")
     p.add_argument("--fai", default="",
                    help="Optional .fai of the species DB — enables anchor-depth + "
                         "target-contig-length annotation for translocation candidates "
@@ -100,10 +104,20 @@ def main():
         asms_per_ref[ref_id].add(assembly)
     n_twin = 0
     for ref_id, asms in asms_per_ref.items():
-        keep = set(representative_asm(asms).values())
-        for a in asms - keep:
-            del obs[(ref_id, a)]
-            n_twin += 1
+        # one twin per assembly core -- preferring one that has BOTH anchors.
+        # Choosing the preferred twin first and checking afterwards dropped
+        # the event when the preferred copy lacked one anchor (as
+        # place_per_assembly learned earlier).
+        by_core = defaultdict(list)
+        for a in asms:
+            by_core[assembly_core(a)].append(a)
+        for twins in by_core.values():
+            usable = lambda a: bool(obs[(ref_id, a)]["up"]) and bool(obs[(ref_id, a)]["down"])  # noqa: E731
+            keep = max(sorted(twins), key=lambda a: (usable(a), _asm_rank(a)))
+            for a in twins:
+                if a != keep:
+                    del obs[(ref_id, a)]
+                    n_twin += 1
     print(f"Dropped {n_twin:,} duplicate GCA/GCF (ref, assembly) pairs", file=sys.stderr)
     print(f"Unique (ref, target_assembly) pairs: {len(obs):,}", file=sys.stderr)
 
@@ -133,12 +147,18 @@ def main():
                 # One hit per physical placement. Keying on the exact (ts, te)
                 # left a clipped and a full-length alignment of the SAME
                 # placement as two hits -> counted as a duplication.
-                best = {}
-                for h in hs:
-                    key = (h["strand"], h["p0"])
-                    if key not in best or (h["alen"], h["ident"]) > (best[key]["alen"], best[key]["ident"]):
-                        best[key] = h
-                sides[side][contig] = [best[k] for k in sorted(best)]
+                # (projected starts within 20 bp are the same placement: an
+                # indel inside the alignment shifts the projection by its size)
+                uniq = []
+                for h in sorted(hs, key=lambda h: (h["strand"], h["p0"], -h["alen"])):
+                    last = uniq[-1] if uniq else None
+                    if last and last["strand"] == h["strand"] and h["p0"] - last["p0"] <= 20:
+                        if (h["alen"], h["ident"]) > (last["alen"], last["ident"]):
+                            h = dict(h, p0=last["p0"])
+                            uniq[-1] = h
+                        continue
+                    uniq.append(h)
+                sides[side][contig] = uniq
         up_hits = sides["up"]
         down_hits = sides["down"]
         if not up_hits or not down_hits:
@@ -148,11 +168,18 @@ def main():
         has_inversion = False
         has_translocation = False
 
-        for contig in set(up_hits.keys()) & set(down_hits.keys()):
+        for contig in sorted(set(up_hits.keys()) & set(down_hits.keys())):
             for u in up_hits[contig]:
                 for d in down_hits[contig]:
                     if u["strand"] == d["strand"]:
-                        has_normal = True
+                        # "normal" = a plausible intact locus: same strand, in
+                        # the right order, within reach. Any same-strand pair
+                        # anywhere on the contig used to count, and one such
+                        # distant repeat hid a real inversion (has_normal).
+                        fwd = u["strand"] == "+"
+                        gap = (d["ts"] - u["te"]) if fwd else (u["ts"] - d["te"])
+                        if -1000 <= gap <= args.max_normal_gap:
+                            has_normal = True
                     else:
                         has_inversion = True
 
@@ -174,7 +201,8 @@ def main():
             # between the two anchor positions. Keep the LARGEST estimate per event.
             best_span = 0
             best_pair = None
-            for contig in set(up_hits.keys()) & set(down_hits.keys()):
+            # sorted + strict '>' : the chosen pair must not depend on set order
+            for contig in sorted(set(up_hits.keys()) & set(down_hits.keys())):
                 for u in up_hits[contig]:
                     for d in down_hits[contig]:
                         if u["strand"] == d["strand"]:
@@ -206,8 +234,8 @@ def main():
                         return contig_lens[hs["tname"]]
                 full = f"{assembly}|{contig}"
                 return contig_lens.get(full) or contig_lens.get(contig) or 0
-            for u_contig, u_hits in up_hits.items():
-                for d_contig, d_hits in down_hits.items():
+            for u_contig, u_hits in sorted(up_hits.items()):
+                for d_contig, d_hits in sorted(down_hits.items()):
                     if u_contig == d_contig:
                         continue   # same-contig: not a translocation signature
                     u_len = _len(u_contig)
@@ -240,7 +268,7 @@ def main():
             best_side = None
             best_contig = None
             for side, hits in (("up", up_hits), ("down", down_hits)):
-                for contig, hs in hits.items():
+                for contig, hs in sorted(hits.items()):
                     if len(hs) < 2:
                         continue
                     # pairwise distances between same-strand hits

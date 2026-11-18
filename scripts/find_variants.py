@@ -87,6 +87,74 @@ def union_len(intervals):
     return total
 
 
+_CG = re.compile(r"(\d+)([=XID])")
+
+
+def split_at_indels(qlen, qs, qe, strand, ts, te, cigar, min_gap=10):
+    """One PAF alignment -> gap-free(ish) blocks, split at every insertion or
+    deletion of >= min_gap bp.
+
+    A block's [v1_start, v1_end) then really is V1 sequence present in the
+    variant. Using the alignment's outer span counted a 300-bp deletion inside
+    the transposase as covered (CDS 'coverage' 100%, V0 check passed), and a
+    variant = V1 + a 300-bp insert came back as ONE block, so the insertion
+    was never seen.
+    Coordinates: v1 = target, between = query, both 0-based half-open on
+    their own forward strands; `strand` is the query's strand vs V1."""
+    out = []
+    if not cigar:
+        return [{"v1_start": ts, "v1_end": te, "between_start": qs, "between_end": qe,
+                 "strand": strand, "ident": 0.0, "block_len": qe - qs}]
+    t = ts
+    q = qs if strand == "+" else qe          # '-' : query consumed from its end
+    cur = None
+
+    def close():
+        if cur and cur["n"] > 0:
+            b0, b1 = sorted((cur["q0"], cur["q1"]))
+            out.append({"v1_start": cur["t0"], "v1_end": cur["t1"],
+                        "between_start": b0, "between_end": b1, "strand": strand,
+                        "ident": cur["m"] / cur["n"] * 100, "block_len": b1 - b0})
+
+    for n, op in ((int(n), op) for n, op in _CG.findall(cigar)):
+        if op in "=X" or n < min_gap:
+            if cur is None:
+                cur = {"t0": t, "t1": t, "q0": q, "q1": q, "m": 0, "n": 0}
+            cur["n"] += n
+            if op == "=":
+                cur["m"] += n
+        else:
+            close(); cur = None
+        if op in "=XD":
+            t += n
+        if op in "=XI":
+            q += n if strand == "+" else -n
+        if cur is not None:
+            cur["t1"], cur["q1"] = t, q
+    close()
+    return out
+
+
+def collinear_plus_cover(blocks):
+    """bp of V1 covered by '+' blocks that are in the same ORDER in the
+    variant as in V1 (largest first, each kept only if consistent with those
+    already kept). 'Clonal' needs this: an inverted or rotated copy has the
+    same sequence content and used to be called clonal_V1."""
+    kept = []
+    for b in sorted((b for b in blocks if b["strand"] == "+"),
+                    key=lambda b: -(b["v1_end"] - b["v1_start"])):
+        ok = True
+        for k in kept:
+            before_v1 = b["v1_start"] < k["v1_start"]
+            before_bt = b["between_start"] < k["between_start"]
+            if before_v1 != before_bt:
+                ok = False
+                break
+        if ok:
+            kept.append(b)
+    return union_len([(b["v1_start"], b["v1_end"]) for b in kept]), kept
+
+
 def align_to_own_v1(job):
     """minimap2 of one V1's between-anchor sequences against THAT V1 only.
 
@@ -113,15 +181,12 @@ def align_to_own_v1(job):
             c = line.split("\t")
             if len(c) < 12:
                 continue
-            matches, block = int(c[9]), int(c[10])
-            ident = matches / block * 100 if block > 0 else 0
-            if ident < 95:
-                continue
-            qs, qe = int(c[2]), int(c[3])
-            out[c[0]].append({
-                "v1_id": rid, "v1_start": int(c[7]), "v1_end": int(c[8]),
-                "between_start": qs, "between_end": qe,
-                "strand": c[4], "ident": ident, "block_len": qe - qs})
+            cg = next((x[5:] for x in c[12:] if x.startswith("cg:Z:")), "")
+            for blk in split_at_indels(int(c[1]), int(c[2]), int(c[3]), c[4],
+                                       int(c[7]), int(c[8]), cg):
+                if blk["ident"] >= 95:
+                    blk["v1_id"] = rid
+                    out[c[0]].append(blk)
         return rid, dict(out)
     finally:
         shutil.rmtree(d, ignore_errors=True)
@@ -200,6 +265,7 @@ def main():
         # (Cross_reference_IS Stage 6) uses "ref_id". Accept either.
         rid = r.get("is110_id") or r.get("ref_id")
         if not rid:
+            n_skip["record without an id"] += 1
             continue
         # Layout compatibility:
         #   records_final: source.{upstream_flank, downstream_flank, is_element}
@@ -245,7 +311,8 @@ def main():
     # the new anchors were paired from the old alignments.
     with open(anchor_fa, "rb") as fh:
         paf_key = (f"{hashlib.md5(fh.read()).hexdigest()} {os.path.abspath(args.db)} "
-                   f"{os.path.getsize(args.db)} N={args.max_secondary}")
+                   f"{os.path.getsize(args.db)} {os.path.getmtime(args.db)} "
+                   f"N={args.max_secondary}")
     key_file = anchor_paf + ".key"
     cached = (os.path.exists(anchor_paf) and os.path.getsize(anchor_paf) > 0
               and os.path.exists(key_file) and open(key_file).read().strip() == paf_key)
@@ -266,12 +333,21 @@ def main():
     print(f"Parsing anchor hits ...", file=sys.stderr, flush=True)
     # anchor_id -> [(target, target_start, target_end, strand, ident, cov)]
     anchor_hits = defaultdict(lambda: defaultdict(list))  # qname -> tname -> [Hit]
+    paf_rows = defaultdict(int)
     with open(anchor_paf) as f:
         for line in f:
             h = parse_paf_line(line)
             if h is None: continue
+            paf_rows[h.qname] += 1
             if h.ident < args.anchor_identity or h.cov < args.anchor_cov: continue
             anchor_hits[h.qname][h.tname].append(h)
+
+    n_capped = sum(1 for n in paf_rows.values() if n > args.max_secondary)
+    if n_capped:
+        print(f"  WARNING: {n_capped:,} of {len(paf_rows):,} anchors reached "
+              f"--max-secondary {args.max_secondary}: the genomes seen are the best "
+              f"{args.max_secondary + 1} hits, NOT a census. Counts per category are "
+              f"a sample for those sites.", file=sys.stderr)
 
     # === Step 4: one scored anchor placement per distinct assembly ===
     # Every up x down combination used to become an observation, so a genome
@@ -388,7 +464,10 @@ def main():
             # bp of V1 covered, as a UNION on V1 coordinates. Summing block
             # lengths counted overlapping alignments twice and a variant with
             # two copies of the element as 200% of V1.
-            total_matched = union_len([(b["v1_start"], b["v1_end"]) for b in blocks])
+            any_cov = union_len([(b["v1_start"], b["v1_end"]) for b in blocks])
+            # ... and only blocks on the SAME strand and in the same order as V1
+            total_matched, chain = collinear_plus_cover(blocks)
+            rearranged = (any_cov / v1_len >= 0.95 > total_matched / v1_len) if v1_len else False
 
             v1_cov_frac = total_matched / v1_len if v1_len > 0 else 0
             min_cov_frac = args.min_v1_coverage / 100.0
@@ -414,11 +493,14 @@ def main():
                     decomp = None
             if between_len < 100:
                 category = "empty"
-            elif (between_len < v1_len - args.min_deletion_shortening
+            elif (between_len <= v1_len - args.min_deletion_shortening
                   and total_matched >= args.min_deletion_match):
                 category = "deletion"
             elif v1_cov_frac >= 0.95 and between_len < v1_len + args.min_extra_bp:
                 category = "clonal_V1"
+            elif rearranged and between_len < v1_len + args.min_extra_bp:
+                # all of V1 is there, but inverted or in another order
+                category = "rearranged"
             elif (len(blocks) >= args.min_similarity_blocks
                   and v1_cov_frac >= min_cov_frac
                   and between_len >= v1_len + args.min_extra_bp):
@@ -452,8 +534,10 @@ def main():
                     "v1_len": v1_len,
                     "n_match_blocks": len(blocks),
                     "total_matched_bp": total_matched,
+                    "any_strand_matched_bp": any_cov,
                     "blocks": [{"v1_pos": [b["v1_start"], b["v1_end"]],
                                 "between_pos": [b["between_start"], b["between_end"]],
+                                "strand": b["strand"],
                                 "ident": round(b["ident"], 1)} for b in blocks],
                 },
             }
@@ -489,7 +573,7 @@ def main():
             obs_records.append(obs)
 
     print(f"\n=== Classification counts ===", file=sys.stderr)
-    for k in ("empty", "deletion", "clonal_V1", "insertion", "partial", "unrelated"):
+    for k in ("empty", "deletion", "clonal_V1", "insertion", "rearranged", "partial", "unrelated"):
         print(f"  {k:>12}: {counts[k]:>8,}", file=sys.stderr)
     n_ev = len({o["nested_insert"]["event_key"] for o in obs_records
                 if "nested_insert" in o})
@@ -529,6 +613,8 @@ def main():
         "n_v1_records": len(records),
         "n_anchor_pairs": n_pairs,
         "n_ambiguous_placements": n_ambiguous,
+        "n_anchors_at_secondary_cap": n_capped,
+        "max_secondary": args.max_secondary,
         "n_records_not_searched": dict(n_skip),
         "n_placements_without_sequence": n_lost,
         "counts_are": "distinct assemblies (GCA/GCF twins collapsed)",

@@ -60,6 +60,10 @@ def parse_args():
     p.add_argument("--threads", type=int, default=16,
                    help="Threads for ULTRA (TRF is single-threaded)")
     p.add_argument("--n-permute", type=int, default=10000)
+    p.add_argument("--cluster-identity", type=float, default=0.95,
+                   help="one test sequence per cd-hit-est cluster at this identity "
+                        "(default 0.95, the project's IS110 threshold; 1.0 = exact "
+                        "sequences only)")
     p.add_argument("--keep-duplicates", action="store_true",
                    help="Test every record, even identical element sequences "
                         "(pseudo-replicated; default: one per distinct sequence)")
@@ -70,6 +74,45 @@ def parse_args():
 
 
 # ----------------------------- sequence sets --------------------------------
+_RC = str.maketrans("ACGTN", "TGCAN")
+
+
+def _revcomp(s):
+    return s.translate(_RC)[::-1]
+
+
+def _contig_key(name):
+    c = name.split("|")[-1]
+    return c[3:] if c.startswith("NZ_") else c
+
+
+def cluster_representatives(seqs, identity, work_dir, threads):
+    """One sequence per cd-hit-est cluster (both strands, >= `identity`,
+    length within the same fraction). Exact-string de-duplication left an
+    element and its one-SNP relatives as separate "independent" observations:
+    Fisher's p moved from 0.5 to 1e-59 by cloning one sequence."""
+    if len(seqs) < 2:
+        return seqs
+    fa, out = os.path.join(work_dir, "dedup_in.fa"), os.path.join(work_dir, "dedup_out.fa")
+    ids = list(seqs)
+    with open(fa, "w") as f:
+        for i, k in enumerate(ids):
+            f.write(f">s{i}\n{seqs[k]}\n")
+    word = 10 if identity >= 0.95 else 8
+    subprocess.run(["cd-hit-est", "-i", fa, "-o", out, "-c", str(identity),
+                    "-s", str(identity), "-n", str(word), "-d", "0",
+                    "-T", str(threads), "-M", "0"],
+                   check=True, stdout=subprocess.DEVNULL)
+    keep = {}
+    with open(out) as f:
+        for line in f:
+            if line.startswith(">"):
+                k = ids[int(line[2:].split()[0])]
+                keep[k] = seqs[k]
+    return keep
+
+
+
 def load_is_sequences(records_path, min_len, called_only=True, dedup=True):
     """Return (seqs dict {id: seq}, is_loci {contig: [(s,e)]}, stats).
 
@@ -90,8 +133,11 @@ def load_is_sequences(records_path, min_len, called_only=True, dedup=True):
     is_loci = defaultdict(list)
     stats_ = defaultdict(int)
     seen_seq = set()
-    labelled = any((r.get("boundary_evidence") or {}).get("method")
-                   == "empty_vs_filled_decomposition" for r in records)
+    # "labelled" = the file uses the current method vocabulary at all. Testing
+    # for a successful call meant that a file with ONLY fallback records was
+    # taken for an old unlabelled one and every record was kept.
+    VOCAB = {"empty_vs_filled_decomposition", "peak_symmetric_fallback", "no_empty_tnp_only"}
+    labelled = any((r.get("boundary_evidence") or {}).get("method") in VOCAB for r in records)
     for r in records:
         rid = r.get("ref_id") or r.get("is110_id")
         ie = r.get("is_element") or (r.get("source", {}) or {}).get("is_element") or {}
@@ -99,10 +145,13 @@ def load_is_sequences(records_path, min_len, called_only=True, dedup=True):
         # genomic locus to exclude from control sampling
         src = r.get("source", {})
         contig = src.get("contig")
-        s = ie.get("source_start")
-        e = ie.get("source_end")
+        s = ie.get("source_start") or ie.get("start")      # either record schema
+        e = ie.get("source_end") or ie.get("end")
         if contig and s and e:
-            is_loci[contig].append((min(s, e), max(s, e)))
+            # keyed by the bare contig accession, so the GCA and GCF copies of
+            # one genome (CP012378.1 / NZ_CP012378.1) share the exclusion --
+            # the twin's copy of the very element under test was a "control"
+            is_loci[_contig_key(contig)].append((min(s, e), max(s, e)))
         if not (rid and seq and len(seq) >= min_len):
             stats_["too_short_or_missing"] += 1
             continue
@@ -112,6 +161,9 @@ def load_is_sequences(records_path, min_len, called_only=True, dedup=True):
             continue
         seq = seq.upper()
         if dedup:
+            # one orientation: an element and its reverse complement are the
+            # same sequence
+            seq = min(seq, _revcomp(seq))
             if seq in seen_seq:
                 stats_["duplicate_sequence"] += 1
                 continue
@@ -123,49 +175,50 @@ def load_is_sequences(records_path, min_len, called_only=True, dedup=True):
 
 
 def sample_controls(fa, is_seqs, is_loci, ratio, min_len, rng):
-    """Sample length-matched random windows avoiding IS loci. Returns {id: seq}."""
+    """Length-matched random windows avoiding known IS loci.
+    Returns ({id: seq}, n_short) -- n_short = controls that could not be drawn.
+
+    A window is drawn uniformly over all ELIGIBLE START POSITIONS for that
+    length (contig weight = clen - L + 1). Weighting by contig length gave a
+    1-kb contig one third of the 1-kb windows next to a 2-kb contig (it has
+    1 of 1,002 possible starts). No window is used twice."""
     contigs = list(fa.references)
     lengths = np.array([fa.get_reference_length(c) for c in contigs], dtype=np.int64)
-    usable = lengths >= min_len
-    contigs = [c for c, u in zip(contigs, usable) if u]
-    clens = lengths[usable].astype(float)
-    if not contigs:
-        return {}
-    weights = clens / clens.sum()
-    cidx = np.arange(len(contigs))
 
-    # interval lookup for exclusion
     def overlaps_is(contig, s, e):
-        for (a, b) in is_loci.get(contig, []):
-            if s < b and a < e:
+        for (a, b) in is_loci.get(_contig_key(contig), []):
+            if s <= b and a <= e:
                 return True
         return False
 
-    controls = {}
+    controls, used, n_short = {}, set(), 0
+    weights_by_len = {}
     for rid, seq in is_seqs.items():
         L = len(seq)
-        made = 0
-        attempts = 0
-        while made < ratio and attempts < ratio * 50:
+        if L not in weights_by_len:
+            w = np.clip(lengths - L + 1, 0, None).astype(float)
+            weights_by_len[L] = (w / w.sum()) if w.sum() > 0 else None
+        w = weights_by_len[L]
+        made = attempts = 0
+        while w is not None and made < ratio and attempts < ratio * 50:
             attempts += 1
-            ci = int(rng.choice(cidx, p=weights))
-            contig = contigs[ci]
-            clen = int(fa.get_reference_length(contig))
-            if clen < L:
-                continue
-            start = rng.integers(0, clen - L + 1)
+            ci = int(rng.choice(len(contigs), p=w))
+            contig, clen = contigs[ci], int(lengths[ci])
+            start = int(rng.integers(0, clen - L + 1))
             end = start + L
-            if overlaps_is(contig, start + 1, end):
+            if (contig, start) in used or overlaps_is(contig, start + 1, end):
                 continue
-            cseq = fa.fetch(contig, int(start), int(end)).upper()
+            cseq = fa.fetch(contig, start, end).upper()
             if not cseq or len(cseq) != L:
                 continue
             # skip windows that are mostly N
             if cseq.count("N") > 0.1 * L:
                 continue
+            used.add((contig, start))
             controls[f"{rid}__ctrl{made}"] = cseq
             made += 1
-    return controls
+        n_short += ratio - made
+    return controls, n_short
 
 
 def write_fasta(path, seqs):
@@ -195,7 +248,7 @@ def dinuc_shuffle(seq, pyrng, max_tries=25):
     for i in range(n - 1):
         base_edges[s[i]].append(s[i + 1])
 
-    for _ in range(max_tries):
+    for _ in range(max(max_tries, 2000)):
         # 1) pick a random "last edge" for every vertex except `last`
         last_edge = {}
         for v, es in base_edges.items():
@@ -240,7 +293,10 @@ def dinuc_shuffle(seq, pyrng, max_tries=25):
             res.append(nxt)
             cur = nxt
         return "".join(res)
-    return s  # could not build a valid shuffle; return original
+    # No valid shuffle found. Returning the ORIGINAL here put the unshuffled
+    # element into its own null set (86 of 100 tries for a low-complexity
+    # sequence at 25 attempts); the caller drops the pair instead.
+    return None
 
 
 # ----------------------------- tandem callers -------------------------------
@@ -271,7 +327,10 @@ def run_trf(trf_bin, fa_path, out_dat):
 def run_ultra(ultra_bin, fa_path, out_tsv, threads=1):
     """Run ULTRA (TSV output: SeqID Start End Period Score ...).
     Returns {seq_id: [(start,end,period), ...]} as 1-based inclusive intervals."""
-    cmd = [ultra_bin, "--tsv", "-t", str(threads), "-o", out_tsv, fa_path]
+    # -p 500: same largest period as TRF above (ULTRA's default is 100, so
+    # every "large" unit of 100-500 bp could be called by TRF only and never
+    # counted as agreed)
+    cmd = [ultra_bin, "--tsv", "-p", "500", "-t", str(threads), "-o", out_tsv, fa_path]
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     hits = defaultdict(list)
     with open(out_tsv) as f:
@@ -311,7 +370,8 @@ def fold_and_test(test_vals, ctrl_vals, n_permute, rng):
     test_vals = np.asarray(test_vals, float)
     ctrl_vals = np.asarray(ctrl_vals, float)
     mt, mc = test_vals.mean(), ctrl_vals.mean()
-    fold = (mt / mc) if mc > 0 else float("inf")
+    # 0/0 is "no estimate", not infinite enrichment; inf is not JSON either
+    fold = (mt / mc) if mc > 0 else None
     # Mann-Whitney
     try:
         u, p_mw = stats.mannwhitneyu(test_vals, ctrl_vals, alternative="greater")
@@ -330,6 +390,18 @@ def fold_and_test(test_vals, ctrl_vals, n_permute, rng):
     return mt, mc, fold, p_mw, p_perm
 
 
+def paired_sign_flip(test_vals, ctrl_vals, n_permute, rng):
+    """One-sided p for mean(test - control) > 0 when each control belongs to
+    one test sequence (the dinucleotide shuffle OF that element): labels are
+    exchanged within pairs. The unpaired permutation ignored the pairing
+    (p = 0.47 where the exact paired test gives 0.002)."""
+    d = np.asarray(test_vals, float) - np.asarray(ctrl_vals, float)
+    obs = d.mean()
+    signs = rng.choice([-1.0, 1.0], size=(n_permute, len(d)))
+    ge = int(((signs * d).mean(axis=1) >= obs).sum())
+    return (ge + 1) / (n_permute + 1)
+
+
 def fisher_presence(test_pos, test_n, ctrl_pos, ctrl_n):
     table = [[test_pos, test_n - test_pos], [ctrl_pos, ctrl_n - ctrl_pos]]
     odds, p = stats.fisher_exact(table, alternative="greater")
@@ -345,6 +417,12 @@ def main():
     is_seqs, is_loci, load_stats = load_is_sequences(
         args.records, args.min_seq_len, called_only=not args.all_records,
         dedup=not args.keep_duplicates)
+    if not args.keep_duplicates and args.cluster_identity < 1.0 and is_seqs:
+        n0 = len(is_seqs)
+        is_seqs = cluster_representatives(is_seqs, args.cluster_identity, args.out,
+                                          args.threads)
+        load_stats["near_identical_collapsed"] = n0 - len(is_seqs)
+        load_stats["kept"] = len(is_seqs)
     print(f"  IS sequences (>= {args.min_seq_len} bp): {len(is_seqs):,}  {load_stats}",
           file=sys.stderr)
     if not is_seqs:
@@ -355,15 +433,20 @@ def main():
 
     print("Sampling length-matched control windows ...", file=sys.stderr, flush=True)
     fa = pysam.FastaFile(args.genome_db)
-    genomic = sample_controls(fa, is_seqs, is_loci, args.control_ratio,
-                              args.min_seq_len, rng)
+    genomic, n_short = sample_controls(fa, is_seqs, is_loci, args.control_ratio,
+                                       args.min_seq_len, rng)
     print(f"  genomic control windows: {len(genomic):,} "
-          f"(target {len(is_seqs)*args.control_ratio:,})", file=sys.stderr)
+          f"(target {len(is_seqs)*args.control_ratio:,}; {n_short:,} could not be drawn)",
+          file=sys.stderr)
 
     print("Generating dinucleotide-shuffle control ...", file=sys.stderr, flush=True)
     shuffle = {f"{sid}__dishuf": dinuc_shuffle(seq, pyrng)
                for sid, seq in is_seqs.items()}
-    print(f"  dinuc-shuffle controls: {len(shuffle):,}", file=sys.stderr)
+    n_noshuf = sum(1 for v in shuffle.values() if v is None)
+    shuffle = {k: v for k, v in shuffle.items() if v is not None}
+    print(f"  dinuc-shuffle controls: {len(shuffle):,} "
+          f"({n_noshuf} elements could not be shuffled and have no shuffle control)",
+          file=sys.stderr)
 
     # Write FASTAs with tool-safe integer IDs. ULTRA truncates sequence names at
     # '|' (and our ref_ids contain '|'), which silently zeroed all ULTRA lookups;
@@ -460,6 +543,17 @@ def main():
                 comp[metric] = {"mean_IS": mt, "mean_control": mc,
                                 "fold_enrichment": fold,
                                 "p_mannwhitney": p_mw, "p_permutation": p_perm}
+                if ctrl_set == "shuffle":
+                    # paired: each shuffle belongs to one element
+                    by_id = {r["seq_id"]: r[metric] for r in test_rows}
+                    pairs = [(by_id[r["seq_id"][:-len("__dishuf")]], r[metric])
+                             for r in ctrl_rows
+                             if r["seq_id"][:-len("__dishuf")] in by_id]
+                    if pairs:
+                        comp[metric]["p_paired_sign_flip"] = paired_sign_flip(
+                            [a for a, _ in pairs], [b for _, b in pairs],
+                            args.n_permute, rng)
+                        comp[metric]["n_pairs"] = len(pairs)
             for flag, _ in pres_flags:
                 tp = sum(1 for r in test_rows if r[flag])
                 cp = sum(1 for r in ctrl_rows if r[flag])
@@ -467,7 +561,8 @@ def main():
                 comp[flag] = {"IS_frac": tp / len(test_rows),
                               "control_frac": cp / len(ctrl_rows),
                               "IS_positive": tp, "control_positive": cp,
-                              "odds_ratio": odds, "p_fisher": p}
+                              "odds_ratio": odds if np.isfinite(odds) else None,
+                              "p_fisher": p}
         report["comparisons"][ctrl_set] = comp
 
     with open(os.path.join(args.out, "enrichment_report.json"), "w") as f:
@@ -492,14 +587,16 @@ def main():
         for flag, lab in pres_flags:
             d = comp[flag]
             lines.append(f"    [{lab:<14}] IS {d['IS_frac']*100:5.1f}%  vs "
-                         f"{d['control_frac']*100:5.1f}%   OR={d['odds_ratio']:.2f}  "
+                         f"{d['control_frac']*100:5.1f}%   OR={'n/a' if d['odds_ratio'] is None else format(d['odds_ratio'], '.2f')}  "
                          f"p_fisher={d['p_fisher']:.1e}")
         lines.append("  Density (tandem bp / length):")
         for metric in metrics:
             d = comp[metric]
             lines.append(f"    {metric:<20} IS {d['mean_IS']*100:5.2f}%  vs "
-                         f"{d['mean_control']*100:5.2f}%   fold={d['fold_enrichment']:.2f}x  "
-                         f"p_perm={d['p_permutation']:.1e}")
+                         f"{d['mean_control']*100:5.2f}%   fold="
+                         f"{'n/a' if d['fold_enrichment'] is None else format(d['fold_enrichment'], '.2f') + 'x'}  "
+                         + (f"p_paired={d['p_paired_sign_flip']:.1e}" if "p_paired_sign_flip" in d
+                            else f"p_perm={d['p_permutation']:.1e}"))
     text = "\n".join(lines)
     with open(os.path.join(args.out, "enrichment_report.txt"), "w") as f:
         f.write(text + "\n")

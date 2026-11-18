@@ -97,7 +97,8 @@ def draw_one(rec, out_png):
     ]
     for ri, r in enumerate(repeats[:3]):
         title_lines.append(
-            f"Tandem #{ri+1}: unit={r['repeat_unit_bp']:,} bp × {r['n_copies']} copies "
+            f"{'Dispersed repeat' if r.get('repeat_class') == 'dispersed' else 'Tandem'} "
+            f"#{ri+1}: unit={r['repeat_unit_bp']:,} bp × {r['n_copies']} copies "
             f"in [{r['span_start']:,}-{r['span_end']:,}] (span {r['total_span_bp']:,} bp)"
         )
     ax.set_title("\n".join(title_lines), fontsize=9, loc="left")

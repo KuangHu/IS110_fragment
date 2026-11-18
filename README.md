@@ -178,6 +178,18 @@ anchor copies (up, up, down, down on one contig) are reported `ambiguous`, never
 Stage markers track the command line and input modification times, not file contents or
 the code version: after changing scripts, delete `.stage_*.done` to force a rerun.
 
+Downstream stages (7-11) and the rearrangement / movement scripts, known limits:
+`find_rearrangements.py` does not propose duplications whose copies lie on different
+contigs; `viz_lineage.py` colours inherited segments by ungapped offsets and adds a
+V_REF track even to chains that do not contain it (figures only); a nested-insert
+`event_key` hashes the V1 context at one junction placement, so the same insertion at a
+microhomology junction can get two keys; `detect_tandem.py` (minimap2 self-alignment)
+does not see arrays of units shorter than ~150 bp -- use `verify_tandem_enrichment.py`
+(TRF + ULTRA) for those. Rows of the movement / inversion / translocation / duplication
+tables are per (reference element, target genome): the same event is reported from every
+reference that carries the element. Use the `*_events.tsv` files of the dedup scripts,
+or collapse by target site, before counting events. Reviews: `docs/reviews/`.
+
 Tests: `sbatch tests/run_tests.sh [WORK_DIR]` runs unit tests and a synthetic
 end-to-end run with known boundaries (both strands, a GCA/GCF twin, a SNP-divergent
 empty and a nested cargo insertion).

@@ -292,6 +292,7 @@ def detect_growing_and_tandem(
     min_tandem_copies=2,
     render_figures=True,
     trust_existing=False,
+    max_secondary=None,
 ):
     """Stages 8-11: variant discovery, lineage building, CDS validation, tandem
     detection, optional figure rendering. Outputs land in `output_dir/`."""
@@ -304,9 +305,11 @@ def detect_growing_and_tandem(
     tandem_dir = os.path.join(output_dir, "tandem")
     figs_dir = os.path.join(output_dir, "figures")
 
-    def stage(name, title, cmd, outputs):
+    def stage(name, title, cmd, outputs, inputs=()):
+        # every downstream stage depends on its input files: with no inputs
+        # declared, a replaced records.json left stages 8-10 "complete"
         _run_stage(output_dir, name, title, cmd, outputs,
-                   trust_existing=trust_existing)
+                   trust_existing=trust_existing, inputs=inputs)
 
     # Stage 8: find anchor-site variants (V_ref vs target → empty/clonal/deletion/insertion)
     obs_json = os.path.join(variants_dir, "observations.json")
@@ -317,8 +320,11 @@ def detect_growing_and_tandem(
            "--db", genome_db,
            "--out", variants_dir,
            "--threads", str(threads),
-           "--min-v1-coverage", str(min_v1_coverage)],
-          [obs_json])
+           "--min-v1-coverage", str(min_v1_coverage)]
+          # the census setting of stage 3 applies here too (stage 8 has its
+          # own minimap2 run, with a default of 20 targets per anchor)
+          + (["--max-secondary", str(max_secondary)] if max_secondary else []),
+          [obs_json], inputs=[records_json, genome_db + ".fai"])
 
     # Stage 9: build size-sorted nested lineages
     lineages_json = os.path.join(lineage_dir, "lineages.json")
@@ -331,7 +337,7 @@ def detect_growing_and_tandem(
            "--cluster-id", str(cluster_id),
            "--min-step-bp", str(min_step_bp),
            "--threads", str(min(threads, 8))],
-          [lineages_json])
+          [lineages_json], inputs=[obs_json, records_json])
 
     # Stage 10a: validate V_0 retains the IS110 CDS
     validated_json = os.path.join(validated_dir, "lineages_validated.json")
@@ -343,7 +349,7 @@ def detect_growing_and_tandem(
            "--records", records_json,
            "--out", validated_dir,
            "--min-cds-coverage", str(min_cds_coverage)],
-          [validated_json])
+          [validated_json], inputs=[lineages_json, obs_json, records_json])
 
     # Stage 10b: tandem detection (self-alignment, catches even single-observation tandems)
     tandem_json = os.path.join(tandem_dir, "tandem_findings.json")
@@ -356,7 +362,7 @@ def detect_growing_and_tandem(
            "--min-repeat-len", str(min_tandem_repeat_len),
            "--min-copies", str(min_tandem_copies),
            "--threads", str(min(threads, 8))],
-          [tandem_json])
+          [tandem_json], inputs=[records_json, obs_json])
 
     # Stage 11 (optional): render figures
     if render_figures:
@@ -491,6 +497,7 @@ def main():
             min_tandem_copies=args.min_tandem_copies,
             render_figures=not args.no_render_figures,
             trust_existing=args.trust_existing,
+            max_secondary=args.max_secondary,
         )
         print(f"\nStages 8-11 outputs:", flush=True)
         for k, v in ext.items():

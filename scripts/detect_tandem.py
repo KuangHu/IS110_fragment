@@ -27,7 +27,10 @@ def parse_args():
     p.add_argument("--min-seq-len", type=int, default=1500,
                    help="Skip sequences shorter than this (default 1500)")
     p.add_argument("--min-repeat-len", type=int, default=50,
-                   help="Min length of a tandem unit (default 50)")
+                   help="Min length of a tandem unit (default 50). NOTE: the "
+                        "self-alignment (minimap2 asm10, k=19) does not reliably "
+                        "see arrays of units shorter than ~150 bp; use TRF/ULTRA "
+                        "(verify_tandem_enrichment.py) for short units")
     p.add_argument("--min-identity", type=float, default=95,
                    help="Min alignment identity (default 95)")
     p.add_argument("--min-copies", type=int, default=2,
@@ -89,9 +92,17 @@ def find_tandem_unit(hits, min_repeat_len, min_identity, adjacency=0.8):
     Returns list of {repeat_class, repeat_unit_bp, n_copies, span_start,
     span_end, total_span_bp, repeat_len_bp, n_hits}.
     """
-    fwd = sorted((ts - qs, qs, qe, ts, te) for (qs, qe, ts, te, strand, ident) in hits
-                 if strand == "+" and ident >= min_identity
-                 and ts > qs and qe - qs >= min_repeat_len)
+    # A self-hit and its mirror image (query and target swapped) are the same
+    # repeat; minimap2 reports either. Requiring ts > qs threw away arrays
+    # whose only report was the mirror. Normalise, then de-duplicate.
+    norm = set()
+    for (qs, qe, ts, te, strand, ident) in hits:
+        if strand != "+" or ident < min_identity or qe - qs < min_repeat_len or ts == qs:
+            continue
+        if ts < qs:
+            qs, qe, ts, te = ts, te, qs, qe
+        norm.add((ts - qs, qs, qe, ts, te))
+    fwd = sorted(norm)
     groups = []
     for h in fwd:
         if groups and h[0] - groups[-1][-1][0] <= max(25, 0.1 * groups[-1][0][0]):
@@ -99,8 +110,25 @@ def find_tandem_unit(hits, min_repeat_len, min_identity, adjacency=0.8):
         else:
             groups.append([h])
 
-    results = []
+    # One offset group can hold several unconnected repeats (two dispersed
+    # pairs with the same spacing; two separate arrays of the same unit).
+    # Treated as one, their outer span was divided by the offset: two 300-bp
+    # pairs 3 kb apart became a 4-copy 1-kb "tandem". Split a group wherever
+    # the next hit starts beyond the reach (target end) of the hits so far.
+    connected = []
     for g in groups:
+        cur, reach = [], None
+        for h in sorted(g, key=lambda h: h[1]):
+            if reach is not None and h[1] > reach:
+                connected.append(cur); cur = []
+                reach = None
+            cur.append(h)
+            reach = max(reach or 0, h[4])
+        if cur:
+            connected.append(cur)
+
+    results = []
+    for g in connected:
         offs = sorted(h[0] for h in g)
         offset = offs[len(offs) // 2]
         if offset < min_repeat_len:
@@ -212,7 +240,10 @@ def main():
                 ov_s = max(v1_s, cs)
                 ov_e = min(v1_e, ce)
                 if ov_e <= ov_s: continue
-                cds_intervals.append((b_s + (ov_s - v1_s), b_s + (ov_e - v1_s)))
+                if b.get("strand", "+") == "+":
+                    cds_intervals.append((b_s + (ov_s - v1_s), b_s + (ov_e - v1_s)))
+                else:      # reverse block: V1 start maps to the block's END
+                    cds_intervals.append((b_e - (ov_e - v1_s), b_e - (ov_s - v1_s)))
         seq_set[f"var_{o['v1_parent_id']}__{vid}"] = {
             "seq": seq, "len": len(seq),
             "kind": o["category"], "v1_parent": o["v1_parent_id"],
@@ -226,6 +257,7 @@ def main():
     # Self-align each sequence
     findings = []
     n_failed = 0
+    failed_ids = []
     work_root = tempfile.mkdtemp(prefix="self_align_")
     for i, (name, info) in enumerate(seq_set.items()):
         if i % 2000 == 0:
@@ -237,6 +269,7 @@ def main():
         except subprocess.CalledProcessError as e:
             # counted and reported; these used to vanish without a trace
             n_failed += 1
+            failed_ids.append(name)
             if n_failed <= 5:
                 print(f"  WARNING: self-alignment failed for {name}: "
                       f"{(e.stderr or b'')[-200:]!r}", file=sys.stderr)
@@ -260,6 +293,7 @@ def main():
             })
 
     subprocess.run(["rm", "-rf", work_root])
+    failed_path = os.path.join(args.out, "tandem_failed.tsv")
 
     if n_failed:
         print(f"  WARNING: {n_failed:,} sequences could not be self-aligned",
@@ -280,11 +314,18 @@ def main():
                         f"{r['total_span_bp']}\t{r['span_start']}\t{r['span_end']}\t"
                         f"{r['repeat_class']}\t{r['copy_spacing_bp']}\n")
 
+    # sequences that could not be examined are NOT negatives: listed, and the
+    # stage exits non-zero so the pipeline does not mark it complete
+    with open(failed_path, "w") as f:
+        f.write("seq_id\n" + "".join(x + "\n" for x in failed_ids))
     # Summary stats
     n_v_ref = sum(1 for x in findings if x["kind"] == "v_ref")
     n_var = sum(1 for x in findings if x["kind"] != "v_ref")
     print(f"  V_refs with tandem: {n_v_ref:,}", file=sys.stderr)
     print(f"  Variants with tandem: {n_var:,}", file=sys.stderr)
+    if n_failed:
+        sys.exit(f"ERROR: {n_failed} sequences could not be self-aligned "
+                 f"(see {failed_path}); results are incomplete")
 
 
 if __name__ == "__main__":
