@@ -12,9 +12,12 @@ For each Tier-4 strict_is_mediated_dup candidate (ref_id, tgt_asm):
         - DNA (between ref's IS pair) appears >= 2 times in tgt at >= --min-dna-cov + identity
         - IS hits exist near each DNA-copy boundary in tgt (uses is_hits.tsv)
 """
-import argparse, csv, gzip, json, os, re, shutil, subprocess, tempfile
+import argparse, csv, gzip, json, os, re, shutil, subprocess, tempfile, sys
 from collections import defaultdict
 import pysam
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import lib_rearr as lr  # noqa: E402
 
 
 def parse_args():
@@ -193,106 +196,111 @@ def main():
         fa_cache[asm] = (path, pysam.FastaFile(path) if path else None)
         return fa_cache[asm]
 
-    n_pass = 0
+    # CANONICAL = on ONE target contig and strand:
+    #     O-flank  [IS]  D  [IS]  D  [IS]   (D = the duplicated flank, O = the other)
+    #   * the duplicated flank of the element is present at >= 2 separate places
+    #   * an IS copy lies between consecutive copies
+    #   * the other flank is present once
+    # The previous test searched for the IS ELEMENT ITSELF across the whole
+    # target and asked whether each copy was near an IS hit (always true): a
+    # target with no duplication but two IS copies was 'canonical'.
+    loci = lr.load_loci(args.records)
+    n_pass = n_assessed = 0
+    n_skip = defaultdict(int)
     with open(out_path, "w") as out:
         out.write("species\tref_id\ttgt_asm\tA_cov\tA_id\tA_pass\t"
                   "B_cov\tB_id\tB_pass\tn_dna_clusters\tDNA_best_cov\tDNA_best_id\t"
-                  "n_is_flanked_clusters\tcanonical_pass\n")
+                  "n_is_flanked_clusters\tcanonical_pass\tdup_side\ttgt_contig\n")
         for i, r in enumerate(rows):
             if i % 100 == 0:
                 print(f"  {i}/{len(rows)}", flush=True)
             ref_id = r['ref_id']
             tgt_asm = r['tgt_asm']
-            species = r.get('species', 'klebsiella_pneumoniae')
+            if 'species' not in r:
+                raise SystemExit("--candidates has no 'species' column (it used to be "
+                                 "silently labelled klebsiella_pneumoniae)")
+            species = r['species']
             locus = loci.get(ref_id)
-            if not locus: continue
-            ref_contig, is_start, is_end = locus
-            ref_asm = ref_id.split("|")[0]
-            ref_path, ref_fa = open_asm(ref_asm)
-            tgt_path, tgt_fa = open_asm(tgt_asm)
-            if not ref_fa or not tgt_fa: continue
+            if not locus:
+                n_skip["ref_id not in records"] += 1; continue
+            ref_contig, is_s0, is_e, tnp_strand = locus
+            _, ref_fa = open_asm(ref_id.split("|")[0])
+            _, tgt_fa = open_asm(tgt_asm)
+            if not ref_fa or not tgt_fa:
+                n_skip["assembly FASTA not found"] += 1; continue
+            d = lr.parse_details(details_by_pair.get((ref_id, tgt_asm), ''))
+            anchors = d["up"] + d["down"]
+            groups = defaultdict(list)
+            for (c, s_, e_, st) in anchors:
+                groups[(c, st)].append((s_, e_))
+            groups = {k: v for k, v in groups.items() if len(set(v)) >= 2}
+            if not groups:
+                n_skip["no contig with two same-strand anchor hits"] += 1; continue
+            (tgt_contig, st), pos = max(sorted(groups.items()), key=lambda kv: len(set(kv[1])))
             try:
-                clen = ref_fa.get_reference_length(ref_contig)
+                A_seq, B_seq = lr.ref_proxies(ref_fa, ref_contig, is_s0, is_e, tnp_strand,
+                                              args.flank)
             except (KeyError, ValueError):
-                continue
+                n_skip["ref contig not in FASTA"] += 1; continue
+            if min(len(A_seq), len(B_seq)) < 1000:
+                n_skip["reference flank < 1 kb (contig end)"] += 1; continue
+            tseq, toff = lr.fetch_window(tgt_fa, tgt_contig, min(p[0] for p in pos),
+                                         max(p[1] for p in pos), args.flank + 30000)
+            if not tseq:
+                n_skip["target contig not in FASTA"] += 1; continue
+            hits = (is_hits.get(tgt_asm, {}).get(tgt_contig)
+                    or is_hits.get(tgt_asm, {}).get(tgt_contig.split("|", 1)[-1]) or [])
 
-            # Get anchor positions
-            details = details_by_pair.get((ref_id, tgt_asm), '')
-            if not details: continue
-            anchors = parse_anchors(details)
-            if not anchors: continue
-            bycontig = defaultdict(list)
-            for (c, s, e, st) in anchors:
-                bycontig[c].append((s, e, st))
-            tgt_contig = max(bycontig.keys(), key=lambda k: len(bycontig[k]))
-
-            # Extract ref's A flank, DNA, B flank
-            # DNA is the IS-locus region in ref (we use the candidate IS ± window for DNA)
-            A_s = max(0, is_start - args.flank); A_e = is_start
-            B_s = is_end; B_e = min(clen, is_end + args.flank)
-            DNA_s = max(0, is_start - args.flank); DNA_e = min(clen, is_end + args.flank)
-            A_seq = ref_fa.fetch(ref_contig, A_s, A_e) if A_e > A_s else ""
-            B_seq = ref_fa.fetch(ref_contig, B_s, B_e) if B_e > B_s else ""
-            DNA_seq = ref_fa.fetch(ref_contig, is_start, is_end) if is_end > is_start else ""
+            def non_is(blocks):
+                keep = []
+                for b in blocks:
+                    ts_, te_ = b["ts"] + toff, b["te"] + toff
+                    is_bp = lr.union_bp([(max(ts_, h[0] - 300), min(te_, h[1] + 300))
+                                         for h in hits if min(te_, h[1] + 300) > max(ts_, h[0] - 300)])
+                    if is_bp < 0.8 * (te_ - ts_):
+                        keep.append(b)
+                return keep
 
             work = tempfile.mkdtemp(prefix=f"d{i}_", dir=work_root)
-            A_path = os.path.join(work, "A.fa")
-            B_path = os.path.join(work, "B.fa")
-            DNA_path = os.path.join(work, "DNA.fa")
-            if A_seq: write_fasta("A", A_seq, A_path)
-            if B_seq: write_fasta("B", B_seq, B_path)
-            if DNA_seq: write_fasta("DNA", DNA_seq, DNA_path)
-            if not (A_seq and B_seq and DNA_seq):
-                shutil.rmtree(work, ignore_errors=True); continue
-
-            # Test A and B forward-alignment against tgt
-            try:
-                A_blk = best_forward_block(tgt_path, A_path, work, args.threads)
-                B_blk = best_forward_block(tgt_path, B_path, work, args.threads)
-                DNA_clusters = all_forward_clusters(tgt_path, DNA_path, work, args.threads)
-            except Exception:
-                shutil.rmtree(work, ignore_errors=True); continue
-
-            A_cov = A_blk[3]/len(A_seq) if A_blk else 0
-            A_id  = A_blk[4] if A_blk else 0
-            B_cov = B_blk[3]/len(B_seq) if B_blk else 0
-            B_id  = B_blk[4] if B_blk else 0
-            A_pass = A_cov >= args.min_flank_cov and A_id >= args.min_identity
-            B_pass = B_cov >= args.min_flank_cov and B_id >= args.min_identity
-
-            passing_dna = [c for c in DNA_clusters
-                           if c["cov"] >= args.min_dna_cov and c["wid"] >= args.min_identity]
-            best_dna = max(passing_dna, key=lambda c: c["cov"]) if passing_dna else None
-            best_dna_cov = best_dna["cov"] if best_dna else 0
-            best_dna_id  = best_dna["wid"] if best_dna else 0
-
-            # Check IS-flanking of each DNA copy
-            tgt_is_hits = is_hits.get(tgt_asm, {}).get(tgt_contig, [])
-            n_is_flanked = 0
-            for c in passing_dna:
-                # need IS at both edges of the DNA cluster
-                # extract local contig from tname
-                local = c["tname"].split("|", 1)[1] if "|" in c["tname"] else c["tname"]
-                hits = is_hits.get(tgt_asm, {}).get(local, [])
-                if is_within(hits, c["ts"], args.is_tol) and is_within(hits, c["te"], args.is_tol):
-                    n_is_flanked += 1
-
-            canonical_pass = (A_pass and B_pass and len(passing_dna) >= 2 and n_is_flanked >= 2)
-            if canonical_pass: n_pass += 1
-
-            out.write(f"{species}\t{ref_id}\t{tgt_asm}\t"
-                      f"{A_cov:.3f}\t{A_id:.1f}\t{A_pass}\t"
-                      f"{B_cov:.3f}\t{B_id:.1f}\t{B_pass}\t"
-                      f"{len(passing_dna)}\t{best_dna_cov:.3f}\t{best_dna_id:.1f}\t"
-                      f"{n_is_flanked}\t{canonical_pass}\n")
+            res = {}
+            for name, seq in (("A", A_seq), ("B", B_seq)):
+                bl = non_is(lr.align(seq, tseq, work, args.threads))
+                dup_bp, copies, places = lr.copy_depth(bl, 1000, args.min_identity, strand=st)
+                res[name] = {"cov": lr.strand_cover(bl, st, args.min_identity) / len(seq),
+                             "id": max((x["ident"] for x in bl if x["strand"] == st), default=0.0),
+                             "dup_bp": dup_bp, "copies": copies, "places": places,
+                             "len": len(seq)}
             shutil.rmtree(work, ignore_errors=True)
+            dup = max("AB", key=lambda k: (res[k]["copies"], res[k]["dup_bp"]))
+            other = "B" if dup == "A" else "A"
+            pl = sorted(res[dup]["places"], key=lambda x: x["ts"])
+            n_is_between = 0
+            for x, y in zip(pl, pl[1:]):
+                lo, hi = x["te"] + toff - args.is_tol, y["ts"] + toff + args.is_tol
+                if any(h[0] >= lo and h[1] <= hi for h in hits):
+                    n_is_between += 1
+            A_pass = res["A"]["cov"] >= args.min_flank_cov
+            B_pass = res["B"]["cov"] >= args.min_flank_cov
+            canonical_pass = (res[dup]["copies"] >= 2
+                              and res[dup]["dup_bp"] >= args.min_dna_cov * min(res[dup]["len"], 5000)
+                              and n_is_between >= 1
+                              and res[other]["cov"] >= args.min_flank_cov)
+            n_assessed += 1
+            if canonical_pass: n_pass += 1
+            out.write(f"{species}\t{ref_id}\t{tgt_asm}\t"
+                      f"{res['A']['cov']:.3f}\t{res['A']['id']:.1f}\t{A_pass}\t"
+                      f"{res['B']['cov']:.3f}\t{res['B']['id']:.1f}\t{B_pass}\t"
+                      f"{res[dup]['copies']}\t{res[dup]['dup_bp'] / res[dup]['len']:.3f}\t"
+                      f"{res[dup]['id']:.1f}\t{n_is_between}\t{canonical_pass}\t"
+                      f"{'up' if dup == 'A' else 'down'}\t{tgt_contig}\n")
 
     for _, fa in fa_cache.values():
         if fa: fa.close()
     shutil.rmtree(work_root, ignore_errors=True)
-    print(f"\nDONE: {n_pass}/{len(rows)} pass canonical duplication check")
-    print(f"  (A and B flanks forward-aligned at >= {args.min_flank_cov} cov, "
-          f">= 2 DNA copies forward, both IS-flanked)")
+    print(f"\nDONE: {n_pass}/{n_assessed} assessed candidates pass the canonical duplication "
+          f"check; NOT assessed (no row): {dict(n_skip)}")
+    print("  (one flank present at >= 2 places on one contig and strand with an IS "
+          "copy between them, the other flank present once)")
     print(f"Wrote {out_path}")
 
 

@@ -168,7 +168,7 @@ def is_positions(seq):
     return sorted(out)
 
 
-def run_dup(ref, s0, strand, tgt_seq):
+def run_dup(ref, s0, strand, tgt_seq, canonical=False):
     with tempfile.TemporaryDirectory() as wd:
         src = os.path.join(wd, "src"); os.makedirs(src)
         with open(os.path.join(src, "GCA_000000001.1.fa"), "w") as f:
@@ -203,6 +203,19 @@ def run_dup(ref, s0, strand, tgt_seq):
             f.write("category\tref_id\tassembly\tdetails\tbest_side\n")
             f.write(f"duplication\tGCA_000000001.1|c1_1\tGCA_000000002.1\t{det}\t{best_side}\n")
         out = os.path.join(wd, "out")
+        if canonical:
+            c2 = os.path.join(wd, "strict.tsv")
+            with open(c2, "w") as f:
+                f.write("species\tref_id\ttgt_asm\n")
+                f.write("test_species\tGCA_000000001.1|c1_1\tGCA_000000002.1\n")
+            subprocess.run([sys.executable,
+                            os.path.join(SCRIPTS, "duplication_strict_canonical_check.py"),
+                            "--candidates", c2, "--dup-all-input", cand, "--records", rp,
+                            "--is-hits", ih, "--src-dir", src, "--out", out, "--threads", "2"],
+                           check=True, stdout=subprocess.DEVNULL)
+            rows = list(csv.DictReader(open(os.path.join(out, "duplication_canonical_check.tsv")),
+                                       delimiter="\t"))
+            return rows[0] if rows else {"canonical_pass": "NA"}
         subprocess.run([sys.executable, os.path.join(SCRIPTS, "is_duplication_check.py"),
                         "--candidates", cand, "--records", rp, "--src-dir", src,
                         "--is-hits", ih, "--out", out, "--threads", "2"],
@@ -233,6 +246,10 @@ def test_duplication_check():
             assert row["passes"] == want, (strand, name, row)
             print(f"PASS duplication check, element strand {strand}: {name} -> {row['passes']} "
                   f"(dup_bp={row['dup_bp']})")
+            crow = run_dup(ref, s0, strand, tgt, canonical=True)
+            assert crow["canonical_pass"] == want, (strand, name, crow)
+            print(f"PASS canonical check,   element strand {strand}: {name} -> "
+                  f"{crow['canonical_pass']}")
 
 
 MAUVE = os.path.expanduser("~/.conda/envs/mauve-env/bin/progressiveMauve")
