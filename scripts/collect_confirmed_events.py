@@ -27,14 +27,19 @@ from collections import defaultdict
 
 import pysam
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import lib_rearr as lr  # noqa: E402
+
 
 CONFIRMED = {
     "inversion_only":     {"CONFIRMED_BOTH"},
-    "duplication":        {"CONFIRMED_DNADIFF", "CONFIRMED_BOTH"},
+    # CONFIRMED_DNADIFF (any dnadiff insertion in the window) is no longer a
+    # confirmation: see validate_rearrangements_gold.py
+    "duplication":        {"CONFIRMED_BOTH"},
     "translocation_only": {"CONFIRMED_BOTH"},   # already excludes contig-break artifacts
 }
 SVTYPE = {"inversion_only": "INV", "duplication": "DUP",
-          "translocation_only": "BND"}
+          "translocation_only": "TRA"}
 EVENT_PREFIX = {"inversion_only": "INV", "duplication": "DUP",
                 "translocation_only": "TRANSLOC"}
 
@@ -88,10 +93,8 @@ def load_examples_details(tsv):
 
 
 def anchor_targets(details):
-    out = []
-    for m in re.finditer(r"([\w.|]+):(\d+)-(\d+)", details):
-        out.append((m.group(1), int(m.group(2)), int(m.group(3))))
-    return out
+    d = lr.parse_details(details)
+    return [(c, s0, e0) for c, s0, e0, st in d["up"] + d["down"]]
 
 
 def decompress_assembly(src_dir, asm, work):
@@ -130,20 +133,21 @@ def write_vcf_header(fh, contigs, species):
     fh.write(f"##species={species}\n")
     fh.write("##ALT=<ID=INV,Description=\"Inversion\">\n")
     fh.write("##ALT=<ID=DUP,Description=\"Duplication\">\n")
-    fh.write("##ALT=<ID=BND,Description=\"Translocation breakend\">\n")
+    fh.write("##ALT=<ID=TRA,Description=\"Translocation: the two flanks of the element lie on different target contigs\">\n")
     fh.write("##INFO=<ID=SVTYPE,Number=1,Type=String,Description=\"Type of structural variant\">\n")
-    fh.write("##INFO=<ID=END,Number=1,Type=Integer,Description=\"End position of the SV\">\n")
-    fh.write("##INFO=<ID=SVLEN,Number=1,Type=Integer,Description=\"Length of the SV\">\n")
+    fh.write("##INFO=<ID=IMPRECISE,Number=0,Type=Flag,Description=\"POS is the first base of the IS element at which the target genome is rearranged; the breakpoints of the rearrangement are not resolved\">\n")
+    fh.write("##INFO=<ID=IS_END,Number=1,Type=Integer,Description=\"Last base of the IS element (1-based)\">\n")
+    fh.write("##INFO=<ID=IS_STRAND,Number=1,Type=String,Description=\"Transposase strand\">\n")
+    fh.write("##INFO=<ID=TGT_ANCHORS,Number=.,Type=String,Description=\"Anchor hit positions in the target assembly (contig:start-end, 1-based)\">\n")
+    fh.write("##INFO=<ID=VAL_METRIC,Number=1,Type=String,Description=\"Second-evidence metric from validate_rearrangements_gold.py\">\n")
     fh.write("##INFO=<ID=IS_MEDIATED,Number=0,Type=Flag,Description=\"Event is IS-element-mediated\">\n")
     fh.write("##INFO=<ID=IS_FAMILY,Number=1,Type=String,Description=\"IS element family\">\n")
     fh.write("##INFO=<ID=REF_ID,Number=1,Type=String,Description=\"Cross_reference_IS pipeline ref_id\">\n")
     fh.write("##INFO=<ID=TGT_ASM,Number=1,Type=String,Description=\"Target assembly accession\">\n")
     fh.write("##INFO=<ID=VAL_DNADIFF,Number=1,Type=String,Description=\"MUMmer dnadiff verdict\">\n")
     fh.write("##INFO=<ID=VAL_MAUVE,Number=1,Type=String,Description=\"progressiveMauve verdict\">\n")
-    fh.write("##INFO=<ID=MAUVE_METRIC,Number=1,Type=String,Description=\"Mauve LCB metric\">\n")
     fh.write("##INFO=<ID=MIN_ANCHOR_END_DIST,Number=1,Type=Integer,Description=\"Min bp from anchor to target contig end\">\n")
     fh.write("##INFO=<ID=CONFIRMED_BY,Number=.,Type=String,Description=\"Gold-standard tool(s) that independently confirmed this event\">\n")
-    fh.write("##INFO=<ID=MATEID,Number=1,Type=String,Description=\"Mate breakend ID (BND only)\">\n")
     fh.write("##FILTER=<ID=PASS,Description=\"Confirmed by both gold-standard tools (or dnadiff-only for DUP)\">\n")
     for name, length in contigs:
         fh.write(f"##contig=<ID={name},length={length}>\n")
@@ -162,6 +166,15 @@ def collect_for_species(sp, args, out_root):
 
     ref_loci = load_ref_loci(rec_json)
     details_by = load_examples_details(ex_tsv)
+    # the examples file holds 50 rows per category; validation.tsv may have
+    # been made from the uncapped *_all.tsv files, whose events then had no
+    # details -> empty evidence and no VCF record
+    for extra in ("rearrangements_inversion_all.tsv", "rearrangements_duplication_all.tsv",
+                  "rearrangements_translocation_all.tsv"):
+        pth = os.path.join(sp_dir, extra)
+        if os.path.exists(pth):
+            for k, v in load_examples_details(pth).items():
+                details_by.setdefault(k, v)
 
     sp_out = os.path.join(out_root, sp)
     os.makedirs(sp_out, exist_ok=True)
@@ -171,13 +184,15 @@ def collect_for_species(sp, args, out_root):
     rows = list(csv.DictReader(open(val_tsv), delimiter="\t"))
     confirmed = [r for r in rows if r["verdict"] in CONFIRMED.get(r["category"], set())]
     print(f"  {sp}: {len(confirmed)} confirmed of {len(rows)} validated", file=sys.stderr)
-    if not confirmed:
-        return {"species": sp, "n_confirmed": 0, "n_validated": len(rows)}
+    # no early return: the per-species files are always rewritten, so the
+    # combined tables can never pick up a stale file from an earlier run
+    skipped = defaultdict(int)
 
     src_dir = os.path.join(args.src, sp)
     work = tempfile.mkdtemp(prefix=f"collect_{sp}_", dir=out_root)
 
     flat = []
+    contig_len = {}
     vcf_records = []
     cache_fa = {}
 
@@ -196,10 +211,16 @@ def collect_for_species(sp, args, out_root):
         ref_id = r["ref_id"]; ref_asm = r["ref_asm"]; tgt_asm = r["tgt_asm"]
         locus = ref_loci.get(ref_id)
         if not locus:
+            skipped["ref_id not in records"] += 1
             continue
         details = details_by.get((cat, ref_id, tgt_asm), "")
         anchors = anchor_targets(details)
-        event_id = f"{EVENT_PREFIX[cat]}_{idx:04d}"
+        if not anchors:
+            skipped["no anchor details for this event"] += 1
+            continue
+        # species in the ID: INV_0001 used to exist once per species in the
+        # combined table
+        event_id = f"{sp}_{EVENT_PREFIX[cat]}_{idx:04d}"
 
         # --- per-event evidence pack ---
         ev = os.path.join(ev_dir, event_id)
@@ -207,12 +228,16 @@ def collect_for_species(sp, args, out_root):
         ref_fa_obj = open_asm(ref_asm)
         qry_fa_obj = open_asm(tgt_asm)
         if not ref_fa_obj or not qry_fa_obj:
+            skipped["assembly FASTA not found"] += 1
+            shutil.rmtree(ev, ignore_errors=True)
             continue
         ref_region_fa = os.path.join(ev, "ref_locus.fa")
         with open(ref_region_fa, "w") as fh:
             ref_span = extract_region(ref_fa_obj, locus["contig"], locus["start"],
                                       locus["end"], args.locus_window, "REF_LOCUS", fh)
         if not ref_span:
+            skipped["reference region not extractable"] += 1
+            shutil.rmtree(ev, ignore_errors=True)
             continue
         qry_region_fa = os.path.join(ev, "target_region.fa")
         anchor_records = []
@@ -293,36 +318,36 @@ def collect_for_species(sp, args, out_root):
             json.dump(ev_meta, f, indent=2)
 
         # --- VCF record ---
-        sv_chrom = locus["contig"]
-        sv_pos = locus["start"]
-        sv_end = locus["end"]
-        sv_len = sv_end - sv_pos
-        # tools that backed this event (one per "YES" verdict)
+        # What is known is WHERE THE ELEMENT IS in the reference assembly and
+        # that the target genome is rearranged there. The breakpoints of the
+        # rearrangement itself are not resolved here, so the record is
+        # IMPRECISE and carries no END/SVLEN. It used to be written as a
+        # precise <INV>/<DUP> spanning exactly the IS element (a ~1.3 kb
+        # "inversion" with SVLEN one short), and translocations as two BND
+        # records that were not valid mates.
+        sv_chrom = f"{ref_asm}|{locus['contig']}"
+        sv_pos = locus["start"]                       # 1-based first base of the element
+        try:
+            ref_base = ref_fa_obj.fetch(locus["contig"], sv_pos - 1, sv_pos).upper() or "N"
+        except (KeyError, ValueError):
+            ref_base = "N"
         _cby = []
-        if r.get("dnadiff") == "YES": _cby.append("MUMmer4_dnadiff_v4.0.1")
-        if r.get("mauve")   == "YES": _cby.append("progressiveMauve_v2.4.0")
+        if r.get("dnadiff") == "YES": _cby.append("MUMmer4_dnadiff")
+        if r.get("mauve")   == "YES": _cby.append("progressiveMauve")
         cby_vcf = ",".join(_cby) if _cby else "."
-
-        info_common = (f"IS_MEDIATED;IS_FAMILY=IS110;REF_ID={ref_id};"
-                       f"TGT_ASM={tgt_asm};VAL_DNADIFF={r.get('dnadiff','')};"
-                       f"VAL_MAUVE={r.get('mauve','')};"
-                       f"MAUVE_METRIC={r.get('mauve_metric','')};"
-                       f"MIN_ANCHOR_END_DIST={r.get('min_anchor_end_dist','')};"
-                       f"CONFIRMED_BY={cby_vcf}")
-
-        if cat == "translocation_only":
-            # paired BND records, MATEID links them
-            for bi, (c, s, e) in enumerate(anchors[:2]):
-                m_id = f"{event_id}_BND_{bi+1}"
-                mate = f"{event_id}_BND_{2-bi}"
-                alt = f"N[{c}:{s}["  # generic breakend; direction simplified
-                info = (f"SVTYPE=BND;{info_common};MATEID={mate}")
-                vcf_records.append((sv_chrom, sv_pos + bi, m_id, "N", alt, ".", "PASS", info))
-        else:
-            vid = event_id
-            alt = f"<{SVTYPE[cat]}>"
-            info = (f"SVTYPE={SVTYPE[cat]};END={sv_end};SVLEN={sv_len};{info_common}")
-            vcf_records.append((sv_chrom, sv_pos, vid, "N", alt, ".", "PASS", info))
+        clean = lambda v: (str(v) if v not in (None, "") else ".").replace("=", ":").replace(";", ",")  # noqa: E731
+        tgt_pos = ",".join(f"{a['contig']}:{a['anchor_start'] + 1}-{a['anchor_end']}"
+                           for a in anchor_records) or "."
+        info = (f"IMPRECISE;SVTYPE={SVTYPE[cat]};IS_END={locus['end']};IS_STRAND={locus['strand']};"
+                f"IS_MEDIATED;IS_FAMILY=IS110;REF_ID={ref_id};TGT_ASM={tgt_asm};"
+                f"TGT_ANCHORS={tgt_pos};VAL_DNADIFF={clean(r.get('dnadiff'))};"
+                f"VAL_MAUVE={clean(r.get('mauve'))};"
+                f"VAL_METRIC={clean(r.get('mauve_metric'))};"
+                f"MIN_ANCHOR_END_DIST={clean(r.get('min_anchor_end_dist'))};"
+                f"CONFIRMED_BY={cby_vcf}")
+        vcf_records.append((sv_chrom, sv_pos, event_id, ref_base, f"<{SVTYPE[cat]}>",
+                            ".", "PASS", info))
+        contig_len[sv_chrom] = ref_fa_obj.get_reference_length(locus["contig"])
 
         # which gold-standard tools backed this event
         confirmed_by = []
@@ -352,7 +377,7 @@ def collect_for_species(sp, args, out_root):
 
     # --- write outputs for this species ---
     # contigs touched (for VCF header)
-    contigs = sorted({(r[0], 0) for r in vcf_records})
+    contigs = sorted(contig_len.items())
     vcf_path = os.path.join(sp_out, "confirmed.vcf")
     with open(vcf_path, "w") as fh:
         write_vcf_header(fh, contigs, sp)
@@ -360,12 +385,17 @@ def collect_for_species(sp, args, out_root):
             fh.write("\t".join(str(x) for x in rec) + "\n")
 
     tsv_path = os.path.join(sp_out, "confirmed.tsv")
-    if flat:
-        with open(tsv_path, "w") as fh:
-            cols = list(flat[0].keys())
-            fh.write("\t".join(cols) + "\n")
-            for row in flat:
-                fh.write("\t".join(str(row[c]) for c in cols) + "\n")
+    cols = ["event_id", "species", "category", "svtype", "ref_id", "ref_asm", "tgt_asm",
+            "is_contig", "is_start", "is_end", "is_strand", "target_anchor_contigs",
+            "n_target_contigs", "val_dnadiff", "val_mauve", "mauve_metric",
+            "min_anchor_end_dist_bp", "verdict", "confirmed_by_software", "evidence_dir"]
+    with open(tsv_path, "w") as fh:
+        fh.write("\t".join(cols) + "\n")
+        for row in flat:
+            fh.write("\t".join(str(row[c]) for c in cols) + "\n")
+    if skipped:
+        print(f"  {sp}: {sum(skipped.values())} confirmed events NOT written: "
+              f"{dict(skipped)}", file=sys.stderr)
 
     # close pysam handles + cleanup tmp
     for k, v in cache_fa.items():
@@ -374,6 +404,8 @@ def collect_for_species(sp, args, out_root):
     shutil.rmtree(work, ignore_errors=True)
 
     return {"species": sp, "n_confirmed": len(flat), "n_validated": len(rows),
+            "n_confirmed_in_validation": len(confirmed),
+            "n_skipped": sum(skipped.values()),
             "by_category": {cat: sum(1 for r in flat if r["category"] == cat)
                             for cat in CONFIRMED}}
 
@@ -407,9 +439,17 @@ def main():
     all_vcf = os.path.join(args.out, "all_confirmed.vcf")
     all_tsv = os.path.join(args.out, "all_confirmed.tsv")
     with open(all_vcf, "w") as fout:
-        fout.write("##fileformat=VCFv4.3\n")
-        fout.write("##source=Cross_reference_IS pipeline (dnadiff+progressiveMauve)\n")
-        fout.write("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n")
+        # full header (INFO/ALT/contig lines): with the bare three-line
+        # header parsers read every INFO field as an untyped string
+        all_contigs = {}
+        for s_ in summary:
+            spv = os.path.join(args.out, s_["species"], "confirmed.vcf")
+            if os.path.exists(spv):
+                for line in open(spv):
+                    if line.startswith("##contig=<ID="):
+                        nm, ln = line[len("##contig=<ID="):].rstrip(">\n").rsplit(",length=", 1)
+                        all_contigs[nm] = int(ln)
+        write_vcf_header(fout, sorted(all_contigs.items()), "all")
         for s in summary:
             sp = s["species"]
             spv = os.path.join(args.out, sp, "confirmed.vcf")
