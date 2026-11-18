@@ -24,6 +24,37 @@ Usage:
 """
 import argparse, csv, json, os
 from collections import defaultdict
+import os, sys
+
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import lib_rearr as lr  # noqa: E402
+from lib_alleles import assembly_core  # noqa: E402
+
+
+def event_key(row, bin_bp=2000):
+    """One key per EVENT in a target genome: (assembly core, contigs, the two
+    anchor positions rounded to `bin_bp`). The same inversion/translocation is
+    reached from IS_a and from IS_b, from every reference strain that carries
+    the element, and from contig/scaffold twins -- all of which used to count
+    as separate 'unique IS loci'."""
+    d = lr.parse_details(row.get("details", ""))
+    pts = sorted((c, round(s / bin_bp)) for c, s, e, st in d["up"][:1] + d["down"][:1])
+    return (assembly_core(row["assembly"]),) + tuple(pts)
+
+
+def write_events(rows_by_ref, path):
+    """rows_by_ref: {ref_id: [rows]} -> events table; returns {event: [ref_ids]}."""
+    ev = defaultdict(set)
+    for ref_id, rows in rows_by_ref.items():
+        for r in rows:
+            ev[event_key(r)].add(ref_id)
+    with open(path, "w") as fh:
+        fh.write("target_assembly_core\tanchor_positions\tn_ref_ids\tref_ids\n")
+        for k in sorted(ev):
+            pos = ";".join(f"{c}:~{b * 2000}" for c, b in k[1:])
+            fh.write(f"{k[0]}\t{pos}\t{len(ev[k])}\t{','.join(sorted(ev[k]))}\n")
+    return ev
 
 
 def parse_args():
@@ -48,6 +79,7 @@ def main():
             if t:
                 complete.add(t)
     print(f"complete-target set: {len(complete):,} assemblies")
+    complete_cores = {assembly_core(t) for t in complete}
 
     by_ref = defaultdict(list)
     n_in = 0
@@ -57,7 +89,8 @@ def main():
         rd = csv.DictReader(f, delimiter="\t")
         for row in rd:
             n_in += 1
-            if row["assembly"] not in complete:
+            # by assembly core: the list may name the GCA twin of a GCF target
+            if assembly_core(row["assembly"]) not in complete_cores:
                 continue
             n_after_complete += 1
             try:
@@ -73,7 +106,10 @@ def main():
     print(f"input rows:                              {n_in:,}")
     print(f"after complete-target filter:            {n_after_complete:,}")
     print(f"after depth filter (>= {args.min_anchor_depth}):  {n_after_depth:,}")
-    print(f"unique IS loci (groups):                 {len(by_ref):,}")
+    ev_path = os.path.splitext(args.out)[0] + "_events.tsv"
+    ev = write_events(by_ref, ev_path)
+    print(f"reference IS loci with a candidate:      {len(by_ref):,}   (NOT a count of events)")
+    print(f"distinct target events:                  {len(ev):,}   -> {ev_path}")
 
     out_cols = ["category", "ref_id", "assembly", "up_contigs", "down_contigs",
                 "details", "min_anchor_depth", "up_contig_len", "down_contig_len",
@@ -82,8 +118,8 @@ def main():
     full = {}
     with open(args.out, "w") as fh:
         fh.write("\t".join(out_cols) + "\n")
-        for ref_id, rows in by_ref.items():
-            rows.sort(key=lambda r: -r["_depth"])
+        for ref_id, rows in sorted(by_ref.items()):
+            rows.sort(key=lambda r: (-r["_depth"], r["assembly"]))
             rep = rows[0]
             n_pairs += len(rows)
             support_compact = ";".join(f"{r['assembly']}:{r['_depth']}" for r in rows)
@@ -110,7 +146,7 @@ def main():
                     } for r in rows
                 ],
             }
-    side = args.out.replace(".tsv", "_supporting.json")
+    side = os.path.splitext(args.out)[0] + "_supporting.json"
     with open(side, "w") as f:
         json.dump(full, f, indent=2)
 

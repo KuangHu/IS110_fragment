@@ -94,8 +94,13 @@ def align(query_seq, target_seq, work, threads, extra=()):
             fh.write(f">q\n{query_seq}\n")
         with open(t, "w") as fh:
             fh.write(f">t\n{target_seq}\n")
+        # --no-long-join -r 500: do not bridge large indels. asm10 otherwise
+        # joins across a 13 kb insertion into ONE block whose column identity
+        # (82%) fails every threshold, and a duplicated segment never shows up
+        # as two blocks. Split blocks + union coverage handle both.
         res = subprocess.run(["minimap2", "-x", "asm10", "-c", "--eqx", "-p", "0.1",
-                              "-N", "50", "-t", str(threads), *extra, t, q],
+                              "-N", "50", "--no-long-join", "-r", "500",
+                              "-t", str(threads), *extra, t, q],
                              check=True, capture_output=True, text=True)
         out = []
         for line in res.stdout.splitlines():

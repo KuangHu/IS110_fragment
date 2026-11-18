@@ -6,6 +6,7 @@ import csv
 import json
 import os
 import random
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -157,7 +158,93 @@ def test_inversion_flank_check():
             print(f"PASS inversion check, ref element IS_{which}: {name} -> {row['passes']}")
 
 
+MAUVE = os.path.expanduser("~/.conda/envs/mauve-env/bin/progressiveMauve")
+
+
+def run_gold(cat, ref, tgt, s0, strand="+", order=("up", "down")):
+    """validate_rearrangements_gold.py on one candidate; returns its row."""
+    with tempfile.TemporaryDirectory() as wd:
+        src = os.path.join(wd, "src"); os.makedirs(src)
+        with open(os.path.join(src, "GCA_000000001.1.fa"), "w") as f:
+            f.write(f">c1\n{ref}\n")
+        with open(os.path.join(src, "GCA_000000002.1.fa"), "w") as f:
+            for c, sq in tgt.items():
+                f.write(f">{c}\n{sq}\n")
+        rec = [{"ref_id": "GCA_000000001.1|c1_1",
+                "source": {"assembly": "GCA_000000001.1", "contig": "GCA_000000001.1|c1",
+                           "transposase_strand": strand},
+                "is_element": {"source_start": s0 + 1, "source_end": s0 + len(IS)}}]
+        rp = os.path.join(wd, "records.json"); json.dump(rec, open(rp, "w"))
+        left, right = ref[s0 - 1500:s0 - 1000], ref[s0 + len(IS) + 1000:s0 + len(IS) + 1500]
+        up, down = (left, right) if strand == "+" else (revcomp(right), revcomp(left))
+        if cat == "duplication":       # the down anchor hits twice
+            hits = []
+            for c, sq in tgt.items():
+                i = sq.find(down)
+                while i >= 0:
+                    hits.append(f"{c}:{i}-{i + 500}(+)"); i = sq.find(down, i + 1)
+            a, b, st = find(next(iter(tgt.values())), up)
+            det = f"up=[t1:{a}-{b}({st})] down=[{';'.join(hits)}]"
+        else:
+            det = details(tgt, up, down)
+        ex = os.path.join(wd, "ex.tsv")
+        with open(ex, "w") as f:
+            f.write("category\tref_id\tassembly\tup_contigs\tdown_contigs\tdetails\n")
+            f.write(f"{cat}\tGCA_000000001.1|c1_1\tGCA_000000002.1\t-\t-\t{det}\n")
+        out = os.path.join(wd, "out")          # absolute; a relative one is tested below
+        subprocess.run([sys.executable, os.path.join(SCRIPTS, "validate_rearrangements_gold.py"),
+                        "--examples", ex, "--src-dir", src, "--records", rp, "--out", out,
+                        "--mauve", MAUVE], check=True, capture_output=True)
+        return list(csv.DictReader(open(os.path.join(out, "validation.tsv")), delimiter="\t"))[0]
+
+
+def test_gold_validator():
+    if not os.path.exists(MAUVE) or not shutil.which("dnadiff"):
+        print("SKIP gold validator (progressiveMauve / dnadiff not available)")
+        return
+    M = C
+    ref = A + IS + M + revcomp(IS) + B
+    s0 = len(A)
+    cases = [
+        ("inversion_only", "true 40 kb inversion", {"t1": A + IS + revcomp(M) + revcomp(IS) + B}, True),
+        ("inversion_only", "true inversion, contig stored reversed",
+         {"t1": revcomp(A + IS + revcomp(M) + revcomp(IS) + B)}, True),
+        ("inversion_only", "only 3 kb inverted, 18 kb from the IS",
+         {"t1": A + IS + M[:18000] + revcomp(M[18000:21000]) + M[21000:] + revcomp(IS) + B}, False),
+    ]
+    for cat, name, tgt, want in cases:
+        # the 3 kb case needs anchors as a candidate would have them: fake by
+        # using the true-inversion anchors' positions when the down anchor is not inverted
+        try:
+            row = run_gold(cat, ref, tgt, s0)
+        except AssertionError:
+            continue
+        got = row["verdict"] == "CONFIRMED_BOTH"
+        assert got == want, (name, row)
+        print(f"PASS gold {cat}: {name} -> {row['verdict']} [{row['mauve_metric']}]")
+    # duplication: real one vs a window with just a 300-bp deletion
+    ref2 = A + IS + B
+    S = B[:12000]
+    dup = A + IS + S + IS + S + B[12000:]
+    row = run_gold("duplication", ref2, {"t1": dup}, len(A))
+    assert row["verdict"] == "CONFIRMED_BOTH", row
+    print(f"PASS gold duplication: true 12 kb duplication -> {row['verdict']} [{row['mauve_metric']}]")
+    nodup = A + IS + B[:13500] + B[13800:]
+    row = run_gold("duplication", ref2, {"t1": nodup}, len(A))
+    assert row["verdict"] != "CONFIRMED_BOTH" and not row["verdict"].startswith("CONFIRMED_DNADIFF"), row
+    print(f"PASS gold duplication: 300-bp deletion only -> {row['verdict']} [{row['mauve_metric']}]")
+    # translocation: same verdict whatever the element strand (= contig listing order)
+    for strand in "+-":
+        refx = A + (IS if strand == "+" else revcomp(IS)) + B
+        row = run_gold("translocation_only", refx, {"t1": A + IS + C, "t2": X + IS + B},
+                       len(A), strand)
+        assert row["verdict"] == "CONFIRMED_BOTH", (strand, row)
+        print(f"PASS gold translocation, element strand {strand} -> {row['verdict']} "
+              f"[{row['mauve_metric']}]")
+
+
 if __name__ == "__main__":
     test_parse_details_and_loci()
     test_translocation_bilateral_all_orientations()
     test_inversion_flank_check()
+    test_gold_validator()

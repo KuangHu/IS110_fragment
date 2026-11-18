@@ -138,11 +138,14 @@ def best_forward_block(ref_index_fa, query_fa, work, threads):
         for line in fh:
             c = line.split("\t")
             if len(c) < 12: continue
-            if c[4] != "+": continue
+            # either strand: the reference contig may be stored in the other
+            # orientation ('+' only gave no alignment at all in that case)
             matches, block_len = int(c[9]), int(c[10])
             ident = matches / block_len * 100 if block_len > 0 else 0
-            if best is None or block_len > best[4]:
-                best = (c[0], c[5], int(c[7]), int(c[8]), block_len, ident)
+            span = int(c[3]) - int(c[2])
+            if best is None or span > best[4]:
+                best = (c[0], c[5], int(c[7]), int(c[8]), span, ident,
+                        c[4], int(c[1]), int(c[2]), int(c[3]))
     return best
 
 
@@ -195,6 +198,8 @@ def main():
     n_one_is_adjacent  = 0
     n_both_align       = 0  # both C and X align to ref at ≥thresh, regardless of IS adjacency
     n_neither_align    = 0
+    from collections import Counter
+    n_skip = Counter()
 
     with open(out_path, "w") as out:
         out.write("species\tref_id\ttgt_asm\tC_block_bp\tC_ident\tC_align_pos\tC_dist_to_is\t"
@@ -207,7 +212,8 @@ def main():
             ref_id  = r['ref_id']
             tgt_asm = r['tgt_asm']
             details = tier3a_details.get((ref_id, tgt_asm), '')
-            if not details: continue
+            if not details:
+                n_skip["no details for ref+target"] += 1; continue
             ups   = parse_anchors_block(details, "up")
             downs = parse_anchors_block(details, "down")
             if not ups or not downs: continue
@@ -218,7 +224,8 @@ def main():
             ref_asm = ref_id.split("|")[0]
             ref_path, ref_fa = open_asm(species, ref_asm)
             _, tgt_fa = open_asm(species, tgt_asm)
-            if not ref_fa or not tgt_fa: continue
+            if not ref_fa or not tgt_fa:
+                n_skip["assembly FASTA not found"] += 1; continue
 
             # Find IS_tgt_1 near up_anchor, IS_tgt_2 near down_anchor
             tgt_is_at_up   = find_nearest_is(merge_is(ih[tgt_asm].get(up_c, [])),
@@ -226,6 +233,7 @@ def main():
             tgt_is_at_down = find_nearest_is(merge_is(ih[tgt_asm].get(down_c, [])),
                                               (down_s + down_e) // 2, max_dist=5000)
             if tgt_is_at_up is None or tgt_is_at_down is None:
+                n_skip["no IS within 5 kb of an anchor in the target"] += 1
                 continue
 
             # C = 30 kb DOWNSTREAM of IS_tgt_1 (= away from the up_anchor side of IS_tgt_1)
@@ -234,6 +242,7 @@ def main():
             # the up_anchor sits NEAR IS_tgt_1; we need the OPPOSITE side of IS_tgt_1 — i.e., the side
             # away from up_anchor — which carries C.
             up_anchor_mid = (up_s + up_e) // 2
+            C_prox_start = up_anchor_mid < tgt_is_at_up[0]   # C's IS-proximal end = its start
             if up_anchor_mid < tgt_is_at_up[0]:
                 # up_anchor is upstream of IS_tgt_1 → C = downstream of IS_tgt_1
                 C_s = tgt_is_at_up[1]
@@ -243,6 +252,7 @@ def main():
                 C_e = tgt_is_at_up[0]
                 C_s = max(0, C_e - args.proxy_window)
             down_anchor_mid = (down_s + down_e) // 2
+            X_prox_start = not (down_anchor_mid > tgt_is_at_down[1])
             if down_anchor_mid > tgt_is_at_down[1]:
                 # down_anchor is downstream of IS_tgt_2 → X = upstream of IS_tgt_2
                 X_e = tgt_is_at_down[0]
@@ -267,19 +277,17 @@ def main():
             if X_seq: write_fasta("TGT_X", X_seq, X_path)
 
             C_block = X_block = None
-            try:
-                if C_seq:
-                    C_block = best_forward_block(ref_path, C_path, work, args.threads)
-                if X_seq:
-                    X_block = best_forward_block(ref_path, X_path, work, args.threads)
-            except Exception:
-                pass
+            # no try/except: a minimap2 failure must not read as "does not align"
+            if C_seq:
+                C_block = best_forward_block(ref_path, C_path, work, args.threads)
+            if X_seq:
+                X_block = best_forward_block(ref_path, X_path, work, args.threads)
 
             ref_is_full = ih.get(ref_asm, {})
 
-            def block_summary(blk, ref_len):
+            def block_summary(blk, seq_len, prox_start):
                 if blk is None: return (0, 0.0, "", 999999, False, False)
-                qname, tname, ts, te, bp, ident = blk
+                qname, tname, ts, te, bp, ident, bstrand, qlen, qs, qe = blk
                 # local contig name for IS lookup
                 contig_full = tname
                 hits = merge_is(ref_is_full.get(contig_full, []))
@@ -289,14 +297,25 @@ def main():
                     hits = merge_is(ref_is_full.get(local, []))
                 if not hits and not tname.startswith(ref_asm + "|"):
                     hits = merge_is(ref_is_full.get(f"{ref_asm}|{tname}", []))
-                aligns = (bp >= min_block_bp and ident >= args.min_identity)
-                nis = find_nearest_is(hits, (ts + te) // 2, max_dist=args.is_tol)
+                # threshold on the real sequence length (it is clipped at
+                # contig ends), not on the nominal window
+                aligns = (bp >= args.min_block_cov * seq_len and ident >= args.min_identity)
+                # Where the IS-PROXIMAL end of C/X lands in the reference,
+                # projected through unaligned bases. The block MIDPOINT was
+                # used: a passing block is >= 24 kb long, so its midpoint is
+                # >= 12 kb from an IS abutting its end and a perfect
+                # reciprocal exchange could never be 'adjacent' (tol 10 kb).
+                if (bstrand == "+") == prox_start:
+                    prox = ts - (qs if bstrand == "+" else qlen - qe)
+                else:
+                    prox = te + ((qlen - qe) if bstrand == "+" else qs)
+                nis = find_nearest_is(hits, prox, max_dist=args.is_tol)
                 is_adj = nis is not None
                 d_to_is = nis[3] if nis else 999999
                 return (bp, ident, f"{tname}:{ts}-{te}", d_to_is, aligns, is_adj)
 
-            C_bp, C_id, C_pos, C_d, C_ok, C_isadj = block_summary(C_block, args.proxy_window)
-            X_bp, X_id, X_pos, X_d, X_ok, X_isadj = block_summary(X_block, args.proxy_window)
+            C_bp, C_id, C_pos, C_d, C_ok, C_isadj = block_summary(C_block, len(C_seq), C_prox_start)
+            X_bp, X_id, X_pos, X_d, X_ok, X_isadj = block_summary(X_block, len(X_seq), X_prox_start)
             both_isadj = (C_ok and C_isadj and X_ok and X_isadj)
 
             if C_ok and X_ok: n_both_align += 1
@@ -310,7 +329,8 @@ def main():
                       f"{C_ok}\t{X_ok}\t{C_isadj}\t{X_isadj}\t{both_isadj}\n")
             shutil.rmtree(work, ignore_errors=True)
 
-    print(f"\nDONE: reciprocal X-C scoring on {len(rows)} cases")
+    print(f"\nDONE: reciprocal X-C scoring on {len(rows)} cases; "
+          f"NOT scored (no output row): {dict(n_skip)}")
     print(f"  both C+X align to ref at >= {args.min_block_cov} cov / >= {args.min_identity}% ident: {n_both_align}")
     print(f"  both align AND both adjacent to a ref IS within {args.is_tol} bp: {n_both_is_adjacent}")
     print(f"  only one C/X is IS-adjacent: {n_one_is_adjacent}")

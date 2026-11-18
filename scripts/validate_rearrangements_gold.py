@@ -21,10 +21,23 @@ Usage:
       --src-dir /path/to/by_species/<species>/ --out validate/ \\
       --n-per-cat 10 --threads 8
 """
+# VERDICTS (changed 2026-11): CONFIRMED_BOTH needs dnadiff's class count AND
+#   inversion      Mauve: some-but-not-all LCBs inverted, >= --min-inverted-bp
+#                  of them adjacent to the element, target contigs first put
+#                  in reference orientation
+#   duplication    >= --min-dup-bp of the reference window (outside the IS)
+#                  aligned at two places in the target window
+#   translocation  both reference flanks follow their anchors (>= 80%) onto
+#                  the two contigs; anchors not at a contig end
+# CONFIRMED_DNADIFF is no longer produced.
 import argparse, gzip, json, os, re, shutil, subprocess, sys, tempfile
 from collections import defaultdict
 
 import pysam
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import lib_rearr as lr  # noqa: E402
+from lib_alleles import revcomp  # noqa: E402
 
 
 def parse_args():
@@ -45,6 +58,12 @@ def parse_args():
     p.add_argument("--bp-window", type=int, default=5000,
                    help="a translocation anchor within this many bp of its target "
                         "contig end is treated as a contig-break artifact (default 5000)")
+    p.add_argument("--min-inverted-bp", type=int, default=5000,
+                   help="inversion: inverted LCBs adjacent to the element must "
+                        "total at least this many bp (default 5000)")
+    p.add_argument("--min-dup-bp", type=int, default=1000,
+                   help="duplication: reference bp (outside the element) present at "
+                        ">= 2 places in the target window (default 1000)")
     p.add_argument("--threads", type=int, default=8)
     p.add_argument("--mauve", default="progressiveMauve",
                    help="progressiveMauve binary")
@@ -53,26 +72,13 @@ def parse_args():
 
 
 def load_ref_loci(records_path):
-    """ref_id -> (local_contig, start, end) of the IS element in its own assembly."""
-    loci = {}
-    with open(records_path) as f:
-        recs = json.load(f)
-    for r in recs:
-        rid = r.get("ref_id") or r.get("is110_id")
-        src = r.get("source", {})
-        ie = r.get("is_element", {})
-        contig = src.get("contig")
-        s = ie.get("source_start") or src.get("transposase_start")
-        e = ie.get("source_end") or src.get("transposase_end")
-        if rid and contig and s and e:
-            # DB contig is "<assembly>|<local_contig>"; strip the assembly prefix
-            local = contig.split("|", 1)[1] if "|" in contig else contig
-            loci[rid] = (local, int(s), int(e))
-    return loci
+    """ref_id -> (local_contig, start0, end, transposase strand)."""
+    return lr.load_loci(records_path)
 
 
-def extract_region(fa_obj, contig, start, end, window, label, out_handle):
-    """Write [start-window, end+window) of `contig` from an open pysam.FastaFile."""
+def extract_region(fa_obj, contig, start, end, window, label, out_handle, rc=False):
+    """Write [start-window, end+window) of `contig` from an open pysam.FastaFile
+    (reverse-complemented when rc)."""
     try:
         clen = fa_obj.get_reference_length(contig)
     except (KeyError, ValueError):
@@ -82,6 +88,8 @@ def extract_region(fa_obj, contig, start, end, window, label, out_handle):
     seq = fa_obj.fetch(contig, s, e)
     if not seq:
         return False
+    if rc:
+        seq = revcomp(seq.upper())
     out_handle.write(f">{label}\n")
     for i in range(0, len(seq), 80):
         out_handle.write(seq[i:i+80] + "\n")
@@ -110,7 +118,8 @@ def run_dnadiff(ref_fa, qry_fa, prefix):
                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     report = prefix + ".report"
     counts = {"Inversions": 0, "Relocations": 0, "Translocations": 0,
-              "Insertions": 0}
+              "Insertions": 0, "TandemIns": 0}
+    qry = dict.fromkeys(counts, 0)
     if os.path.exists(report):
         with open(report) as f:
             for line in f:
@@ -123,6 +132,13 @@ def run_dnadiff(ref_fa, qry_fa, prefix):
                     nums = [p for p in parts[1:] if re.match(r"^\d+", p)]
                     if nums:
                         counts[key] = int(re.match(r"^\d+", nums[0]).group())
+                    if len(nums) > 1:
+                        qry[key] = int(re.match(r"^\d+", nums[1]).group())
+    # A duplication in the TARGET is extra sequence in the query: dnadiff
+    # lists it in the QRY column (Insertions / TandemIns). Only the REF
+    # column was read, so the class that "confirmed" a duplication was
+    # extra sequence in the REFERENCE -- i.e. a deletion in the target.
+    counts["QryInsertions"] = qry["Insertions"] + qry["TandemIns"]
     return counts
 
 
@@ -172,6 +188,9 @@ def parse_xmfa_lcbs(xmfa):
 def run_mauve(mauve_bin, ref_fa, qry_fa, work):
     """Run progressiveMauve; analyse LCB structure for inversions / reordering.
     Returns dict {INV: n_inverted_lcbs, REARR: n_order_breaks, n_lcbs, ok} or {ok:False}."""
+    # absolute paths: Mauve runs with cwd=work, so a relative --out made
+    # every call fail -- and a failure was scored as "no signal"
+    work, ref_fa, qry_fa = map(os.path.abspath, (work, ref_fa, qry_fa))
     xmfa = os.path.join(work, "mauve.xmfa")
     try:
         subprocess.run([mauve_bin, f"--output={xmfa}", ref_fa, qry_fa],
@@ -187,31 +206,63 @@ def run_mauve(mauve_bin, ref_fa, qry_fa, work):
     if not shared:
         return {"ok": True, "INV": 0, "REARR": 0, "n_lcbs": 0}
     # inversion: opposite strand between the two genomes
-    n_inv = sum(1 for l in shared if l[1][2] != l[2][2])
+    inv = [l for l in shared if l[1][2] != l[2][2]]
+    n_inv = len(inv)
     # reordering: sort by genome-1 start; count discordances in genome-2 order
     order = sorted(shared, key=lambda l: l[1][0])
     g2_starts = [l[2][0] for l in order]
     n_breaks = sum(1 for i in range(1, len(g2_starts))
                    if g2_starts[i] < g2_starts[i - 1])
-    return {"ok": True, "INV": n_inv, "REARR": n_breaks, "n_lcbs": len(shared)}
+    return {"ok": True, "INV": n_inv, "REARR": n_breaks, "n_lcbs": len(shared),
+            # reference intervals (1-based, in the region FASTA) of inverted LCBs
+            "inv_ref": [(l[1][0], l[1][1]) for l in inv]}
 
 
 # class mapping per candidate category
 DNADIFF_CLASS = {"inversion_only": "Inversions",
                  "translocation_only": "Translocations",
-                 "duplication": "Insertions"}  # dup shows as ins/dup in dnadiff
+                 "duplication": "QryInsertions"}  # extra sequence in the target
 # progressiveMauve signal per category: which LCB-derived metric must be > 0
+# Translocation: the LCB ORDER metric (REARR) is not evidence. With only the
+# two anchor contigs in the query, a true A-IS-C / X-IS-B exchange is collinear
+# with the reference A-IS-B, and the count that did come out depended on which
+# contig was written first (i.e. on the strand of the reference element): the
+# same genome pair gave CONFIRMED_ONE or CONFIRMED_BOTH by listing order.
+# The second line of evidence is now the bilateral flank test.
 MAUVE_SIGNAL = {"inversion_only": "INV",
-                "translocation_only": "REARR",
-                "duplication": None}  # Mauve LCBs don't call duplication; dnadiff-only
+                "translocation_only": None,
+                "duplication": None}  # Mauve LCBs don't call duplication
+
+
+def duplicated_ref_bp(ref_seq, tgt_seq, mask, work, threads, min_block=1000, min_ident=95.0):
+    """bp of the reference region present at >= 2 non-overlapping places in the
+    target region, outside `mask` (the IS element itself -- IS copies are
+    expected to be repeated). This is the duplication; 'dnadiff reports an
+    insertion somewhere in the window' confirmed a 300-bp deletion 13 kb away
+    as a duplication."""
+    blocks = [b for b in lr.align(ref_seq, tgt_seq, work, threads)
+              if b["ident"] >= min_ident and b["qe"] - b["qs"] >= min_block]
+    events = []
+    for i, a in enumerate(blocks):
+        for b in blocks[i + 1:]:
+            if min(a["te"], b["te"]) - max(a["ts"], b["ts"]) > 0:
+                continue                      # same place in the target
+            s0, e0 = max(a["qs"], b["qs"]), min(a["qe"], b["qe"])
+            if e0 - s0 > 0:
+                events.append((s0, e0))
+    covered = lr.union_bp(events)
+    in_mask = lr.union_bp([(max(s0, mask[0]), min(e0, mask[1])) for s0, e0 in events
+                           if min(e0, mask[1]) > max(s0, mask[0])])
+    return covered - in_mask
 
 
 def anchor_targets(details):
     """Extract [(contig, start, end)] from the details string.
     Contig names may contain '|' (e.g. ENA|CM003196|CM003196.1)."""
     out = []
-    for m in re.finditer(r"([\w.|]+):(\d+)-(\d+)", details):
-        out.append((m.group(1), int(m.group(2)), int(m.group(3))))
+    d = lr.parse_details(details)
+    for c, s0, e0, st in d["up"] + d["down"]:
+        out.append((c, s0, e0))
     return out
 
 
@@ -273,10 +324,24 @@ def main():
             qry_region = os.path.join(work, "tgt_locus.fa")
             ref_fo = pysam.FastaFile(ref_asm_fa)
             qry_fo = pysam.FastaFile(qry_asm_fa)
-            ref_contig, rs, re_ = locus
+            ref_contig, rs, re_, tnp_strand = locus
             with open(ref_region, "w") as fh:
                 if not extract_region(ref_fo, ref_contig, rs, re_, W, "REF_LOCUS", fh):
                     rec["verdict"] = "REF_REGION_FAIL"; results.append(rec); continue
+            ref_off = max(0, rs - W)                 # region offset in the contig
+            det = lr.parse_details(details)
+            if not det["up"] or not det["down"]:
+                rec["verdict"] = "NO_ANCHOR_PAIR"; results.append(rec); continue
+            # Is each target contig stored in the same orientation as the
+            # reference? Anchors are in transposase orientation, so a collinear
+            # same-orientation contig has anchor strand == transposase strand.
+            # Each contig is written in REFERENCE orientation (by its first
+            # anchor), so "opposite strand" in the tools below means inverted
+            # relative to the flank, not "this contig happens to be stored
+            # reverse-complemented" (which scored as an inversion in Mauve).
+            orient = {}
+            for c_, s_, e_, st_ in det["up"] + det["down"]:
+                orient.setdefault(c_, st_ != tnp_strand)
             # target: the anchor contigs (dedup), each ±W around the anchor span
             anchors = anchor_targets(details)
             seen_c = {}
@@ -287,7 +352,8 @@ def main():
             with open(qry_region, "w") as fh:
                 ntc = 0
                 for contig, (s, e) in seen_c.items():
-                    if extract_region(qry_fo, contig, s, e, W, f"TGT_{contig}", fh):
+                    if extract_region(qry_fo, contig, s, e, W, f"TGT_{contig}", fh,
+                                      rc=orient.get(contig, False)):
                         ntc += 1
             rec["n_target_contigs"] = ntc
             if ntc == 0:
@@ -314,20 +380,57 @@ def main():
             rec["dnadiff"] = "YES" if dd_present else "no"
 
             # Tool 2: progressiveMauve (LCB structure) on the locus regions
-            mv = run_mauve(args.mauve, ref_region, qry_region, work)
             signal = MAUVE_SIGNAL.get(cat)
-            if not mv.get("ok"):
-                rec["mauve"] = "FAILED"
-            elif signal is None:
-                rec["mauve"] = "n/a"  # Mauve LCBs don't resolve duplication
-            else:
-                mval = mv.get(signal, 0)
-                rec["mauve_metric"] = f"{signal}={mval}/{mv.get('n_lcbs',0)}LCB"
-                rec["mauve"] = "YES" if mval > 0 else "no"
+            second_ok = None                    # second line of evidence
+            if signal == "INV":
+                mv = run_mauve(args.mauve, ref_region, qry_region, work)
+                if not mv.get("ok"):
+                    rec["mauve"] = "FAILED"
+                else:
+                    # An inversion: SOME but not all LCBs inverted (targets are
+                    # already in reference orientation), the inverted LCBs
+                    # abut the element, and they are not a small unrelated
+                    # inversion elsewhere in the window (any inversion of any
+                    # size anywhere in +/-30 kb used to confirm).
+                    is_a, is_b = rs - ref_off, re_ - ref_off
+                    adj = [(a, b) for a, b in mv["inv_ref"]
+                           if a <= is_b + 2000 + (re_ - rs) and b >= is_a - 2000 - (re_ - rs)]
+                    inv_bp = lr.union_bp(adj)
+                    partial = 0 < mv["INV"] < mv["n_lcbs"]
+                    rec["mauve_metric"] = (f"INV:{mv['INV']}/{mv['n_lcbs']}LCB;"
+                                           f"inv_bp_at_IS:{inv_bp}")
+                    second_ok = partial and inv_bp >= args.min_inverted_bp
+                    rec["mauve"] = "YES" if second_ok else "no"
+            elif cat == "duplication":
+                ref_seq = ref_fo.fetch(ref_contig, ref_off,
+                                       min(ref_fo.get_reference_length(ref_contig), re_ + W)).upper()
+                tgt_seq = "".join(
+                    qry_fo.fetch(c_, max(0, s_ - W),
+                                 min(qry_fo.get_reference_length(c_), e_ + W)).upper() + "N" * 200
+                    for c_, (s_, e_) in seen_c.items())
+                dup_bp = duplicated_ref_bp(ref_seq, tgt_seq, (rs - ref_off, re_ - ref_off),
+                                           work, args.threads)
+                rec["mauve_metric"] = f"dup_bp_outside_IS:{dup_bp}"
+                rec["mauve"] = "n/a"
+                second_ok = dup_bp >= args.min_dup_bp
+            elif cat == "translocation_only":
+                # bilateral flank test (see is_translocation_check.py)
+                pair = next(((u, w) for u in det["up"] for w in det["down"] if u[0] != w[0]), None)
+                rec["mauve"] = "n/a"
+                if pair is not None:
+                    A_seq, B_seq = lr.ref_proxies(ref_fo, ref_contig, rs, re_, tnp_strand, W)
+                    fr = []
+                    for prox, (c_, s_, e_, st_) in ((A_seq, pair[0]), (B_seq, pair[1])):
+                        t_, _ = lr.fetch_window(qry_fo, c_, s_, e_, W)
+                        fr.append(lr.strand_cover(lr.align(prox, t_, work, args.threads),
+                                                  st_, 95.0) / max(1, len(prox))
+                                  if len(prox) >= 1000 and t_ else 0.0)
+                    rec["mauve_metric"] = f"flank_cov:{fr[0]:.2f}/{fr[1]:.2f}"
+                    second_ok = min(fr) >= 0.8
 
             # verdict (duplication uses dnadiff only, since Mauve is n/a there)
             dd_ok = rec["dnadiff"] == "YES"
-            mv_ok = rec["mauve"] == "YES"
+            mv_ok = bool(second_ok)
             # translocations across 2 contigs are unresolvable when an anchor sits
             # within --bp-window of a contig end (= contig-break artifact, not a
             # confirmable rearrangement in a draft target)
@@ -335,8 +438,9 @@ def main():
                         and 0 <= rec.get("min_anchor_end_dist", -1) < args.bp_window)
             if artifact:
                 rec["verdict"] = "UNRESOLVABLE_CONTIG_BREAK"
-            elif signal is None:
-                rec["verdict"] = "CONFIRMED_DNADIFF" if dd_ok else "REJECTED"
+            elif rec["mauve"] == "FAILED":
+                # a tool failure is an error, not half a confirmation
+                rec["verdict"] = "ERROR:MAUVE"
             elif dd_ok and mv_ok:
                 rec["verdict"] = "CONFIRMED_BOTH"
             elif dd_ok or mv_ok:
