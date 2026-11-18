@@ -309,17 +309,23 @@ def main():
         # the clonal_V1 observation if available, otherwise from the matched blocks
         # of a sufficiently-covered insertion variant.
         # Easier: just record V_ref as a placeholder with length=v1_len and no seq.
-        if n_clonal > 0:
-            variants_raw["V_REF"] = {
-                "vid": "V_REF",
-                "seq": v_ref_seqs.get(v1_id, ""),
-                "len": v1_len,
-                "n_observations": n_clonal, "example_target": v1_id,
-                "v_ref_cov_pct": 100.0,
-            }
-
-        if not variants_raw and n_empty == 0:
+        # The reference element is a KNOWN state of this locus: it is the
+        # comparison step of the series whether or not another genome carries
+        # it. Its n_observations counts OTHER genomes only (the source genome
+        # is not an observation), so it can be 0. Tying the step to
+        # n_clonal > 0 erased the whole lineage of an element whose only
+        # other observation is a longer variant, once the source genome
+        # stopped counting as a clonal observation.
+        if not variants_raw and n_empty == 0 and n_clonal == 0:
             continue
+        variants_raw["V_REF"] = {
+            "vid": "V_REF",
+            "seq": v_ref_seqs.get(v1_id, ""),
+            "len": v1_len,
+            "n_observations": n_clonal, "example_target": v1_id,
+            "v_ref_cov_pct": 100.0,
+            "observed_in_other_genome": n_clonal > 0,
+        }
 
         # Cluster at 99% identity
         if len(variants_raw) > 1:
