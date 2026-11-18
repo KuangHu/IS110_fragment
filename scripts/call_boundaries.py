@@ -18,7 +18,7 @@ import sys
 from collections import defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from lib_alleles import (load_anchor_hits, place_per_assembly, source_core,  # noqa: E402
+from lib_alleles import (iter_anchor_groups, anchor_side, place_per_assembly, source_core,  # noqa: E402
                          gap_tolerance, classify_gap)
 
 
@@ -75,15 +75,7 @@ def main():
                 "distances": [int(d) for d in distances.split(",")],
             }
 
-    row_counts = {}
-    hits, n_total, n_kept = load_anchor_hits(args.paf, args.min_identity,
-                                             args.min_coverage, row_counts)
     cap = args.max_secondary + 1 if args.max_secondary > 0 else None
-    if cap:
-        n_capped = sum(1 for n in row_counts.values() if n >= cap)
-        print(f"Anchors at the minimap2 -N cap ({cap} rows): {n_capped:,} / "
-              f"{len(row_counts):,} -- their counts are a sample, not a census")
-    print(f"PAF rows: {n_total:,}; passed filter: {n_kept:,}")
 
     out_pairs = open(f"{args.out}_pairs.tsv", "w")
     out_pairs.write("ref_id\tdistance_D\ttnp_len\tflank_size\texpected_v0\texpected_empty\t"
@@ -92,9 +84,16 @@ def main():
                     "removed_bp\tassembly\tplacement_status\tn_candidate_pairs\tmargin\n")
 
     summary = defaultdict(lambda: defaultdict(int))  # (ref_id, D) -> {category: count}
-    removed = defaultdict(list)                      # (ref_id, D) -> removed bp at empties
+    modes = {}                                       # (ref_id, D) -> (mode, support)
+    capped = {}                                      # (ref_id, D) -> 0/1
+    row_counts, stats = {}, {}
 
-    for ref_id, info in ref_info.items():
+    # one element at a time: the PAF is never held in memory
+    for ref_id, hits in iter_anchor_groups(args.paf, args.min_identity,
+                                           args.min_coverage, stats, row_counts):
+        info = ref_info.get(ref_id)
+        if info is None:
+            continue
         for D in info["distances"]:
             # up anchor ends D bp before the transposase, down anchor starts D
             # bp after it, so the source (filled) gap is 2D + tnp_len. At an
@@ -102,12 +101,15 @@ def main():
             expected_v0 = 2 * D + info["tnp_len"]
             expected_empty = 2 * D
             tol = gap_tolerance(expected_v0, args.tol_bp, args.tol_frac)
+            nd = len(info["distances"])
             placements = place_per_assembly(
-                hits.get((ref_id, "up", D), {}), hits.get((ref_id, "down", D), {}),
+                anchor_side(hits, ref_id, "up", D, nd),
+                anchor_side(hits, ref_id, "down", D, nd),
                 exclude_core=source_core(ref_id),     # never the element's own genome
                 min_gap=-50, max_gap=min(args.max_pair_distance,
                                          expected_v0 + args.max_extra_bp),
                 margin_ratio=args.margin)
+            removed = []
             for pl in placements.values():
                 if pl["status"] == "ambiguous":
                     category = "ambiguous"
@@ -117,7 +119,7 @@ def main():
                                             min_removed=args.min_is_size)
                 rem = expected_v0 - pl["gap"]
                 if category == "empty":
-                    removed[(ref_id, D)].append(rem)
+                    removed.append(rem)
                 u, d = pl["up"], pl["down"]
                 out_pairs.write(
                     f"{ref_id}\t{D}\t{info['tnp_len']}\t{info['flank_size']}\t"
@@ -130,6 +132,22 @@ def main():
                     f"{pl['margin']:.3f}\n")
                 summary[(ref_id, D)][category] += 1
                 summary[(ref_id, D)]["_total"] += 1
+            if placements:
+                modes[(ref_id, D)] = length_mode(removed, args.histogram_bin)
+                # the cap is per index part: row_counts holds the longest run
+                # of rows in ONE part (anchors named with or without the D)
+                capped[(ref_id, D)] = int(bool(cap) and any(
+                    max(row_counts.get(f"{ref_id}__{side}{D}", 0),
+                        row_counts.get(f"{ref_id}__{side}", 0)) >= cap
+                    for side in ("up", "down")))
+
+    if cap:
+        n_capped = sum(1 for n in row_counts.values() if n >= cap)
+        print(f"Anchors at the minimap2 -N cap ({cap} rows in one index part): "
+              f"{n_capped:,} / {len(row_counts):,} -- their counts are a sample, "
+              f"not a census")
+    print(f"PAF rows: {stats.get('n_total', 0):,}; passed filter: "
+          f"{stats.get('n_kept', 0):,}")
 
     out_pairs.close()
     print(f"Wrote pairs: {args.out}_pairs.tsv")
@@ -147,15 +165,12 @@ def main():
             has_empty = n_empty >= 1
             has_v0 = n_v0 >= 1
             bimodal = has_empty and (has_v0 or n_v1plus >= 1)
-            mode, support = length_mode(removed[(ref_id, D)], args.histogram_bin)
-            capped = int(bool(cap) and any(
-                row_counts.get(f"{ref_id}__{side}{D}", 0) >= cap
-                for side in ("up", "down")))
+            mode, support = modes[(ref_id, D)]
             f.write(f"{ref_id}\t{D}\t{info['tnp_len']}\t{cats.get('_total', 0)}\t"
                     f"{n_empty}\t{n_v0}\t{n_v1plus}\t{cats.get('intermediate', 0)}\t"
                     f"{cats.get('very_short', 0)}\t{cats.get('ambiguous', 0)}\t"
                     f"{int(has_empty)}\t{int(has_v0)}\t{int(bimodal)}\t"
-                    f"{'' if mode is None else mode}\t{support}\t{capped}\n")
+                    f"{'' if mode is None else mode}\t{support}\t{capped[(ref_id, D)]}\n")
 
     print(f"Wrote summary: {args.out}_summary.tsv")
 
@@ -171,7 +186,7 @@ def main():
     for ref_id in sorted(ref_info.keys()):
         if ref_id in by_ref:
             min_d = min(by_ref[ref_id])
-            mode, _ = length_mode(removed[(ref_id, min_d)], args.histogram_bin)
+            mode, _ = modes[(ref_id, min_d)]
             print(f"  {ref_id[:40]:40s}  boundary <= {min_d:>6d} bp from tnp; "
                   f"element ~{mode} bp")
         else:

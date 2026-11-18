@@ -24,6 +24,7 @@ python3 "$REPO/tests/test_stage_units.py"
 python3 "$REPO/tests/test_downstream.py"
 python3 "$REPO/tests/test_movement.py"
 python3 "$REPO/tests/test_rearr.py"
+python3 "$REPO/tests/test_review_final.py"
 
 echo "=== synthetic data ==="
 python3 "$REPO/tests/make_synthetic.py" "$WORK/syn"
@@ -52,8 +53,9 @@ for seed in 1 2; do
         --hmm unused.hmm --db "$WORK/syn/db.fa" --out "$R2" \
         --distances 1000,5000 --flank 6000 --threads 4 --no-render-figures > "$R2/log.txt" 2>&1
 done
-for f in anchors_anchors.fa anchors_refs.fa anchors_table.tsv boundaries_summary.tsv pairs_summary.tsv \
+for f in anchors_anchors.fa anchors_refs.fa anchors_table.tsv anchors_vs_db.paf anchors_vs_db.paf.rows.tsv \
+         boundaries_summary.tsv pairs_summary.tsv boundaries_pairs.tsv pairs_pairs.tsv \
          records/records.json records/summary.tsv records/is_elements.fa records/empty_junctions.fa; do
     cmp "$WORK/run_seed1/$f" "$WORK/run_seed2/$f" || { echo "FAIL hash-seed dependence: $f"; exit 1; }
 done
-echo "PASS outputs identical under PYTHONHASHSEED=1 and 2 (9 files)"
+echo "PASS outputs identical under PYTHONHASHSEED=1 and 2 (13 files)"

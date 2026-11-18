@@ -39,7 +39,8 @@ from multiprocessing import Pool
 import pysam
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from lib_alleles import (load_anchor_hits, place_per_assembly, source_core,  # noqa: E402
+from lib_alleles import (iter_ref_lines, hits_from_lines, read_anchor_rows,  # noqa: E402
+                         _RunCounter, anchor_side, place_per_assembly, source_core,  # noqa: E402
                          gap_tolerance, classify_gap, decompose_alleles,
                          find_tsd, canon_key, revcomp, ANCHOR_RE)
 
@@ -138,10 +139,38 @@ def _empty_interval(eo):
     return raw if eo["strand"] == "+" else revcomp(raw)
 
 
+def _process_ref(payload):
+    """Worker: PAF lines of ONE element -> its record.
+
+    Parsing, placement and record building all happen here, so the parent
+    only passes raw lines and memory stays bounded by threads x one element.
+    Returns (status, packed, unsupported, rows, rows_kept); status is 'ok',
+    'failed' (source sequence not found) or 'dropped' (--drop-unsupported)."""
+    (ref_id, info, src, lines, n_at_cap, distances, opts, min_identity, min_coverage,
+     drop_unsupported, genome_db, flank_out_len, top_empty_n, db_label,
+     max_align_cells) = payload
+    hits, n_total, n_kept = hits_from_lines(lines, min_identity, min_coverage)
+    best = pick_best_d(hits, ref_id, info, distances, opts)
+    best["n_anchors_at_cap"] = n_at_cap
+    unsupported = not best["v0_obs"] and not best["empty_obs"]
+    if unsupported and drop_unsupported:
+        return "dropped", None, True, n_total, n_kept
+    packed = _build_one_record(((ref_id, info, best, src), genome_db, flank_out_len,
+                                top_empty_n, db_label, max_align_cells,
+                                drop_unsupported))
+    if packed == "dropped":
+        return "dropped", None, True, n_total, n_kept
+    if packed is None:
+        return "failed", None, unsupported, n_total, n_kept
+    unsupported = packed[0]["boundary_evidence"]["method"] in UNSUPPORTED_METHODS
+    return "ok", packed, unsupported, n_total, n_kept
+
+
 def _build_one_record(packed):
     """Build a single IS record. Returns tuple or None on failure."""
     ((ref_id, info, best, src), genome_db, flank_out_len, top_empty_n, db_label,
-     max_align_cells) = packed
+     max_align_cells) = packed[:6]
+    drop_unsupported = packed[6] if len(packed) > 6 else False
 
     # Compute IS size from the peaks (used only by the fallback)
     has_empty = bool(best["empty_peak"])
@@ -224,8 +253,17 @@ def _build_one_record(packed):
             method = "peak_symmetric_fallback"
         elif best["v0_obs"]:
             method = "no_empty_tnp_only"
+        elif best.get("no_anchors"):
+            # no_anchors_tnp_only: the contig is too short for even the
+            # smallest anchor pair, so the element could not be looked for in
+            # other genomes at all (it used to get no record)
+            method = "no_anchors_tnp_only"
         else:
             method = "no_observation_tnp_only"
+        if drop_unsupported and method in UNSUPPORTED_METHODS:
+            # decided HERE, after flank-deletion rejection: an element whose
+            # only "empty" sites were rejected is unsupported too
+            return "dropped"
         ext5 = (is_length - info["tnp_len"]) // 2
         ext3 = is_length - info["tnp_len"] - ext5
         # offsets are in TRANSPOSASE orientation: on the minus strand the 5'
@@ -362,6 +400,10 @@ def length_mode(values, bin_size=50):
     return (best[len(best) // 2], len(best))
 
 
+# records that rest on no observation in another genome
+UNSUPPORTED_METHODS = ("no_observation_tnp_only", "no_anchors_tnp_only")
+
+
 def call_confidence(method, support, n_tied):
     """One flag from call_support / call_n_tied (reporting only):
          tied      another candidate had as much support as the chosen one
@@ -395,8 +437,10 @@ def pair_anchors(hits, ref_id, D, info, opts):
     anchor-copy combination and could pair anchors on different repeat
     copies. Ambiguous placements are counted but never used as evidence."""
     expected_v0 = 2 * D + info["tnp_len"]
+    nd = len(info["distances"]) if info.get("distances") else None
     placements = place_per_assembly(
-        hits.get((ref_id, "up", D), {}), hits.get((ref_id, "down", D), {}),
+        anchor_side(hits, ref_id, "up", D, nd),
+        anchor_side(hits, ref_id, "down", D, nd),
         exclude_core=source_core(ref_id),
         min_gap=-50, max_gap=expected_v0 + opts["max_extra_bp"],
         margin_ratio=opts["margin"])
@@ -460,8 +504,15 @@ def pick_best_d(hits, ref_id, info, distances, opts):
     Also returns, as best['decompose'], the smallest D <= decompose_max_d that
     has empty sites -- the interval used for base-level decomposition."""
     candidates = []
+    # only the distances this reference has anchors for (a legacy single-D
+    # reference would otherwise answer for every distance of the run)
+    own = info.get("distances")
+    if own is not None:          # [] = the contig is too short for any anchor
+        distances = [D for D in distances if D in own] or list(own)
+    n_amb_max = 0
     for D in distances:
         pairs, expected_v0, n_amb = pair_anchors(hits, ref_id, D, info, opts)
+        n_amb_max = max(n_amb_max, n_amb)
         if not pairs:
             continue
         v0_peak, empty_peak, v0_obs, empty_obs, v1plus_obs, n_overlap = categorize_pairs(
@@ -474,14 +525,19 @@ def pick_best_d(hits, ref_id, info, distances, opts):
         })
 
     if not candidates:
-        # No anchor pair in any other genome. The transposase hit is real, so
-        # the element is still catalogued -- as an explicitly unsupported
-        # record (method no_observation_tnp_only), unless --drop-unsupported.
-        D0 = distances[0]
-        return {"D": D0, "pairs": [], "expected_v0": 2 * D0 + info["tnp_len"],
-                "n_ambiguous": 0, "n_anchor_overlap": 0, "n_anchor_overlap_all_d": 0,
+        # No usable anchor pair in any other genome. The transposase hit is
+        # real, so the element is still catalogued -- as an explicitly
+        # unsupported record (method no_observation_tnp_only), unless
+        # --drop-unsupported. Genomes where the placement was AMBIGUOUS are
+        # still reported: "two equally good loci" is not "no alignment".
+        D0 = distances[0] if distances else None
+        return {"D": D0, "pairs": [],
+                "expected_v0": (2 * D0 if D0 is not None else 0) + info["tnp_len"],
+                "n_ambiguous": n_amb_max, "n_anchor_overlap": 0,
+                "n_anchor_overlap_all_d": 0,
                 "v0_peak": None, "empty_peak": None, "v0_obs": [], "empty_obs": [],
-                "v1plus_obs": [], "decompose": None}
+                "v1plus_obs": [], "decompose": None,
+                "no_anchors": not distances}
 
     best = None
     # Prefer smallest D with both V0 and empty (highest-quality boundary call)
@@ -496,8 +552,16 @@ def pick_best_d(hits, ref_id, info, distances, opts):
                 best = c
                 break
     if best is None:
-        # Else: just pick the first one (only V0)
-        best = candidates[0]
+        # Else: the smallest D that SAW the element filled. Taking simply the
+        # first candidate could land on a D whose only placements are larger
+        # than the filled state, and the record then claimed "no observation"
+        # although another D held an exact filled one.
+        for c in sorted(candidates, key=lambda x: x["D"]):
+            if c["v0_obs"]:
+                best = c
+                break
+    if best is None:
+        best = min(candidates, key=lambda x: x["D"])
 
     best = dict(best)
     # empties seen only with overlapping anchors, at any D (see categorize_pairs)
@@ -658,54 +722,66 @@ def main():
                 "strand": parts[col["tnp_strand"]],
             }
 
-    # Parse anchor PAF
-    print(f"Parsing anchor PAF...", file=sys.stderr)
-    row_counts = {}
-    ncbi_hits, n_total, n_kept = load_anchor_hits(args.paf, args.min_identity,
-                                                  args.min_coverage, row_counts)
-    # Anchors that reached the secondary cap of the search. minimap2 prints at
-    # most N+1 rows per query and index part, so "more than N rows" is the
-    # conservative test (an anchor below it was certainly not cut off).
+    # Anchors that reached the secondary cap of the search. minimap2 applies
+    # -N per index part and prints at most N+1 rows per anchor and part, so
+    # the test is "N+1 rows in ONE part" (the sidecar of search_anchors.py, or
+    # the runs of an unsorted single-run PAF) -- not the total over parts.
     cap = args.max_secondary + 1 if args.max_secondary > 0 else None
-    capped_by_ref = defaultdict(int)
-    if cap:
-        for q, n in row_counts.items():
-            if n >= cap:
-                m = ANCHOR_RE.match(q)
-                if m:
-                    capped_by_ref[m.group(1)] += 1
-        print(f"  anchors at the -N cap ({cap}+ rows): "
-              f"{sum(capped_by_ref.values()):,} / {len(row_counts):,}; "
-              f"elements with such an anchor: {len(capped_by_ref):,}", file=sys.stderr)
-    print(f"  PAF: {n_total:,} rows, {n_kept:,} kept", file=sys.stderr)
+    row_counts = read_anchor_rows(args.paf)
+    counter = None
+    if row_counts is None:
+        counter = _RunCounter()
+        row_counts = counter.max_run
 
-    # Build records — parallelize per-ref using pysam (in-process FASTA reads)
-    n_done = n_neither = 0
+    def n_at_cap(ref_id, info):
+        if not cap:
+            return None
+        names = [f"{ref_id}__{side}{D}" for D in info["distances"]
+                 for side in ("up", "down")]
+        names += [f"{ref_id}__up", f"{ref_id}__down"]        # legacy names
+        return sum(1 for q in names if row_counts.get(q, 0) >= cap)
+
     db_label = os.path.basename(args.genome_db)
-
-    # Pre-filter refs to those with a valid pick (cheap; no FASTA I/O)
-    work_items = []
     opts = {"tol_bp": args.tol_bp, "tol_frac": args.tol_frac,
             "margin": args.margin, "max_extra_bp": args.max_extra_bp,
             "decompose_max_d": args.decompose_max_d,
             "min_is_size": args.min_is_size, "max_is_size": args.max_is_size}
-    for ref_id, info in ref_info.items():
-        best = pick_best_d(ncbi_hits, ref_id, info, distances, opts)
-        best["n_anchors_at_cap"] = capped_by_ref.get(ref_id, 0) if cap else None
-        if not best["v0_obs"] and not best["empty_obs"]:
-            n_neither += 1
-            if args.drop_unsupported:
-                continue
-        src = source_positions.get(ref_id)
-        if not src:
-            continue
-        n_done += 1
-        work_items.append((ref_id, info, best, src))
 
-    print(f"  Refs to process: {len(work_items):,} ({n_neither:,} without any filled or "
-          f"empty observation in another genome: "
-          f"{'dropped' if args.drop_unsupported else 'kept as no_observation_tnp_only'})",
-          file=sys.stderr, flush=True)
+    def payload(ref_id, info, src, lines):
+        return (ref_id, info, src, lines, n_at_cap(ref_id, info), distances, opts,
+                args.min_identity, args.min_coverage, args.drop_unsupported,
+                args.genome_db, args.flank_out_len, args.top_empty, db_label,
+                args.max_align_cells)
+
+    n_no_source = 0
+
+    def payloads():
+        """One element at a time, in PAF order; then the elements the search
+        returned nothing for; then the transposase hits that have no anchors
+        at all (contig too short) -- every hit of stage 1 gets a record or is
+        counted as dropped/failed, none disappears between stages."""
+        nonlocal n_no_source
+        seen = set()
+        for ref_id, lines in iter_ref_lines(args.paf, counter):
+            info, src = ref_info.get(ref_id), source_positions.get(ref_id)
+            if info is None:
+                continue
+            seen.add(ref_id)
+            if src is None:
+                n_no_source += 1
+                continue
+            yield payload(ref_id, info, src, lines)
+        for ref_id in sorted(set(ref_info) - seen):
+            src = source_positions.get(ref_id)
+            if src is None:
+                n_no_source += 1
+                continue
+            yield payload(ref_id, ref_info[ref_id], src, [])
+        for is_id in sorted(set(source_positions) - set(ref_info)):
+            src = source_positions[is_id]
+            info = {"ref_len": 0, "anchor_len": 0, "flank_size": 0, "distances": [],
+                    "tnp_len": src["end"] - src["start"] + 1}
+            yield payload(is_id, info, src, [])
 
     # Worker pool: each worker opens its own pysam.FastaFile (not fork-safe to share)
     all_records = []
@@ -714,32 +790,72 @@ def main():
     up_flank_seqs = []
     down_flank_seqs = []
     empty_junction_seqs = []
+    n_done = n_failed = n_dropped = n_neither = n_total = n_kept = 0
+    errors = []
+    # at most this many elements are parsed/queued at once: the parent reads
+    # the PAF only as fast as the workers consume it
+    import threading
+    slots = threading.BoundedSemaphore(max(4, args.threads * 4))
 
-    pool_args = [(item, args.genome_db, args.flank_out_len, args.top_empty, db_label,
-                  args.max_align_cells)
-                 for item in work_items]
-    n_failed = 0
+    def collect(res):
+        nonlocal n_done, n_failed, n_dropped, n_neither, n_total, n_kept
+        try:
+            status, packed, unsupported, nt, nk = res
+            n_done += 1
+            n_total += nt
+            n_kept += nk
+            n_neither += bool(unsupported)
+            if status == "dropped":
+                n_dropped += 1
+            elif status == "failed":
+                n_failed += 1
+            else:
+                record, is_seq, tnp_seq, up_seq, down_seq, empties = packed
+                all_records.append(record)
+                ref_id = record["ref_id"]
+                is_elem_seqs.append((ref_id, is_seq))
+                tnp_seqs.append((ref_id, tnp_seq))
+                up_flank_seqs.append((ref_id, up_seq))
+                down_flank_seqs.append((ref_id, down_seq))
+                empty_junction_seqs.extend(empties)
+            if n_done % 1000 == 0:
+                print(f"    built {n_done:,}", file=sys.stderr, flush=True)
+        finally:
+            slots.release()
+
+    def failed(exc):
+        errors.append(exc)
+        slots.release()
+
+    print("Reading anchor PAF one element at a time...", file=sys.stderr, flush=True)
     with Pool(args.threads, initializer=_worker_init,
               initargs=(args.genome_db, args.source_db)) as pool:
-        for i, packed in enumerate(pool.imap_unordered(_build_one_record, pool_args,
-                                                       chunksize=8)):
-            if i % 1000 == 0:
-                print(f"    built {i:,}/{len(pool_args):,}", file=sys.stderr, flush=True)
-            if packed is None:
-                n_failed += 1
-                continue
-            record, is_seq, tnp_seq, up_seq, down_seq, empties = packed
-            all_records.append(record)
-            ref_id = record["ref_id"]
-            is_elem_seqs.append((ref_id, is_seq))
-            tnp_seqs.append((ref_id, tnp_seq))
-            up_flank_seqs.append((ref_id, up_seq))
-            down_flank_seqs.append((ref_id, down_seq))
-            for tag, seq in empties:
-                empty_junction_seqs.append((tag, seq))
+        for item in payloads():
+            if errors:
+                break
+            slots.acquire()
+            pool.apply_async(_process_ref, (item,), callback=collect,
+                             error_callback=failed)
+        pool.close()
+        pool.join()
+    if errors:
+        raise errors[0]
+
+    if cap:
+        n_cap_anchors = sum(1 for n in row_counts.values() if n >= cap)
+        print(f"  anchors at the -N cap ({cap} rows in one index part): "
+              f"{n_cap_anchors:,} / {len(row_counts):,}", file=sys.stderr)
+    print(f"  PAF: {n_total:,} rows, {n_kept:,} kept", file=sys.stderr)
+    print(f"  Refs processed: {n_done:,} ({n_neither:,} without any filled or "
+          f"empty observation in another genome: "
+          f"{'dropped' if args.drop_unsupported else 'kept, method no_observation_tnp_only / no_anchors_tnp_only'})",
+          file=sys.stderr, flush=True)
+    if n_no_source:
+        print(f"WARNING: {n_no_source:,} references of the table are not in "
+              f"--hits and got no record", file=sys.stderr)
 
     # Write outputs
-    # imap_unordered returns in completion order; sort so the files are
+    # results arrive in completion order; sort so the files are
     # reproducible run to run
     order = sorted(range(len(all_records)), key=lambda i: all_records[i]["ref_id"])
     all_records = [all_records[i] for i in order]
@@ -749,10 +865,10 @@ def main():
     down_flank_seqs = [down_flank_seqs[i] for i in order]
     empty_junction_seqs.sort()
     if n_failed:
-        print(f"WARNING: {n_failed:,} of {len(pool_args):,} refs produced no record "
+        print(f"WARNING: {n_failed:,} of {n_done:,} refs produced no record "
               f"(source contig or sequence not found in the FASTA -- wrong "
               f"--source-db / --genome-db?)", file=sys.stderr, flush=True)
-    if pool_args and not all_records:
+    if n_done and not all_records and not n_dropped:
         sys.exit("ERROR: no record could be built; refusing to write an empty "
                  "records.json")
     json_path = os.path.join(args.out, "records.json")
@@ -822,7 +938,8 @@ def main():
     print(f"  Distinct exact element+context keys (event_key; upper bound on "
           f"insertion events): {len({r['event_key'] for r in all_records}):,}",
           file=sys.stderr)
-    print(f"  No observation in another genome: {n_neither}", file=sys.stderr)
+    print(f"  No observation in another genome: {n_neither}"
+          f"{f' ({n_dropped} dropped)' if n_dropped else ''}", file=sys.stderr)
     print(f"  All outputs in: {args.out}", file=sys.stderr)
 
 

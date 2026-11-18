@@ -98,7 +98,7 @@ Output tree:
 output_dir/
 ├── is_hits.tsv                       (stage 1)
 ├── anchors_refs.fa, anchors_anchors.fa, anchors_table.tsv  (stage 2)
-├── anchors_vs_db.paf                 (stage 3)
+├── anchors_vs_db.paf (+ .rows.tsv)    (stage 3; sorted by element, 12 columns)
 ├── pairs_pairs.tsv, pairs_summary.tsv (stage 4)
 ├── boundaries_pairs.tsv, boundaries_summary.tsv (stage 5)
 ├── records/records.json              (stage 6)
@@ -134,14 +134,32 @@ Each item below was a measured bug in the fna project and was present here.
 | 6 | lineages were described as successive insertions | labelled `"direction": "unpolarized"`; length order is not time order (see `build_lineages.py`) |
 | 7 | variants keyed by an exact, orientation-dependent hash | `event_key` (records) and `nested_insert.event_key` (variants): orientation- and junction-invariant insert key + canonical context |
 
-**Anchor-search cap.** minimap2 `-N` limits each anchor to N+1 targets. On the
-E. coli DB with the old `-N 50`, 91% of anchors (1,986,882 / 2,179,807) hit
-exactly 51 rows, so every count was a *sample* of the DB biased to the closest
-matches. `--max-secondary` (env `MAX_SECONDARY` in the template) now sets it;
-Stage 5 flags capped anchors in `anchor_search_capped`. For a census set it to
-more than the number of DB sequences an anchor can hit (GCA/GCF twins and extra
-locus copies each take a slot, so the number of distinct assemblies is not enough);
-raise it until no anchor is flagged — PAF size grows with it.
+**Anchor-search cap.** minimap2 `-N` limits each anchor to N+1 rows *per index
+part*. With the old `-N 50` and the 9-part E. coli index an anchor got at most
+459 rows; a pilot without a cap (600 random anchors) gave a median of 4,596 rows
+per anchor, p99 12,236 — 92.5% of anchors had been cut off, and since the two
+anchors of a pair are cut independently, far more pairs were lost than rows.
+`--max-secondary` now defaults to 10,000 (1.8% of pilot anchors above it).
+
+Stage 3 is `search_anchors.py`: it runs minimap2, keeps the 12 PAF columns,
+**sorts the rows by element**, and writes `anchors_vs_db.paf.rows.tsv` (per
+anchor: rows, index parts, most rows in one part). Stages 4–7 read the PAF one
+element at a time (`lib_alleles.iter_ref_lines`), so memory no longer grows with
+the PAF (the old loader needed 98 GB for the 21.6-GB E. coli PAF; at the new cap
+that file is roughly 185 GB). A raw multi-part PAF is refused; convert it with
+`search_anchors.py --from-paf`. The cap is judged per index part from the
+sidecar: `anchor_search_capped` (stage 5) and `anchor_cap_reached` /
+`n_anchors_at_cap` (records).
+
+**Records without an observation.** Every transposase hit of stage 1 gets a
+record. `boundary_evidence.method` says what it rests on:
+`empty_vs_filled_decomposition` (boundary called), `peak_symmetric_fallback`
+(length only), `no_empty_tnp_only` (seen filled in another genome, never empty),
+`no_observation_tnp_only` (no filled and no empty observation in any other
+genome), `no_anchors_tnp_only` (contig too short for any anchor pair, so never
+searched). The element's own genome and its GCA/GCF twin are never observations.
+`--drop-unsupported` leaves the last two out. `call_confidence` =
+ok / tied / support1 / no_call.
 
 ### Core-pipeline review fixes (2026-11)
 

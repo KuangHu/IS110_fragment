@@ -25,7 +25,7 @@ import sys
 from collections import defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from lib_alleles import (load_anchor_hits, place_per_assembly, source_core,  # noqa: E402
+from lib_alleles import (iter_anchor_groups,  place_per_assembly, source_core,  # noqa: E402
                          gap_tolerance, classify_gap)
 
 
@@ -75,10 +75,6 @@ def main():
                 "tnp_len": int(parts[col.get("tnp_len", 3)]),
             }
 
-    hits, n_total, n_kept = load_anchor_hits(args.paf, args.min_identity,
-                                             args.min_coverage)
-    print(f"PAF rows: {n_total:,}; passed filter: {n_kept:,}")
-
     out_pairs = open(f"{args.out}_pairs.tsv", "w")
     out_pairs.write("ref_id\tref_len\texpected_v0\texpected_empty\ttarget_contig\ttlen\t"
                     "up_strand\tup_ts\tup_te\t"
@@ -87,40 +83,45 @@ def main():
                     "distance_D\tassembly\tplacement_status\tn_candidate_pairs\tmargin\n")
 
     ref_summary = defaultdict(lambda: defaultdict(int))
-    keys = sorted({(r, D) for (r, _, D) in hits}, key=lambda k: (k[0], k[1] or 0))
-    for ref_id, D in keys:
+    stats = {}
+    # one element at a time: the PAF is never held in memory
+    for ref_id, hits in iter_anchor_groups(args.paf, args.min_identity,
+                                           args.min_coverage, stats):
         if ref_id not in ref_info:
             continue
         info = ref_info[ref_id]
-        if D is None:   # legacy single-D reference
-            expected_v0 = info["ref_len"] - 2 * info["anchor_len"]
-        else:
-            expected_v0 = 2 * D + info["tnp_len"]
-        expected_empty = expected_v0 - info["tnp_len"]
-        tol = gap_tolerance(expected_v0, args.tol_bp, args.tol_frac)
-
-        placements = place_per_assembly(
-            hits.get((ref_id, "up", D), {}), hits.get((ref_id, "down", D), {}),
-            exclude_core=source_core(ref_id),         # never the element's own genome
-            min_gap=-50, max_gap=expected_v0 + args.max_extra_bp,
-            margin_ratio=args.margin)
-        for pl in placements.values():
-            if pl["status"] == "ambiguous":
-                category = "ambiguous"
+        for D in sorted({D for (_, _, D) in hits}, key=lambda d: d or 0):
+            if D is None:   # legacy single-D reference
+                expected_v0 = info["ref_len"] - 2 * info["anchor_len"]
             else:
-                category = classify_gap(pl["gap"], expected_v0, info["tnp_len"], tol)
-            u, d = pl["up"], pl["down"]
-            out_pairs.write(
-                f"{ref_id}\t{info['ref_len']}\t{expected_v0}\t{expected_empty}\t"
-                f"{pl['tname']}\t{u.tlen}\t"
-                f"{u.strand}\t{u.ts}\t{u.te}\t"
-                f"{d.strand}\t{d.ts}\t{d.te}\t"
-                f"{pl['gap']}\t{category}\t"
-                f"{'' if D is None else D}\t{pl['assembly']}\t{pl['status']}\t"
-                f"{pl['n_pairs']}\t{pl['margin']:.3f}\n")
-            s = ref_summary[ref_id]
-            s["n_pairs"] += 1
-            s[category] += 1
+                expected_v0 = 2 * D + info["tnp_len"]
+            expected_empty = expected_v0 - info["tnp_len"]
+            tol = gap_tolerance(expected_v0, args.tol_bp, args.tol_frac)
+
+            placements = place_per_assembly(
+                hits.get((ref_id, "up", D), {}), hits.get((ref_id, "down", D), {}),
+                exclude_core=source_core(ref_id),     # never the element's own genome
+                min_gap=-50, max_gap=expected_v0 + args.max_extra_bp,
+                margin_ratio=args.margin)
+            for pl in placements.values():
+                if pl["status"] == "ambiguous":
+                    category = "ambiguous"
+                else:
+                    category = classify_gap(pl["gap"], expected_v0, info["tnp_len"], tol)
+                u, d = pl["up"], pl["down"]
+                out_pairs.write(
+                    f"{ref_id}\t{info['ref_len']}\t{expected_v0}\t{expected_empty}\t"
+                    f"{pl['tname']}\t{u.tlen}\t"
+                    f"{u.strand}\t{u.ts}\t{u.te}\t"
+                    f"{d.strand}\t{d.ts}\t{d.te}\t"
+                    f"{pl['gap']}\t{category}\t"
+                    f"{'' if D is None else D}\t{pl['assembly']}\t{pl['status']}\t"
+                    f"{pl['n_pairs']}\t{pl['margin']:.3f}\n")
+                s_ = ref_summary[ref_id]
+                s_["n_pairs"] += 1
+                s_[category] += 1
+    print(f"PAF rows: {stats.get('n_total', 0):,}; passed filter: "
+          f"{stats.get('n_kept', 0):,}")
 
     out_pairs.close()
     print(f"Wrote pairs: {args.out}_pairs.tsv")

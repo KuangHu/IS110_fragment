@@ -124,16 +124,159 @@ def parse_paf_line(line):
 ANCHOR_RE = re.compile(r"^(.+)__(up|down)(\d*)$")
 
 
+ROWS_SUFFIX = ".rows.tsv"     # written by search_anchors.py next to the PAF
+
+
+class _RunCounter:
+    """Rows per anchor, and the longest CONTIGUOUS run of rows per anchor.
+
+    minimap2 applies -N within one index part and prints a query's rows
+    together, part after part, so a raw PAF of a 9-part index holds 9 runs
+    per anchor. The cap was reached only if ONE run has N+1 rows; the total
+    over parts says nothing (4 rows from two parts of 2 is not a capped
+    search at -N 2, it used to be flagged as one)."""
+
+    def __init__(self):
+        self.total, self.max_run, self.n_runs = {}, {}, {}
+        self._q, self._n = None, 0
+
+    def feed(self, qname):
+        if qname == self._q:
+            self._n += 1
+            return
+        self.flush()
+        self._q, self._n = qname, 1
+
+    def flush(self):
+        q, n = self._q, self._n
+        if q is not None:
+            self.total[q] = self.total.get(q, 0) + n
+            self.n_runs[q] = self.n_runs.get(q, 0) + 1
+            if n > self.max_run.get(q, 0):
+                self.max_run[q] = n
+        self._q, self._n = None, 0
+
+
+def read_anchor_rows(paf_path):
+    """{anchor: longest run of rows in one index part} from the sidecar that
+    search_anchors.py writes, or None if the PAF has no sidecar."""
+    import os
+    path = paf_path + ROWS_SUFFIX
+    if not os.path.exists(path):
+        return None
+    out = {}
+    with open(path) as f:
+        header = f.readline().rstrip("\n").split("\t")
+        i = header.index("max_rows_one_part")
+        for line in f:
+            c = line.rstrip("\n").split("\t")
+            out[c[0]] = int(c[i])
+    return out
+
+
+def iter_ref_lines(paf_path, counter=None):
+    """Yield (ref_id, [PAF line, ...]) one ELEMENT at a time.
+
+    The PAF must hold each element's rows together: that is the case for a
+    single-part minimap2 run (the anchors of one element are adjacent in the
+    query file) and for a PAF sorted by search_anchors.py. The raw PAF of a
+    multi-part index is rejected, never silently split into partial
+    elements. Rows whose query is not an anchor name are skipped."""
+    cur, buf, seen = None, [], set()
+    with open(paf_path) as f:
+        for line in f:
+            q = line[:line.find("\t")] if "\t" in line else ""
+            if counter is not None and q:
+                counter.feed(q)
+            m = ANCHOR_RE.match(q)
+            if not m:
+                continue
+            ref_id = m.group(1)
+            if ref_id != cur:
+                if cur is not None:
+                    yield cur, buf
+                if ref_id in seen:
+                    raise ValueError(
+                        f"{paf_path}: rows of element {ref_id!r} are not "
+                        f"contiguous (raw PAF of a multi-part index?). Sort it "
+                        f"with search_anchors.py --from-paf first.")
+                seen.add(ref_id)
+                cur, buf = ref_id, []
+            buf.append(line)
+    if counter is not None:
+        counter.flush()          # before the last yield: its runs are final too
+    if cur is not None:
+        yield cur, buf
+
+
+def hits_from_lines(lines, min_identity, min_coverage):
+    """PAF lines of one element -> ({(ref_id, side, D): {tname: [Hit]}},
+    rows parsed, rows kept)."""
+    from collections import defaultdict
+    hits = defaultdict(lambda: defaultdict(list))
+    n_total = n_kept = 0
+    for line in lines:
+        h = parse_paf_line(line)
+        if h is None:
+            continue
+        n_total += 1
+        if h.ident < min_identity or h.cov < min_coverage:
+            continue
+        m = ANCHOR_RE.match(h.qname)
+        if not m:
+            continue
+        n_kept += 1
+        D = int(m.group(3)) if m.group(3) else None
+        hits[(m.group(1), m.group(2), D)][h.tname].append(h)
+    return hits, n_total, n_kept
+
+
+def iter_anchor_groups(paf_path, min_identity, min_coverage, stats=None,
+                       row_counts=None):
+    """Yield (ref_id, {(ref_id, side, D): {tname: [Hit]}}) one element at a
+    time, so that memory is bounded by one element and not by the PAF (see
+    iter_ref_lines for what the PAF must look like).
+
+    stats (dict) receives n_total / n_kept. row_counts (dict) receives, per
+    anchor, the longest run of raw rows within one index part -- from the
+    sidecar when there is one (a sorted PAF has lost the runs), otherwise
+    from the stream itself. When an element is yielded, the counts of its own
+    anchors are final."""
+    sidecar = read_anchor_rows(paf_path)
+    counter = None
+    if sidecar is not None:
+        if row_counts is not None:
+            row_counts.update(sidecar)
+    elif row_counts is not None:
+        # no sidecar: count the runs while streaming, straight into the
+        # caller's dict. When an element is yielded all of ITS anchors are
+        # final (the next element's first row closed the last run).
+        counter = _RunCounter()
+        counter.max_run = row_counts
+    n_total = n_kept = 0
+    for ref_id, lines in iter_ref_lines(paf_path, counter):
+        hits, nt, nk = hits_from_lines(lines, min_identity, min_coverage)
+        n_total += nt
+        n_kept += nk
+        if stats is not None:
+            stats["n_total"], stats["n_kept"] = n_total, n_kept
+        yield ref_id, hits
+
+
 def load_anchor_hits(paf_path, min_identity, min_coverage, row_counts=None):
     """PAF -> {(ref_id, side, D): {tname: [Hit]}}, D None for legacy names.
 
-    D is part of the key: pooling up1000 with down80000 hits (what the old
-    stage-4 parser did) pairs anchors from different distances.
+    Whole file in memory: for tests and small inputs. The pipeline stages use
+    iter_anchor_groups. D is part of the key: pooling up1000 with down80000
+    hits (what the old stage-4 parser did) pairs anchors from different
+    distances.
 
-    If `row_counts` (a dict) is given it is filled with raw PAF rows per
-    anchor, so callers can tell which anchors hit minimap2's -N cap."""
+    If `row_counts` (a dict) is given it is filled as in iter_anchor_groups:
+    the longest run of raw rows per anchor within one index part."""
     from collections import defaultdict
     hits = defaultdict(lambda: defaultdict(list))
+    sidecar = read_anchor_rows(paf_path)
+    counter = _RunCounter()
     n_total = n_kept = 0
     with open(paf_path) as f:
         for line in f:
@@ -141,8 +284,7 @@ def load_anchor_hits(paf_path, min_identity, min_coverage, row_counts=None):
             if h is None:
                 continue
             n_total += 1
-            if row_counts is not None:
-                row_counts[h.qname] = row_counts.get(h.qname, 0) + 1
+            counter.feed(h.qname)
             if h.ident < min_identity or h.cov < min_coverage:
                 continue
             m = ANCHOR_RE.match(h.qname)
@@ -151,7 +293,27 @@ def load_anchor_hits(paf_path, min_identity, min_coverage, row_counts=None):
             n_kept += 1
             D = int(m.group(3)) if m.group(3) else None
             hits[(m.group(1), m.group(2), D)][h.tname].append(h)
+    counter.flush()
+    if row_counts is not None:
+        row_counts.update(sidecar if sidecar is not None else counter.max_run)
     return hits, n_total, n_kept
+
+
+def anchor_side(hits, ref_id, side, D, n_distances=None):
+    """Hits of one anchor. Legacy anchors carry no D in their name
+    ('<ref>__up'): they are the anchors of a single-D reference, so they
+    answer for that one D. Stages 5/6 asked only for the numeric key and
+    reported such references as unobserved."""
+    got = hits.get((ref_id, side, D))
+    if got:
+        return got
+    legacy = hits.get((ref_id, side, None))
+    if legacy:
+        if n_distances not in (None, 1):
+            raise ValueError(f"{ref_id}: anchors without a distance in their "
+                             f"name, but the reference has {n_distances} distances")
+        return legacy
+    return {}
 
 
 def gap_tolerance(expected_v0, tol_bp=100, tol_frac=0.002):
@@ -301,9 +463,20 @@ def place_pair(ups, downs, min_gap=-50, max_gap=200000, margin_ratio=0.05):
             "margin": margin, "status": status}
 
 
+_ORF_SUFFIX_RE = re.compile(r"_\d+$")
+
+
 def source_core(ref_id):
-    """Assembly core of the genome an element comes from ('<assembly>|<contig>_<n>')."""
-    return assembly_core(split_target(ref_id)[0])
+    """Assembly core of the genome an element comes from.
+
+    ref_id is '<assembly>|<contig>_<n>' or, for a FASTA without assembly
+    prefixes, '<contig>_<n>' (n = protein number added by stage 1). Targets of
+    such a FASTA are named '<contig>', so the protein number has to come off
+    before the two can be compared -- otherwise 'isolateA_7' never equals
+    'isolateA' and the element's own genome counts as another genome."""
+    if "|" in ref_id:
+        return assembly_core(split_target(ref_id)[0])
+    return assembly_core(_ORF_SUFFIX_RE.sub("", ref_id))
 
 
 def place_per_assembly(up_by_tname, down_by_tname, exclude_core=None, **kw):

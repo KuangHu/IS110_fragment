@@ -49,6 +49,22 @@ _STAGE_ORDER = ["2_anchors", "3_minimap2", "4_pairs", "5_boundaries", "6_records
 _RAN = set()   # output dirs in which some stage has executed in this process
 
 
+def _code_fingerprint(cmd):
+    """md5 over the stage's own script(s) and the shared lib_*.py modules."""
+    import glob
+    import hashlib
+    here = os.path.dirname(os.path.abspath(__file__))
+    files = sorted({os.path.abspath(c) for c in cmd
+                    if isinstance(c, str) and c.endswith(".py") and os.path.isfile(c)}
+                   | set(glob.glob(os.path.join(here, "lib_*.py"))))
+    h = hashlib.md5()
+    for path in files:
+        h.update(os.path.basename(path).encode())
+        with open(path, "rb") as f:
+            h.update(f.read())
+    return h.hexdigest()
+
+
 def _run_stage(output_dir, name, title, cmd, outputs, trust_existing=False,
                atomic_o=None, inputs=()):
     """Run one cached stage.
@@ -70,7 +86,12 @@ def _run_stage(output_dir, name, title, cmd, outputs, trust_existing=False,
     # process had already invalidated (that state used to live only in
     # memory).
     invalid = os.path.join(output_dir, f".stage_{name}.invalid")
-    sig = json.dumps([os.path.basename(cmd[0])] + list(cmd[1:]))
+    # The signature also carries a fingerprint of the code that the stage
+    # runs (its script and every lib_*.py). Without it, a directory computed
+    # before a counting rule changed kept its stage-4/5 tables while stage 6
+    # was rebuilt under the new rule.
+    sig = json.dumps([os.path.basename(cmd[0])] + list(cmd[1:])
+                     + ["code:" + _code_fingerprint(cmd)])
     have = all(os.path.exists(o) for o in outputs)
     if have and os.path.exists(marker):
         with open(marker) as f:
@@ -80,7 +101,7 @@ def _run_stage(output_dir, name, title, cmd, outputs, trust_existing=False,
         if old_sig == sig and not stale_in:
             return
         why = (f"input changed: {os.path.basename(stale_in[0])}" if stale_in
-               else "parameters changed since the cached run")
+               else "parameters or code changed since the cached run")
         print(f"=== {title}: {why} -- re-running ===", flush=True)
     elif (have and trust_existing and output_dir not in _RAN
           and not os.path.exists(invalid)
@@ -138,8 +159,9 @@ def find_is_boundaries(
     source_db=None,         # optional — defaults to genome_db
     detect_rearrangements=False,
     anchor_d_rearrangements=1000,
-    max_secondary=50,
+    max_secondary=10000,
     trust_existing=False,
+    index_batch=None,       # minimap2 -I for the anchor search
 ):
     os.makedirs(output_dir, exist_ok=True)
     # An anchor at distance D needs D + anchor_length bp of flank; with the
@@ -204,12 +226,18 @@ def find_is_boundaries(
     # downstream is a sample of the DB, biased to the closest matches.
     # Raise --max-secondary to at least the number of distinct assemblies
     # for a census (PAF size grows ~linearly with it).
-    cmd = ["minimap2", "-x", "sr", "-c", "--eqx",
-           "--secondary=yes", "-N", str(max_secondary), "-p", "0.5",
-           "-t", str(threads),
-           genome_db, anchors_fa, "-o", anchors_paf]
-    stage("3_minimap2", "Stage 3: anchors vs DB (minimap2)", cmd, [anchors_paf],
-          atomic_o=len(cmd) - 1, inputs=[anchors_fa, genome_db + ".fai"])
+    # search_anchors.py runs minimap2 (-x sr -c --eqx --secondary=yes -N ..
+    # -p 0.5), sorts the rows by element so the later stages can read one
+    # element at a time, and records per anchor the rows per index part
+    # (<paf>.rows.tsv) -- the only place the -N cap can be seen.
+    anchors_rows = anchors_paf + ".rows.tsv"
+    cmd = ["python3", os.path.join(script_dir, "search_anchors.py"),
+           "--db", genome_db, "--anchors", anchors_fa, "--out", anchors_paf,
+           "--max-secondary", str(max_secondary), "--threads", str(threads)]
+    if index_batch:
+        cmd += ["--index-batch", str(index_batch)]
+    stage("3_minimap2", "Stage 3: anchors vs DB (minimap2)", cmd,
+          [anchors_paf, anchors_rows], inputs=[anchors_fa, genome_db + ".fai"])
 
     # Stage 4
     stage("4_pairs", "Stage 4: anchor pair finder",
@@ -220,7 +248,7 @@ def find_is_boundaries(
            "--min-identity", str(min_identity),
            "--min-coverage", str(min_coverage)],
           [pairs_prefix + "_pairs.tsv", pairs_prefix + "_summary.tsv"],
-          inputs=[anchors_paf, ref_table_tsv])
+          inputs=[anchors_paf, anchors_rows, ref_table_tsv])
 
     # Stage 5
     stage("5_boundaries", "Stage 5: boundary peak caller",
@@ -235,7 +263,7 @@ def find_is_boundaries(
            "--max-is-size", str(expected_is_size_range[1]),
            "--max-secondary", str(max_secondary)],
           [boundaries_prefix + "_pairs.tsv", boundaries_prefix + "_summary.tsv"],
-          inputs=[anchors_paf, ref_table_tsv])
+          inputs=[anchors_paf, anchors_rows, ref_table_tsv])
 
     # Stage 6
     records_json = os.path.join(records_dir, "records.json")
@@ -259,7 +287,7 @@ def find_is_boundaries(
           [records_json] + [os.path.join(records_dir, f) for f in (
               "summary.tsv", "is_elements.fa", "transposase_cds.fa",
               "upstream_flanks.fa", "downstream_flanks.fa", "empty_junctions.fa")],
-          inputs=[anchors_paf, ref_table_tsv, is_hits_tsv,
+          inputs=[anchors_paf, anchors_rows, ref_table_tsv, is_hits_tsv,
                   genome_db + ".fai", src_db + ".fai"])
 
     # Stage 7 (optional): rearrangement detection from the same anchor PAF
@@ -432,13 +460,17 @@ def main():
     p.add_argument("--max-is-size", type=int, default=200000)
     p.add_argument("--any-domain", action="store_true")
     p.add_argument("--threads", type=int, default=32)
-    p.add_argument("--max-secondary", type=int, default=50,
-                   help="minimap2 -N for the anchor search: max target HITS per "
-                        "anchor is N+1. Default 50 samples the DB. For a census "
-                        "it must exceed the number of DB sequences an anchor can "
-                        "hit -- GCA/GCF twins and extra locus copies each use a "
-                        "slot, so the number of distinct assemblies is NOT "
-                        "enough; raise it until Stage 5 reports no capped anchors")
+    p.add_argument("--max-secondary", type=int, default=10000,
+                   help="minimap2 -N for the anchor search: at most N+1 rows per "
+                        "anchor and index part. Sized from a pilot on the "
+                        "13,027-assembly E. coli DB (600 anchors, no cap: median "
+                        "4,596 rows per anchor, p99 12,236; 1.8%% of anchors "
+                        "above 10,000, 92.5%% above the 459 rows that -N 50 "
+                        "gave). Smaller DBs never reach it. Stage 3 prints the "
+                        "share of anchors at the cap and stage 6 flags their "
+                        "records (anchor_cap_reached)")
+    p.add_argument("--index-batch", default=None,
+                   help="minimap2 -I for the anchor search (default: minimap2's 8G)")
     p.add_argument("--trust-existing", action="store_true",
                    help="Adopt stage outputs that exist but have no completion "
                         "marker (runs made before markers existed). Without it "
@@ -481,6 +513,7 @@ def main():
         anchor_d_rearrangements=args.anchor_D_rearrangements,
         max_secondary=args.max_secondary,
         trust_existing=args.trust_existing,
+        index_batch=args.index_batch,
     )
     print(f"\nFinal records: {result}", flush=True)
 

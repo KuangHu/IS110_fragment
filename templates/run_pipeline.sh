@@ -35,7 +35,7 @@ MIN_IS_SIZE="${MIN_IS_SIZE:-800}"
 MAX_IS_SIZE="${MAX_IS_SIZE:-200000}"
 # minimap2 -N for the anchor search; each anchor reports <= N+1 targets.
 # 50 samples a large DB -- set >= number of distinct assemblies for a census.
-MAX_SECONDARY="${MAX_SECONDARY:-50}"
+MAX_SECONDARY="${MAX_SECONDARY:-10000}"
 THREADS="${SLURM_CPUS_PER_TASK:-32}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/scripts"
