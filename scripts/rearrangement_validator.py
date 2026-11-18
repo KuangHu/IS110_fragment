@@ -62,8 +62,14 @@ def run_nucmer(ref_fa, query_fa, prefix, maxmatch=True):
     if maxmatch:
         cmd.append("--maxmatch")
     cmd += [ref_fa, query_fa]
-    subprocess.run(cmd, check=False, capture_output=True)
     delta = prefix + ".delta"
+    # the work dir name is reused between runs: remove any old delta, or a
+    # failed nucmer silently scores the PREVIOUS run's alignment
+    if os.path.exists(delta):
+        os.remove(delta)
+    res = subprocess.run(cmd, check=False, capture_output=True, text=True)
+    if res.returncode != 0:
+        raise RuntimeError(f"nucmer failed: {res.stderr[-300:]}")
     return delta if os.path.exists(delta) else None
 
 
@@ -157,6 +163,16 @@ def near_is_element(positions, assembly, contig, pos, window=2000):
     """Return True if pos on contig is within window of an IS transposase."""
     if assembly not in positions:
         return False
+    # show-diff names the sequence as it is in the region FASTA: either the
+    # bare contig or a samtools region "contig:start-end" with coordinates
+    # relative to that window; is_hits.tsv keys contigs as "assembly|contig".
+    # With none of the three matching, is_mediated could never be True.
+    m = re.match(r"^(.+):(\d+)-(\d+)$", contig)
+    if m and (m.group(1) in positions[assembly]
+              or f"{assembly}|{m.group(1)}" in positions[assembly]):
+        contig, pos = m.group(1), pos + int(m.group(2)) - 1
+    if contig not in positions[assembly] and f"{assembly}|{contig}" in positions[assembly]:
+        contig = f"{assembly}|{contig}"
     if contig not in positions[assembly]:
         return False
     for s, e, _ in positions[assembly][contig]:
@@ -199,7 +215,11 @@ def validate_inversion(blocks, diffs, anchor_info, is_positions, target_assembly
             except ValueError:
                 continue
 
-    if inv_diffs and inv_frac >= inversion_min_frac:
+    if not fwd_blocks and inv_blocks:
+        # everything is reverse: the target contig is just stored in the
+        # other orientation (this scored LIKELY_blocks_only at inv_frac 0.97)
+        verdict = "REJECTED_all_reverse"
+    elif inv_diffs and inv_frac >= inversion_min_frac:
         verdict = "CONFIRMED_IS_MEDIATED" if is_mediated else "CONFIRMED"
     elif inv_diffs:
         verdict = "LIKELY"
@@ -241,9 +261,12 @@ def validate_translocation(blocks, diffs, anchor_info, is_positions, target_asse
             except ValueError:
                 continue
 
-    if (jmp_diffs or cross_contig_anchors) and len(distinct_q) >= 2:
+    # cross_contig_anchors is the DEFINITION of the candidate, so it cannot
+    # also confirm it (an identical genome split into two contigs was
+    # CONFIRMED). It is reported, not used.
+    if jmp_diffs and len(distinct_q) >= 2:
         verdict = "CONFIRMED_IS_MEDIATED" if is_mediated else "CONFIRMED"
-    elif jmp_diffs or cross_contig_anchors:
+    elif jmp_diffs:
         verdict = "LIKELY"
     else:
         verdict = "REJECTED"
@@ -289,7 +312,8 @@ def validate_duplication(blocks, diffs, anchor_info, is_positions, target_assemb
             except ValueError:
                 continue
 
-    if dup_diffs or multi_map_count > 0 or multi_anchor:
+    # multi_anchor restates the candidate (see above): not used for the verdict
+    if dup_diffs or multi_map_count > 0:
         if dup_diffs:
             verdict = "CONFIRMED_IS_MEDIATED" if is_mediated else "CONFIRMED"
         else:
