@@ -36,7 +36,8 @@ def load_is_hits(path):
             asm = r["assembly"]
             contig = r["contig"]
             local = contig.split("|", 1)[1] if "|" in contig else contig
-            idx[asm][local].append((int(r["tnp_start"]), int(r["tnp_end"]),
+            idx[asm][local].append((int(r["tnp_start"]) - 1, int(r["tnp_end"]),   # 1-based inclusive -> 0-based half-open
+                                    
                                     r.get("tnp_strand", "+")))
     return idx
 
@@ -73,19 +74,22 @@ def load_assembly_seqs(src_dir, asm):
     return {}
 
 
-ANCHOR_RE = re.compile(r"([\w.|]+):(\d+)-(\d+)\(([+-])\)")
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+import lib_rearr as _lr  # noqa: E402  (structural parser: keeps "-" and ":" in contig names)
 def parse_anchors(details):
     # the contig field in details is already in the local-after-assembly form
     # (e.g., "ENA|CM132337|CM132337.1") — this is the same form is_hits uses,
     # so do NOT strip further pipes.
-    return [(m.group(1), int(m.group(2)), int(m.group(3)), m.group(4))
-            for m in ANCHOR_RE.finditer(details)]
+    return (lambda d_: d_["up"] + d_["down"])(_lr.parse_details(details))
 
 
 def make_region_record(seq_record, sub_start, sub_end, name_suffix):
     """Slice a SeqRecord to [sub_start, sub_end] (0-based)."""
     sub = seq_record[sub_start:sub_end]
-    sub.id = f"{seq_record.id[:15]}_{name_suffix}"[:16]
+    # suffix first: cutting the joined name at 16 characters removed the
+    # REF/TGT suffix and the contig number, so records were indistinguishable
+    sub.id = f"{name_suffix}_{seq_record.id}"
     sub.name = sub.id
     sub.description = f"{seq_record.description} | region {sub_start+1}-{sub_end}"
     sub.annotations["molecule_type"] = "DNA"

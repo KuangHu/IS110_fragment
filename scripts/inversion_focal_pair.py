@@ -35,7 +35,9 @@ def parse_args():
     return p.parse_args()
 
 
-ANCHOR_RE = re.compile(r"([\w.|]+):(\d+)-(\d+)\(([+-])\)")
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+import lib_rearr as _lr  # noqa: E402  (structural parser: keeps "-" and ":" in contig names)
 
 
 def load_is_hits(path):
@@ -44,7 +46,8 @@ def load_is_hits(path):
         for r in csv.DictReader(fh, delimiter="\t"):
             asm = r["assembly"]; contig = r["contig"]
             local = contig.split("|", 1)[1] if "|" in contig else contig
-            hit = (int(r["tnp_start"]), int(r["tnp_end"]),
+            hit = (int(r["tnp_start"]) - 1, int(r["tnp_end"]),   # 1-based inclusive -> 0-based half-open
+                                    
                    r.get("tnp_strand", "+"))
             idx[asm][local].append(hit)
             tail = local.split("|")[-1]
@@ -159,8 +162,7 @@ def main():
         if r.get("ref_id") == args.ref_id and r.get("assembly") == args.tgt_asm:
             details = r.get("details", ""); break
     if not details: raise SystemExit("anchor details not found")
-    anchors = [(m.group(1), int(m.group(2)), int(m.group(3)), m.group(4))
-               for m in ANCHOR_RE.finditer(details)]
+    anchors = (lambda d_: d_["up"] + d_["down"])(_lr.parse_details(details))
     bycontig = defaultdict(list)
     for (c, s, e, st) in anchors:
         bycontig[c].append((s, e, st))

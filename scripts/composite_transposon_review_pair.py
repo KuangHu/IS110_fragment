@@ -41,7 +41,8 @@ def load_is_hits(path):
         for r in csv.DictReader(fh, delimiter="\t"):
             asm = r["assembly"]; contig = r["contig"]
             local = contig.split("|", 1)[1] if "|" in contig else contig
-            idx[asm][local].append((int(r["tnp_start"]), int(r["tnp_end"]),
+            idx[asm][local].append((int(r["tnp_start"]) - 1, int(r["tnp_end"]),   # 1-based inclusive -> 0-based half-open
+                                    
                                     r.get("tnp_strand", "+")))
     return idx
 
