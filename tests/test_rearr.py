@@ -252,6 +252,65 @@ def test_duplication_check():
                   f"{crow['canonical_pass']}")
 
 
+def run_inv_full(ref, s0, strand, tgt):
+    with tempfile.TemporaryDirectory() as wd:
+        src = os.path.join(wd, "src"); os.makedirs(src)
+        with open(os.path.join(src, "GCA_000000001.1.fa"), "w") as f:
+            f.write(f">c1\n{ref}\n")
+        with open(os.path.join(src, "GCA_000000002.1.fa"), "w") as f:
+            f.write(f">t1\n{tgt}\n")
+        rec = [{"ref_id": "GCA_000000001.1|c1_1",
+                "source": {"assembly": "GCA_000000001.1", "contig": "GCA_000000001.1|c1",
+                           "transposase_strand": strand},
+                "is_element": {"source_start": s0 + 1, "source_end": s0 + len(IS)}}]
+        rp = os.path.join(wd, "records.json"); json.dump(rec, open(rp, "w"))
+        ih = os.path.join(wd, "is_hits.tsv")
+        with open(ih, "w") as f:
+            f.write("is_id\tassembly\tcontig\ttnp_start\ttnp_end\ttnp_strand\n")
+            for k, (a_, b_, st) in enumerate(is_positions(tgt)):
+                f.write(f"x{k}\tGCA_000000002.1\tGCA_000000002.1|t1\t{a_}\t{b_}\t{st}\n")
+        left, right = ref[s0 - 1500:s0 - 1000], ref[s0 + len(IS) + 1000:s0 + len(IS) + 1500]
+        up, down = (left, right) if strand == "+" else (revcomp(right), revcomp(left))
+        anc = os.path.join(wd, "anc.tsv"); cand = os.path.join(wd, "cand.tsv")
+        with open(anc, "w") as f:
+            f.write("ref_id\tassembly\tdetails\n")
+            f.write(f"GCA_000000001.1|c1_1\tGCA_000000002.1\t{details({'t1': tgt}, up, down)}\n")
+        with open(cand, "w") as f:
+            f.write("ref_id\ttgt_asm\nGCA_000000001.1|c1_1\tGCA_000000002.1\n")
+        out = os.path.join(wd, "out")
+        subprocess.run([sys.executable, os.path.join(SCRIPTS, "inversion_full_check.py"),
+                        "--candidates", cand, "--anchor-tsv", anc, "--records", rp,
+                        "--is-hits", ih, "--src-dir", src, "--out", out, "--threads", "2"],
+                       check=True, stdout=subprocess.DEVNULL)
+        rows = list(csv.DictReader(open(os.path.join(out, "per_candidate_inversion_full.tsv")),
+                                   delimiter="\t"))
+        return rows[0] if rows else {"all_pass": "NA"}
+
+
+def test_inversion_full_check():
+    n = 0
+    for mlen in (8000, 12000, 20000, 40000):
+        M = C[:mlen]
+        ref = A + IS + M + revcomp(IS) + B
+        inv = A + IS + revcomp(M) + revcomp(IS) + B
+        for which, (s0, strand) in (("a", (len(A), "+")), ("b", (len(A) + len(IS) + mlen, "-"))):
+            for tgt in (inv, revcomp(inv)):
+                row = run_inv_full(ref, s0, strand, tgt)
+                assert row["all_pass"] == "True", (mlen, which, row)
+                n += 1
+    print(f"PASS full inversion check: {n}/16 true inversions pass (was 0/16)")
+    # only 3 kb of a 40 kb interval inverted: must not pass
+    M = C
+    ref = A + IS + M + revcomp(IS) + B
+    part = A + IS + M[:1000] + revcomp(M[1000:4000]) + M[4000:] + revcomp(IS) + B
+    try:
+        row = run_inv_full(ref, len(A), "+", part)
+    except AssertionError:
+        row = {"all_pass": "NA"}
+    assert row["all_pass"] != "True", row
+    print(f"PASS full inversion check: partial 3 kb inversion -> {row['all_pass']}")
+
+
 MAUVE = os.path.expanduser("~/.conda/envs/mauve-env/bin/progressiveMauve")
 
 
@@ -341,5 +400,6 @@ if __name__ == "__main__":
     test_parse_details_and_loci()
     test_translocation_bilateral_all_orientations()
     test_inversion_flank_check()
+    test_inversion_full_check()
     test_duplication_check()
     test_gold_validator()

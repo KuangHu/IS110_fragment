@@ -28,9 +28,13 @@ PASS criteria (configurable):
   - DNA reverse block covers >= --min-middle-cov at >= --min-identity
   - At least 2 IS hits found in tgt within --is-tol of the alignment transitions
 """
-import argparse, csv, gzip, json, os, re, shutil, subprocess, tempfile
+import argparse, csv, gzip, json, os, re, shutil, subprocess, tempfile, sys
 from collections import defaultdict
 import pysam
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import lib_rearr as lr  # noqa: E402
+from lib_alleles import revcomp as _rc  # noqa: E402
 
 
 def parse_args():
@@ -169,7 +173,7 @@ def parse_anchors(details):
 def main():
     args = parse_args()
     os.makedirs(args.out, exist_ok=True)
-    loci = load_loci(args.records)
+    loci = lr.load_loci(args.records)
     is_hits = load_is_hits(args.is_hits)
 
     anchor_by_pair = {}
@@ -195,6 +199,7 @@ def main():
 
     n_pass = 0
     n_skipped = 0
+    n_assessed = 0
     with open(out_path, "w") as out:
         out.write("ref_id\ttgt_asm\ttgt_flipped\tspan\t"
                   "A_ref_len\tA_tgt_len\tA_fwd_bp\tA_fwd_ident\tA_cov\tA_pass\t"
@@ -209,15 +214,14 @@ def main():
             details = anchor_by_pair.get((ref_id, tgt_asm), '')
             if not details:
                 n_skipped += 1; continue
-            anchors = parse_anchors(details)
-            if len(anchors) < 2:
+            d_ = lr.parse_details(details)
+            pair = next(((u, w) for u in d_["up"] for w in d_["down"]
+                         if u[0] == w[0] and u[3] != w[3]), None)
+            if pair is None:
                 n_skipped += 1; continue
-            bycontig = defaultdict(list)
-            for (c, s, e, st) in anchors:
-                bycontig[c].append((s, e, st))
-            tgt_contig = max(bycontig.keys(), key=lambda k: len(bycontig[k]))
-            tgt_hits = sorted(bycontig[tgt_contig], key=lambda x: x[0])
-            h_left, h_right = tgt_hits[0], tgt_hits[-1]
+            up_hit, down_hit = pair
+            tgt_contig = up_hit[0]
+            h_left, h_right = sorted([up_hit[1:], down_hit[1:]], key=lambda x: x[0])
             span = h_right[1] - h_left[0]
             if span > args.max_span or span < 1000:
                 n_skipped += 1; continue
@@ -225,119 +229,78 @@ def main():
             locus = loci.get(ref_id)
             if not locus:
                 n_skipped += 1; continue
-            ref_contig, ref_is_s, ref_is_e = locus
+            ref_contig, ref_is_s, ref_is_e, tnp_strand = locus
             ref_asm = ref_id.split("|")[0]
             ref_path, ref_fa = open_asm(ref_asm)
             tgt_path, tgt_fa = open_asm(tgt_asm)
             if not ref_fa or not tgt_fa:
                 n_skipped += 1; continue
-
             try:
                 ref_clen = ref_fa.get_reference_length(ref_contig)
                 tgt_clen = tgt_fa.get_reference_length(tgt_contig)
             except (KeyError, ValueError):
                 n_skipped += 1; continue
 
-            # Slice WIDE: ref ± (span + flank) around the candidate IS;
-            # tgt covering the anchor union ± flank
-            ref_lo = max(0, ref_is_s - span - args.flank)
-            ref_hi = min(ref_clen, ref_is_e + span + args.flank)
-            tgt_lo = max(0, h_left[0]  - args.flank)
-            tgt_hi = min(tgt_clen, h_right[1] + args.flank)
-            ref_seq = ref_fa.fetch(ref_contig, ref_lo, ref_hi)
-            tgt_seq = tgt_fa.fetch(tgt_contig, tgt_lo, tgt_hi)
+            # The test is made in the TARGET's frame, where both ends of the
+            # event are known (the two anchor hits):
+            #
+            #   out_L | anchor_L ........ inner ........ anchor_R | out_R
+            #
+            #   M  the inner interval must align to the reference on the
+            #      OPPOSITE strand to the flanks (it is the inverted segment)
+            #   A/B the two outer flanks, taken PAD bp beyond the anchors so
+            #      they are clear of the IS copies, must align on the flank
+            #      strand
+            # Orientation comes from the up anchor (anchors are in transposase
+            # orientation), not from which strand has more alignment near the
+            # edges of the slice -- that heuristic flipped the target whenever
+            # the inverted middle outweighed the 10-kb flanks. Coverage is a
+            # union over the region being tested: the old M_cov divided a
+            # block by its own extent (always >= 1), so 11.5 kb inverted in a
+            # 1.17-Mb span passed.
+            is_len = ref_is_e - ref_is_s
+            PAD = 1500 + is_len + 1000
+            flipped = up_hit[3] != tnp_strand        # target stored reverse to the reference
+            want_flank = "-" if flipped else "+"
+            want_mid = "+" if flipped else "-"
+            t_lo = max(0, h_left[0] - PAD - args.flank)
+            t_hi = min(tgt_clen, h_right[1] + PAD + args.flank)
+            tgt_seq = tgt_fa.fetch(tgt_contig, t_lo, t_hi).upper()
+            ref_lo = max(0, ref_is_s - span - PAD - args.flank)
+            ref_hi = min(ref_clen, ref_is_e + span + PAD + args.flank)
+            ref_seq = ref_fa.fetch(ref_contig, ref_lo, ref_hi).upper()
 
             work = tempfile.mkdtemp(prefix="inv_", dir=work_root)
-            ref_full = os.path.join(work, "ref.fa")
-            tgt_full = os.path.join(work, "tgt.fa")
-            write_fasta("REF", ref_seq, ref_full)
-            write_fasta("TGT", tgt_seq, tgt_full)
-            try:
-                blocks = align(ref_full, tgt_full, work, args.threads)
-            except Exception:
-                n_skipped += 1
-                shutil.rmtree(work, ignore_errors=True); continue
-            if not blocks:
-                n_skipped += 1
-                shutil.rmtree(work, ignore_errors=True); continue
+            # a failed alignment raises: it used to be counted as "skipped"
+            blocks = [x for x in lr.align(tgt_seq, ref_seq, work, args.threads)
+                      if x["ident"] >= args.min_identity
+                      and x["qe"] - x["qs"] >= args.min_block_bp]
+            shutil.rmtree(work, ignore_errors=True)
 
-            ref_len = len(ref_seq); tgt_len = len(tgt_seq)
-            # Decide flip: more reverse alignment at edges than forward → revcomp tgt
-            edge_pad = ref_len // 4
-            fwd_edge = sum(b["block"] for b in blocks if b["strand"] == "+"
-                           and (b["ts"] < edge_pad or b["te"] > ref_len - edge_pad))
-            rev_edge = sum(b["block"] for b in blocks if b["strand"] == "-"
-                           and (b["ts"] < edge_pad or b["te"] > ref_len - edge_pad))
-            flipped = rev_edge > fwd_edge
-            if flipped:
-                tgt_seq = revcomp(tgt_seq)
-                write_fasta("TGT", tgt_seq, tgt_full)
-                try:
-                    blocks = align(ref_full, tgt_full, work, args.threads)
-                except Exception:
-                    blocks = []
-                if not blocks:
-                    n_skipped += 1
-                    shutil.rmtree(work, ignore_errors=True); continue
+            def cover(strand, lo, hi):
+                """query bp in [lo, hi) covered by blocks on `strand`."""
+                return lr.union_bp([(max(x["qs"], lo), min(x["qe"], hi)) for x in blocks
+                                    if x["strand"] == strand and min(x["qe"], hi) > max(x["qs"], lo)])
 
-            # Find boundaries from alignment:
-            # - largest reverse block in the middle = DNA
-            # - largest forward block with ts < DNA start = region_A
-            # - largest forward block with ts > DNA end   = region_B
-            rev_blocks = [b for b in blocks if b["strand"] == "-" and b["block"] >= args.min_block_bp]
-            fwd_blocks = [b for b in blocks if b["strand"] == "+" and b["block"] >= args.min_block_bp]
-            if not rev_blocks:
-                # No reverse block at all → fail middle check
-                M_block = None
-            else:
-                M_block = max(rev_blocks, key=lambda b: b["block"])
-            if not fwd_blocks:
-                A_block = B_block = None
-            else:
-                if M_block is not None:
-                    left_fwd  = [b for b in fwd_blocks if b["te"] <= M_block["ts"] + 500]
-                    right_fwd = [b for b in fwd_blocks if b["ts"] >= M_block["te"] - 500]
-                else:
-                    left_fwd = [b for b in fwd_blocks if b["ts"] < ref_len // 2]
-                    right_fwd = [b for b in fwd_blocks if b["ts"] >= ref_len // 2]
-                A_block = max(left_fwd,  key=lambda b: b["block"]) if left_fwd  else None
-                B_block = max(right_fwd, key=lambda b: b["block"]) if right_fwd else None
+            aL, aR = h_left[0] - t_lo, h_right[1] - t_lo         # anchor span in the slice
+            regA = (max(0, aL - PAD - args.flank), max(0, aL - PAD))
+            regB = (min(len(tgt_seq), aR + PAD), min(len(tgt_seq), aR + PAD + args.flank))
+            PAD_IN = is_len + 1500     # clear the IS copy next to the unflipped anchor
+            regM = (h_left[1] - t_lo + PAD_IN, h_right[0] - t_lo - PAD_IN)
+            A_ref_len = A_tgt_len = regA[1] - regA[0]
+            B_ref_len = B_tgt_len = regB[1] - regB[0]
+            M_ref_len = M_tgt_len = max(0, regM[1] - regM[0])
+            A_bp, B_bp = cover(want_flank, *regA), cover(want_flank, *regB)
+            M_bp = cover(want_mid, *regM) if M_ref_len > 0 else 0
+            A_id = B_id = M_id = max((x["ident"] for x in blocks), default=0.0)
+            A_cov = A_bp / A_ref_len if A_ref_len >= 1000 else 0
+            B_cov = B_bp / B_ref_len if B_ref_len >= 1000 else 0
+            M_cov = M_bp / M_ref_len if M_ref_len >= 1000 else 0
+            A_pass = A_cov >= args.min_flank_cov
+            B_pass = B_cov >= args.min_flank_cov
+            M_pass = M_cov >= args.min_middle_cov
 
-            # Region lengths derived from the alignment boundaries
-            if A_block and M_block and B_block:
-                A_ref_len = A_block["te"]
-                B_ref_len = ref_len - B_block["ts"]
-                M_ref_len = M_block["te"] - M_block["ts"]
-                A_tgt_len = A_block["qe"]
-                B_tgt_len = len(tgt_seq) - B_block["qs"]
-                M_tgt_len = M_block["qe"] - M_block["qs"]
-            else:
-                A_ref_len = A_block["te"] if A_block else 0
-                B_ref_len = ref_len - B_block["ts"] if B_block else 0
-                M_ref_len = M_block["te"] - M_block["ts"] if M_block else 0
-                A_tgt_len = A_block["qe"] if A_block else 0
-                B_tgt_len = len(tgt_seq) - B_block["qs"] if B_block else 0
-                M_tgt_len = M_block["qe"] - M_block["qs"] if M_block else 0
-
-            A_bp = A_block["block"] if A_block else 0
-            A_id = A_block["ident"] if A_block else 0
-            B_bp = B_block["block"] if B_block else 0
-            B_id = B_block["ident"] if B_block else 0
-            M_bp = M_block["block"] if M_block else 0
-            M_id = M_block["ident"] if M_block else 0
-
-            A_cov = A_bp / max(1, min(A_ref_len, A_tgt_len)) if A_ref_len and A_tgt_len else 0
-            B_cov = B_bp / max(1, min(B_ref_len, B_tgt_len)) if B_ref_len and B_tgt_len else 0
-            M_cov = M_bp / max(1, min(M_ref_len, M_tgt_len)) if M_ref_len and M_tgt_len else 0
-
-            A_pass = A_cov >= args.min_flank_cov  and A_id >= args.min_identity and A_bp >= 1000
-            B_pass = B_cov >= args.min_flank_cov  and B_id >= args.min_identity and B_bp >= 1000
-            M_pass = M_cov >= args.min_middle_cov and M_id >= args.min_identity and M_bp >= 1000
-
-            # Verify tgt has an IS at each anchor position (= the inversion endpoints).
-            # The anchors are 1 kb sequences immediately flanking the ref IS; in tgt
-            # they always land within a couple kb of an IS by construction of the
-            # anchor-finding pipeline. We just confirm that's true for THIS candidate.
+            # an IS copy at each end of the inverted interval in the target
             tgt_is = merge_is(is_hits.get(tgt_asm, {}).get(tgt_contig, []))
             left_mid  = (h_left[0]  + h_left[1])  // 2
             right_mid = (h_right[0] + h_right[1]) // 2
@@ -346,6 +309,7 @@ def main():
 
             all_pass = A_pass and B_pass and M_pass and tgt_is_at_both
             if all_pass: n_pass += 1
+            n_assessed += 1
 
             out.write(f"{ref_id}\t{tgt_asm}\t{flipped}\t{span}\t"
                       f"{A_ref_len}\t{A_tgt_len}\t{A_bp}\t{A_id:.1f}\t{A_cov:.3f}\t{A_pass}\t"
@@ -357,8 +321,8 @@ def main():
     for _, fa in fa_cache.values():
         if fa: fa.close()
     shutil.rmtree(work_root, ignore_errors=True)
-    print(f"\nDONE: {n_pass}/{len(rows)} pass FULL 3-way check + IS-at-transitions. "
-          f"{n_skipped} skipped.")
+    print(f"\nDONE: {n_pass}/{n_assessed} assessed candidates pass the FULL 3-way check + "
+          f"IS-at-transitions. {n_skipped} of {len(rows)} could not be assessed (no row).")
     print(f"Wrote {out_path}")
 
 
