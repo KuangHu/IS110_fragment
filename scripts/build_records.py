@@ -282,6 +282,21 @@ def _build_one_record(packed):
             "v0_peak_count": best["v0_peak"][1] if best["v0_peak"] else 0,
             "empty_peak_distance": best["empty_peak"][0] if best["empty_peak"] else None,
             "empty_peak_count": best["empty_peak"][1] if best["empty_peak"] else 0,
+            # how many 50-bp bins share the top count (1 = unique mode)
+            "v0_peak_n_tied": mode_ties([p["distance"] for p in best["v0_obs"]]),
+            "empty_peak_n_tied": mode_ties([p["distance"] for p in best["empty_obs"]]),
+            # support of the call that decided the element, and how many
+            # candidates had that same support (1 = no tie):
+            #   decomposition : empties voting for the chosen (off5, off3) /
+            #                   distinct calls with as many votes
+            #   fallback      : observations in the chosen empty-length bin /
+            #                   bins with as many
+            #   no empty site : 0 / 0 (nothing was chosen)
+            "call_support": (dec["n_consensus"] if dec and dec["ok"] else
+                             (best["empty_peak"][1] if has_empty else 0)),
+            "call_n_tied": (dec["n_tied_calls"] if dec and dec["ok"] else
+                            (mode_ties([p["distance"] for p in best["empty_obs"]])
+                             if has_empty else 0)),
             "is_element_length_inferred": is_length,
             "n_v0_observations": len(best["v0_obs"]),
             "n_empty_observations": len(best["empty_obs"]),
@@ -315,6 +330,18 @@ def length_mode(values, bin_size=50):
     best = max(bins.values(), key=len)
     best.sort()
     return (best[len(best) // 2], len(best))
+
+
+def mode_ties(values, bin_size=50):
+    """Number of bins that share the largest size (1 = the mode is unique).
+    length_mode() takes the FIRST such bin in the order of `values`, i.e. the
+    bin of the first observation in sorted assembly order -- deterministic,
+    but not a judgement. Reporting only: this function chooses nothing."""
+    if not values:
+        return 0
+    bins = Counter(v // bin_size for v in values)
+    top = max(bins.values())
+    return sum(1 for n in bins.values() if n == top)
 
 
 def pair_anchors(hits, ref_id, D, info, opts):
@@ -526,6 +553,7 @@ def decompose_boundary(src, info, dec, top_n, max_align_cells):
             "consensus_support": round(n_cons / len(calls), 3),
             "n_distinct_calls": len(votes),
             "consensus_tied": n_tied > 1,
+            "n_tied_calls": n_tied,
             "orf_clipped_5p": max(0, off5), "orf_clipped_3p": max(0, -off3),
             "rejected_assemblies": rejected,
             "accepted_assemblies": [c[5] for c in calls],
@@ -681,7 +709,9 @@ def main():
                 "is_element_len\ttnp_len\tD_used\tsource_db\tv0_peak\tempty_peak\t"
                 "n_v0\tn_empty\tn_v1plus\tn_top_empty\t"
                 "boundary_method\toffset_5p\toffset_3p\tdecomp_D\tdecomp_support\t"
-                "junction_microhomology_bp\ttsd_len\tevent_key\n")
+                "junction_microhomology_bp\ttsd_len\tevent_key\t"
+                "call_support\tcall_n_tied\tv0_peak_count\tv0_peak_n_tied\t"
+                "empty_peak_count\tempty_peak_n_tied\n")
         for r in all_records:
             be = r["boundary_evidence"]
             dc = be.get("decomposition") or {}
@@ -697,7 +727,10 @@ def main():
                     f"{r['is_element']['end_offset_3p']}\t"
                     f"{dc.get('D', '')}\t{dc.get('consensus_support', '')}\t"
                     f"{dc.get('junction_microhomology_bp', '')}\t"
-                    f"{(dc.get('tsd') or {}).get('length', '')}\t{r['event_key']}\n")
+                    f"{(dc.get('tsd') or {}).get('length', '')}\t{r['event_key']}\t"
+                    f"{be['call_support']}\t{be['call_n_tied']}\t"
+                    f"{be['v0_peak_count']}\t{be['v0_peak_n_tied']}\t"
+                    f"{be['empty_peak_count']}\t{be['empty_peak_n_tied']}\n")
 
     print(f"\n=== Build summary ===", file=sys.stderr)
     print(f"  Records built:       {len(all_records):,} of {n_done:,} refs with "
