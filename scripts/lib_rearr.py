@@ -144,3 +144,34 @@ def fetch_window(fa, contig, s, e, window):
         return "", 0
     a, b = max(0, s - window), min(clen, e + window)
     return fa.fetch(contig, a, b).upper(), a
+
+
+def copy_depth(blocks, min_block, min_ident, strand=None):
+    """How many separate places in the target carry the same stretch of the
+    query? blocks: output of align(). Blocks that overlap ON THE TARGET are one
+    place (the longer is kept). Returns (dup_bp, max_copies, places):
+      dup_bp      query bp present at >= 2 places
+      max_copies  largest number of places covering one stretch >= min_block
+      places      the blocks used
+    This is the test for 'the segment appears twice'. Counting forward blocks
+    >= 1 kb anywhere in the window (what the duplication check did) passed a
+    target with no duplicated segment at all."""
+    use = sorted((b for b in blocks if b["ident"] >= min_ident
+                  and b["qe"] - b["qs"] >= min_block
+                  and (strand is None or b["strand"] == strand)),
+                 key=lambda b: -(b["qe"] - b["qs"]))
+    places = []
+    for b in use:
+        if not any(min(b["te"], p["te"]) - max(b["ts"], p["ts"]) > 0 for p in places):
+            places.append(b)
+    pts = sorted([(p["qs"], 1) for p in places] + [(p["qe"], -1) for p in places])
+    dup_bp, max_copies, depth, last = 0, 0, 0, None
+    for pos, d in pts:
+        if last is not None and pos > last:
+            if depth >= 2:
+                dup_bp += pos - last
+            if pos - last >= min_block:
+                max_copies = max(max_copies, depth)
+        depth += d
+        last = pos
+    return dup_bp, max_copies, places

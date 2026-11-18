@@ -158,6 +158,83 @@ def test_inversion_flank_check():
             print(f"PASS inversion check, ref element IS_{which}: {name} -> {row['passes']}")
 
 
+def is_positions(seq):
+    """1-based (start, end, strand) of every IS copy in seq."""
+    out = []
+    for q, st in ((IS, "+"), (revcomp(IS), "-")):
+        i = seq.find(q)
+        while i >= 0:
+            out.append((i + 1, i + len(IS), st)); i = seq.find(q, i + 1)
+    return sorted(out)
+
+
+def run_dup(ref, s0, strand, tgt_seq):
+    with tempfile.TemporaryDirectory() as wd:
+        src = os.path.join(wd, "src"); os.makedirs(src)
+        with open(os.path.join(src, "GCA_000000001.1.fa"), "w") as f:
+            f.write(f">c1\n{ref}\n")
+        with open(os.path.join(src, "GCA_000000002.1.fa"), "w") as f:
+            f.write(f">t1\n{tgt_seq}\n")
+        rec = [{"ref_id": "GCA_000000001.1|c1_1",
+                "source": {"assembly": "GCA_000000001.1", "contig": "GCA_000000001.1|c1",
+                           "transposase_strand": strand},
+                "is_element": {"source_start": s0 + 1, "source_end": s0 + len(IS)}}]
+        rp = os.path.join(wd, "records.json"); json.dump(rec, open(rp, "w"))
+        ih = os.path.join(wd, "is_hits.tsv")
+        with open(ih, "w") as f:
+            f.write("is_id\tassembly\tcontig\ttnp_start\ttnp_end\ttnp_strand\n")
+            for k, (a_, b_, st) in enumerate(is_positions(tgt_seq)):
+                f.write(f"x{k}\tGCA_000000002.1\tGCA_000000002.1|t1\t{a_}\t{b_}\t{st}\n")
+        left, right = ref[s0 - 1500:s0 - 1000], ref[s0 + len(IS) + 1000:s0 + len(IS) + 1500]
+        up, down = (left, right) if strand == "+" else (revcomp(right), revcomp(left))
+        best_side, hits = None, []
+        for side, anc in (("up", up), ("down", down)):
+            h = []
+            for q, st in ((anc, "+"), (revcomp(anc), "-")):
+                i = tgt_seq.find(q)
+                while i >= 0:
+                    h.append(f"t1:{i}-{i + 500}({st})"); i = tgt_seq.find(q, i + 1)
+            if len(h) >= 2:
+                best_side, hits = side, h
+        assert best_side, "fixture has no anchor multiplicity"
+        det = f"up=[{';'.join(hits)}] down=[]" if best_side == "up" else f"up=[] down=[{';'.join(hits)}]"
+        cand = os.path.join(wd, "cand.tsv")
+        with open(cand, "w") as f:
+            f.write("category\tref_id\tassembly\tdetails\tbest_side\n")
+            f.write(f"duplication\tGCA_000000001.1|c1_1\tGCA_000000002.1\t{det}\t{best_side}\n")
+        out = os.path.join(wd, "out")
+        subprocess.run([sys.executable, os.path.join(SCRIPTS, "is_duplication_check.py"),
+                        "--candidates", cand, "--records", rp, "--src-dir", src,
+                        "--is-hits", ih, "--out", out, "--threads", "2"],
+                       check=True, stdout=subprocess.DEVNULL)
+        return list(csv.DictReader(open(os.path.join(out, "per_candidate_duplication.tsv")),
+                                   delimiter="\t"))[0]
+
+
+def test_duplication_check():
+    S = B[:12000]
+    rest = B[12000:]
+    for strand in "+-":
+        el = IS if strand == "+" else revcomp(IS)
+        # reference: A [IS] S rest      (for '-': the mirror image, so the
+        # duplicated segment is still on the element's DOWN side)
+        ref = A + el + S + rest if strand == "+" else revcomp(A + IS + S + rest)
+        s0 = ref.find(el)
+        dup = A + IS + S + IS + S + IS + rest
+        cases = (("true duplication", dup, "True"),
+                 ("true duplication, contig reversed", revcomp(dup), "True"),
+                 # no duplicated segment: just a second copy of the anchor
+                 # region next to another IS far away
+                 ("anchor region copied only", A + IS + S + rest + C + IS + S[500:2500] + X, "False"),
+                 # second copy inverted: not a direct repeat
+                 ("second copy inverted", A + IS + S + IS + revcomp(S) + IS + rest, "NA"))
+        for name, tgt, want in cases:
+            row = run_dup(ref, s0, strand, tgt)
+            assert row["passes"] == want, (strand, name, row)
+            print(f"PASS duplication check, element strand {strand}: {name} -> {row['passes']} "
+                  f"(dup_bp={row['dup_bp']})")
+
+
 MAUVE = os.path.expanduser("~/.conda/envs/mauve-env/bin/progressiveMauve")
 
 
@@ -247,4 +324,5 @@ if __name__ == "__main__":
     test_parse_details_and_loci()
     test_translocation_bilateral_all_orientations()
     test_inversion_flank_check()
+    test_duplication_check()
     test_gold_validator()

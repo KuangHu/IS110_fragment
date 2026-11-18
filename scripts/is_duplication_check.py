@@ -23,9 +23,12 @@ PASS criteria (configurable):
   - (optional) at least --min-fwd-blocks forward-strand blocks of ref MIDDLE
     appearing in target at >= --min-identity identity and >= --min-block-bp bp
 """
-import argparse, csv, gzip, json, os, re, shutil, subprocess, tempfile
+import argparse, csv, gzip, json, os, re, shutil, subprocess, tempfile, sys
 from collections import defaultdict
 import pysam
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import lib_rearr as lr  # noqa: E402
 
 
 def parse_args():
@@ -202,7 +205,7 @@ def nearest_is(is_hits_for_asm, contig, pos, tol):
 def main():
     args = parse_args()
     os.makedirs(args.out, exist_ok=True)
-    loci = load_loci(args.records)
+    loci = lr.load_loci(args.records)
     is_hits = load_is_hits(args.is_hits)
     print(f"loaded is_hits: {sum(sum(len(v) for v in d.values()) for d in is_hits.values())} hits "
           f"across {len(is_hits)} assemblies", flush=True)
@@ -214,7 +217,8 @@ def main():
         side = (r.get("best_side") or "").strip()
         if side not in ("up", "down"):
             continue
-        anchors = parse_anchors(r.get("details", ""))
+        d_ = lr.parse_details(r.get("details", ""))
+        anchors = d_["up"] + d_["down"]
         if len(anchors) < 2:
             continue
         # Group by contig and keep only contigs with >= 2 distinct positions
@@ -254,90 +258,109 @@ def main():
         fa_cache[asm] = pysam.FastaFile(path) if path else None
         return fa_cache[asm]
 
-    n_pass = 0
+    n_pass = n_assessed = 0
     with open(out_path, "w") as out:
         out.write("ref_id\ttgt_asm\tbest_side\tn_anchor_positions\t"
                   "n_is_flanked\tcopy_separation\tn_fwd_blocks\t"
-                  "best_block_bp\tbest_block_ident\tflanked_positions\tpasses\n")
+                  "best_block_bp\tbest_block_ident\tflanked_positions\tpasses\t"
+                  "dup_bp\ttgt_contig\tstatus\n")
+
+        def skip(ref_id, tgt_asm, side, why):
+            out.write(f"{ref_id}\t{tgt_asm}\t{side}\t0\t0\t0\t0\t0\t0.0\t\tNA\t0\t\t{why}\n")
+
         for i, r in enumerate(rows):
             if i % 50 == 0:
                 print(f"  {i}/{len(rows)}", flush=True)
-            ref_id  = r["ref_id"]
-            tgt_asm = r["assembly"]
+            ref_id, tgt_asm, side = r["ref_id"], r["assembly"], r["_best_side"]
             locus = loci.get(ref_id)
-            if not locus: continue
-            ref_contig, is_start, is_end = locus
-            ref_asm = ref_id.split("|")[0]
-            ref_fa = open_asm(ref_asm)
+            if not locus:
+                skip(ref_id, tgt_asm, side, "ref_id not in records"); continue
+            ref_contig, is_s0, is_e, tnp_strand = locus
+            ref_fa = open_asm(ref_id.split("|")[0])
             tgt_fa = open_asm(tgt_asm)
-            if not ref_fa or not tgt_fa: continue
+            if not ref_fa or not tgt_fa:
+                skip(ref_id, tgt_asm, side, "assembly FASTA not found"); continue
             try:
-                clen = ref_fa.get_reference_length(ref_contig)
+                # MIDDLE = the flank on the anchor's side, in TRANSPOSASE
+                # orientation. best_side is up/down relative to the transposase;
+                # it was applied as genomic left/right, so every minus-strand
+                # element was tested with the flank on the wrong side.
+                up_seq, down_seq = lr.ref_proxies(ref_fa, ref_contig, is_s0, is_e,
+                                                  tnp_strand, args.middle_window)
             except (KeyError, ValueError):
-                continue
+                skip(ref_id, tgt_asm, side, "ref contig not in FASTA"); continue
+            mid_seq = down_seq if side == "down" else up_seq
+            if len(mid_seq) < args.min_block_bp:
+                skip(ref_id, tgt_asm, side, "reference flank too short (contig end)"); continue
 
-            anchors = r["_anchors"]
             target_is_idx = is_hits.get(tgt_asm, {})
-
-            # Test (b): IS-flanking at each anchor hit position
-            flanked = []
-            for (c, s, e, strand) in anchors:
-                mid = (s + e) // 2
-                nis = nearest_is(target_is_idx, c, mid, args.is_tol)
-                if nis is not None:
-                    flanked.append((c, s, e, nis[0], nis[1], nis[2]))
-            n_flanked = len(flanked)
-
-            # Position separation
-            positions = sorted({(a[0], a[1]) for a in anchors})
-            sep = positions[-1][1] - positions[0][1] if len(positions) >= 2 else 0
-
-            # Test (c): forward alignment blocks of MIDDLE in target region
+            # Evaluate ONE contig and ONE strand at a time. Positions on
+            # different contigs were pooled: the 'separation' was a difference
+            # of coordinates on two contigs, one flanked hit on each of two
+            # contigs satisfied --min-flanked 2, and a second copy in INVERTED
+            # orientation passed a test that requires direct repeats.
+            groups = defaultdict(list)
+            for (c, s_, e_, st) in r["_anchors"]:
+                groups[(c, st)].append((s_, e_))
+            best = None
             work = tempfile.mkdtemp(prefix="dup_", dir=work_root)
-            if r["_best_side"] == "down":
-                ms = is_end; me = min(clen, is_end + args.middle_window)
-            else:
-                ms = max(0, is_start - args.middle_window); me = is_start
-            mid_seq = ref_fa.fetch(ref_contig, ms, me) if me > ms else ""
-            ref_mid_path = os.path.join(work, "ref_middle.fa")
-            if mid_seq:
-                write_fasta("REF_MID", mid_seq, ref_mid_path)
-            tgt_region_path = os.path.join(work, "tgt.fa")
-            tgt_bp = write_target_region(tgt_fa, anchors,
-                                         args.tgt_context, tgt_region_path)
-            blocks = []
-            if mid_seq and tgt_bp > 0:
-                try:
-                    blocks = find_forward_blocks(
-                        ref_mid_path, tgt_region_path, work, args.threads,
-                        min_block_bp=args.min_block_bp, min_identity=args.min_identity,
-                    )
-                except Exception:
-                    blocks = []
-            n_fwd = len(blocks)
-            best_block_bp = max((b["block_bp"] for b in blocks), default=0)
-            best_ident    = max((b["identity"]    for b in blocks), default=0.0)
-
-            # PASS criterion: IS-flanked anchor positions AND (if requested)
-            # enough forward-strand alignment blocks of MIDDLE in target
-            passes = (n_flanked >= args.min_flanked
-                      and len(positions) >= 2
-                      and sep >= args.min_copy_sep
-                      and n_fwd >= args.min_fwd_blocks)
-            if passes: n_pass += 1
-            flank_str = ";".join(f"{c}:{s}-{e}~IS:{iss}-{ise}@{d}bp"
-                                 for (c, s, e, iss, ise, d) in flanked[:3])
-            out.write(f"{ref_id}\t{tgt_asm}\t{r['_best_side']}\t{len(positions)}\t"
-                      f"{n_flanked}\t{sep}\t{n_fwd}\t{best_block_bp}\t{best_ident:.1f}\t"
-                      f"{flank_str}\t{passes}\n")
+            for (c, st), pos in sorted(groups.items()):
+                pos = sorted(set(pos))
+                if len(pos) < 2:
+                    continue
+                sep = pos[-1][0] - pos[0][0]
+                flanked = []
+                for (s_, e_) in pos:
+                    nis = nearest_is(target_is_idx, c, (s_ + e_) // 2, args.is_tol)
+                    if nis is not None:
+                        flanked.append((c, s_, e_, nis[0], nis[1], nis[2]))
+                tseq, toff = lr.fetch_window(tgt_fa, c, pos[0][0], pos[-1][1], args.tgt_context)
+                if not tseq:
+                    continue
+                # the segment must be present at >= 2 separate places, on the
+                # anchors' strand; blocks that are just an IS copy do not count
+                blocks = []
+                for b in lr.align(mid_seq, tseq, work, args.threads):
+                    ts_, te_ = b["ts"] + toff, b["te"] + toff
+                    is_bp = lr.union_bp([(max(ts_, h[0] - 300), min(te_, h[1] + 300))
+                                         for h in target_is_idx.get(c, [])
+                                         if min(te_, h[1] + 300) > max(ts_, h[0] - 300)])
+                    if is_bp < 0.8 * (te_ - ts_):
+                        blocks.append(b)
+                dup_bp, copies, places = lr.copy_depth(blocks, args.min_block_bp,
+                                                       args.min_identity, strand=st)
+                cand = {"contig": c, "n_pos": len(pos), "sep": sep, "flanked": flanked,
+                        "dup_bp": dup_bp, "copies": copies,
+                        "best_bp": max((p["qe"] - p["qs"] for p in places), default=0),
+                        "best_id": max((p["ident"] for p in places), default=0.0)}
+                cand["passes"] = (len(flanked) >= args.min_flanked
+                                  and sep >= args.min_copy_sep
+                                  and copies >= args.min_fwd_blocks
+                                  and dup_bp >= args.min_block_bp)
+                if best is None or (cand["passes"], cand["dup_bp"]) > (best["passes"], best["dup_bp"]):
+                    best = cand
             shutil.rmtree(work, ignore_errors=True)
+            if best is None:
+                skip(ref_id, tgt_asm, side, "no contig with two same-strand anchor hits"); continue
+            n_assessed += 1
+            if best["passes"]: n_pass += 1
+            flank_str = ";".join(f"{c}:{s_}-{e_}~IS:{iss}-{ise}@{d}bp"
+                                 for (c, s_, e_, iss, ise, d) in best["flanked"][:3])
+            out.write(f"{ref_id}\t{tgt_asm}\t{side}\t{best['n_pos']}\t"
+                      f"{len(best['flanked'])}\t{best['sep']}\t{best['copies']}\t"
+                      f"{best['best_bp']}\t{best['best_id']:.1f}\t{flank_str}\t"
+                      f"{best['passes']}\t{best['dup_bp']}\t{best['contig']}\tassessed\n")
 
     for fa in fa_cache.values():
         if fa: fa.close()
     shutil.rmtree(work_root, ignore_errors=True)
-    print(f"\nDONE: {n_pass}/{len(rows)} pass IS-mediated duplication test "
-          f"(>= {args.min_flanked} anchor hits IS-flanked within {args.is_tol} bp, "
-          f"sep >= {args.min_copy_sep} bp)")
+    print(f"\nDONE: {n_pass}/{n_assessed} assessed candidates pass the IS-mediated "
+          f"duplication test (>= {args.min_flanked} anchor hits IS-flanked within "
+          f"{args.is_tol} bp, sep >= {args.min_copy_sep} bp, >= {args.min_block_bp} bp of the "
+          f"flank present at >= {args.min_fwd_blocks} places on one contig and strand); "
+          f"{len(rows) - n_assessed} not assessable")
+    print("  NOTE: rows are per (reference element, target genome). The same target "
+          "duplication is reported from every reference that carries the element.")
     print(f"Wrote {out_path}")
 
 
