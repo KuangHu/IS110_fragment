@@ -19,6 +19,9 @@ NOT fixed -- these verdicts remain weaker than their names (see README "Known li
       which also still use the old contig-name parser (#24, two of them).
 - #31 (part) event identity in the collector is (category, ref_id, target): the same
       target event reached from several reference elements is several records.
+      LATER (same day): records are still one per reference element, but
+      `confirmed.tsv` now has `target_event` / `n_records_same_target_event` and the
+      summary has `n_target_events`; count events with those.
 - #1 is handled by requiring each contig to run past the element; a translocation whose
       contig ends just beyond the element is therefore "not assessable", not rejected.
 

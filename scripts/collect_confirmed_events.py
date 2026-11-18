@@ -153,6 +153,42 @@ def write_vcf_header(fh, contigs, species):
     fh.write("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n")
 
 
+def group_target_events(flat, sp, slack=1000):
+    """Mark records that describe the SAME event in the target genome.
+
+    One row is one (category, reference element, target assembly). Copies of
+    the same IS family at different reference loci can all point at one and
+    the same rearranged place in the target, which then appears as several
+    confirmed events. Rows of one category and one target assembly whose
+    target anchors lie on the same contigs at overlapping positions (within
+    `slack` bp) get one `target_event` id; count events with that column.
+    Nothing is removed."""
+    parent = list(range(len(flat)))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    by = defaultdict(list)
+    for i, r in enumerate(flat):
+        by[(r["category"], r["tgt_asm"], tuple(sorted(r["_anchors"])))].append(i)
+    for idx in by.values():
+        for x in range(len(idx)):
+            for y in range(x + 1, len(idx)):
+                a, b = flat[idx[x]]["_anchors"], flat[idx[y]]["_anchors"]
+                if all(a[c][0] - slack <= b[c][1] and b[c][0] - slack <= a[c][1] for c in a):
+                    parent[find(idx[x])] = find(idx[y])
+    members = defaultdict(list)
+    for i in range(len(flat)):
+        members[find(i)].append(i)
+    for n, root in enumerate(sorted(members, key=lambda r: min(members[r])), 1):
+        for i in members[root]:
+            flat[i]["target_event"] = f"{sp}_T{n:04d}"
+            flat[i]["n_records_same_target_event"] = len(members[root])
+
+
 def collect_for_species(sp, args, out_root):
     runs = args.runs
     sp_dir = os.path.join(runs, sp)
@@ -398,7 +434,11 @@ def collect_for_species(sp, args, out_root):
             "verdict": r["verdict"],
             "confirmed_by_software": confirmed_by_str,
             "evidence_dir": os.path.relpath(ev, sp_out),
+            "_anchors": {a["contig"]: (a["anchor_start"], a["anchor_end"])
+                         for a in anchor_records},
         })
+
+    group_target_events(flat, sp)
 
     # --- write outputs for this species ---
     # contigs touched (for VCF header)
@@ -413,7 +453,8 @@ def collect_for_species(sp, args, out_root):
     cols = ["event_id", "species", "category", "svtype", "ref_id", "ref_asm", "tgt_asm",
             "is_contig", "is_start", "is_end", "is_strand", "target_anchor_contigs",
             "n_target_contigs", "val_dnadiff", "val_mauve", "mauve_metric",
-            "min_anchor_end_dist_bp", "verdict", "confirmed_by_software", "evidence_dir"]
+            "min_anchor_end_dist_bp", "verdict", "confirmed_by_software", "evidence_dir",
+            "target_event", "n_records_same_target_event"]
     with open(tsv_path, "w") as fh:
         fh.write("\t".join(cols) + "\n")
         for row in flat:
@@ -429,6 +470,7 @@ def collect_for_species(sp, args, out_root):
     shutil.rmtree(work, ignore_errors=True)
 
     return {"species": sp, "n_confirmed": len(flat), "n_validated": len(rows),
+            "n_target_events": len({r["target_event"] for r in flat}),
             "n_confirmed_in_validation": len(confirmed),
             "n_skipped": sum(skipped.values()),
             "by_category": {cat: sum(1 for r in flat if r["category"] == cat)
@@ -453,12 +495,15 @@ def main():
     # all-species summary TSV
     summ_path = os.path.join(args.out, "all_species_summary.tsv")
     with open(summ_path, "w") as f:
-        f.write("species\tn_validated\tn_confirmed\tn_inversion\tn_duplication\tn_translocation\n")
+        # n_target_events: records that describe the same place in the same
+        # target genome counted once (see group_target_events)
+        f.write("species\tn_validated\tn_confirmed\tn_inversion\tn_duplication\tn_translocation"
+                "\tn_target_events\n")
         for s in summary:
             bc = s.get("by_category", {})
             f.write(f"{s['species']}\t{s['n_validated']}\t{s['n_confirmed']}\t"
                     f"{bc.get('inversion_only',0)}\t{bc.get('duplication',0)}\t"
-                    f"{bc.get('translocation_only',0)}\n")
+                    f"{bc.get('translocation_only',0)}\t{s.get('n_target_events', 0)}\n")
 
     # combined VCF + TSV
     all_vcf = os.path.join(args.out, "all_confirmed.vcf")
