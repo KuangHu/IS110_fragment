@@ -23,7 +23,7 @@ from multiprocessing.pool import ThreadPool
 from collections import defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from lib_alleles import (parse_paf_line, place_per_assembly,  # noqa: E402
+from lib_alleles import (parse_paf_line, place_per_assembly, source_core,  # noqa: E402
                          decompose_alleles, canonical_insert_key, canon_key,
                          revcomp)
 
@@ -363,7 +363,8 @@ def main():
         downs = anchor_hits.get(f"{rid}__down", {})
         if not ups or not downs: continue
         placements = place_per_assembly(
-            ups, downs, min_gap=-args.max_anchor_overlap,
+            ups, downs, exclude_core=source_core(rid),   # never the element's own genome
+            min_gap=-args.max_anchor_overlap,
             max_gap=args.max_pair_dist, margin_ratio=args.margin)
         for pl in placements.values():
             if pl["status"] == "ambiguous":

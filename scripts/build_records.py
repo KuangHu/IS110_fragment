@@ -39,7 +39,7 @@ from multiprocessing import Pool
 import pysam
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from lib_alleles import (load_anchor_hits, place_per_assembly,  # noqa: E402
+from lib_alleles import (load_anchor_hits, place_per_assembly, source_core,  # noqa: E402
                          gap_tolerance, classify_gap, decompose_alleles,
                          find_tsd, canon_key, revcomp)
 
@@ -353,6 +353,7 @@ def pair_anchors(hits, ref_id, D, info, opts):
     expected_v0 = 2 * D + info["tnp_len"]
     placements = place_per_assembly(
         hits.get((ref_id, "up", D), {}), hits.get((ref_id, "down", D), {}),
+        exclude_core=source_core(ref_id),
         min_gap=-50, max_gap=expected_v0 + opts["max_extra_bp"],
         margin_ratio=opts["margin"])
     pairs, n_ambiguous = [], 0

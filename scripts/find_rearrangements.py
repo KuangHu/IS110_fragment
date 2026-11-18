@@ -20,7 +20,7 @@ import sys
 from collections import defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from lib_alleles import assembly_core, _asm_rank, split_target  # noqa: E402
+from lib_alleles import assembly_core, _asm_rank, split_target, source_core  # noqa: E402
 
 
 ANCHOR_RE = re.compile(r"^(.+)__(up|down)(\d+)$")
@@ -99,6 +99,14 @@ def main():
 
     # GCA_x and GCF_x are the same genome: keep one representative per
     # assembly core so each rearrangement is not counted twice.
+    # ... and the element's own genome (or its twin) is not an observation:
+    # its anchors align back to the locus they were cut from.
+    n_self = 0
+    for (ref_id, assembly) in list(obs):
+        if assembly_core(assembly) == source_core(ref_id):
+            del obs[(ref_id, assembly)]
+            n_self += 1
+    print(f"Dropped {n_self:,} (ref, own assembly or twin) pairs", file=sys.stderr)
     asms_per_ref = defaultdict(set)
     for (ref_id, assembly) in obs:
         asms_per_ref[ref_id].add(assembly)

@@ -320,6 +320,42 @@ def test_source_db_is_separate():
     build_records._SRC = None
 
 
+
+def _anchor_hits(ref_id, D, targets, tnp_len=1000):
+    """{(ref_id, side, D): {tname: [Hit]}} with one filled-distance placement
+    on each target contig."""
+    from lib_alleles import Hit
+    hits = {(ref_id, "up", D): {}, (ref_id, "down", D): {}}
+    for t in targets:
+        hits[(ref_id, "up", D)][t] = [Hit(f"{ref_id}__up{D}", 500, 0, 500, "+", t, 900000,
+                                          10000, 10500, 500, 500, 100.0, 100.0)]
+        d0 = 10500 + 2 * D + tnp_len
+        hits[(ref_id, "down", D)][t] = [Hit(f"{ref_id}__down{D}", 500, 0, 500, "+", t, 900000,
+                                            d0, d0 + 500, 500, 500, 100.0, 100.0)]
+    return hits
+
+
+def test_own_genome_and_twin_are_not_observations():
+    """An element's anchors always align back to its own locus and to the same
+    locus in the GCA/GCF twin; neither may count as an observation."""
+    from lib_alleles import place_per_assembly, source_core
+    rid = "GCA_000001.1|CP1.1_7"
+    assert source_core(rid) == source_core("GCF_000001.2|NZ_CP1.1_7") == "000001"
+    hits = _anchor_hits(rid, 1000, ["GCA_000001.1|CP1.1", "GCF_000001.1|NZ_CP1.1",
+                                    "GCA_000002.1|CP2.1"])
+    up, down = hits[(rid, "up", 1000)], hits[(rid, "down", 1000)]
+    assert set(place_per_assembly(up, down)) == {"000001", "000002"}          # old behaviour
+    assert set(place_per_assembly(up, down, exclude_core=source_core(rid))) == {"000002"}
+    opts = {"tol_bp": 100, "tol_frac": 0.002, "margin": 0.05, "max_extra_bp": 50000,
+            "decompose_max_d": 5000, "min_is_size": 0, "max_is_size": 0}
+    pairs, _, _ = build_records.pair_anchors(hits, rid, 1000, {"tnp_len": 1000}, opts)
+    assert [p["assembly"] for p in pairs] == ["GCA_000002.1"], pairs
+    # own genome + twin only: no observation at all
+    only_self = _anchor_hits(rid, 1000, ["GCA_000001.1|CP1.1", "GCF_000001.1|NZ_CP1.1"])
+    pairs, _, _ = build_records.pair_anchors(only_self, rid, 1000, {"tnp_len": 1000}, opts)
+    assert pairs == []
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

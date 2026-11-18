@@ -18,7 +18,7 @@ import sys
 from collections import defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from lib_alleles import (load_anchor_hits, place_per_assembly,  # noqa: E402
+from lib_alleles import (load_anchor_hits, place_per_assembly, source_core,  # noqa: E402
                          gap_tolerance, classify_gap)
 
 
@@ -104,6 +104,7 @@ def main():
             tol = gap_tolerance(expected_v0, args.tol_bp, args.tol_frac)
             placements = place_per_assembly(
                 hits.get((ref_id, "up", D), {}), hits.get((ref_id, "down", D), {}),
+                exclude_core=source_core(ref_id),     # never the element's own genome
                 min_gap=-50, max_gap=min(args.max_pair_distance,
                                          expected_v0 + args.max_extra_bp),
                 margin_ratio=args.margin)

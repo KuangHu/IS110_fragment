@@ -301,8 +301,20 @@ def place_pair(ups, downs, min_gap=-50, max_gap=200000, margin_ratio=0.05):
             "margin": margin, "status": status}
 
 
-def place_per_assembly(up_by_tname, down_by_tname, **kw):
+def source_core(ref_id):
+    """Assembly core of the genome an element comes from ('<assembly>|<contig>_<n>')."""
+    return assembly_core(split_target(ref_id)[0])
+
+
+def place_per_assembly(up_by_tname, down_by_tname, exclude_core=None, **kw):
     """{tname: [Hit]} x2 -> {core: placement}, one per distinct assembly.
+
+    exclude_core: assembly core of the element's OWN genome. Its anchors
+    always align back to the locus they were cut from (and to the same locus
+    in the GCA/GCF twin), at exactly the "filled" distance. That is not an
+    observation of the element in another genome, and it must not count as
+    one: every record used to carry it as a filled observation, and a record
+    could rest on nothing else.
 
     Groups contigs by assembly, places once per assembly, then keeps a single
     representative per GCA/GCF core. The placement dict gains 'assembly' and
@@ -314,6 +326,8 @@ def place_per_assembly(up_by_tname, down_by_tname, **kw):
         by_asm_down.setdefault(split_target(t)[0], []).extend(hs)
     by_core = {}
     for asm in set(by_asm_up) & set(by_asm_down):
+        if exclude_core is not None and assembly_core(asm) == exclude_core:
+            continue
         by_core.setdefault(assembly_core(asm), []).append(asm)
     out = {}
     # sorted(): iteration order must not depend on the hash seed -- it decides
