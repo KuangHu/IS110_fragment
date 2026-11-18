@@ -13,7 +13,7 @@ set -euo pipefail
 
 OUTDIR="${OUTDIR:-/groups/rubin/projects/kuang/out/IS110_fragment/hmm_search}"
 GTDB_FNA="${GTDB_FNA:-/groups/rubin/databases/GTDB/gtdb_genomes_v2024latest/gtdb_genomes_reps_r220/allfilestogether}"
-CPUS=48
+CPUS="${CPUS:-48}"
 SCRIPTS="${IS110_FRAGMENT_SCRIPTS:-/global/home/users/kh36969/IS110_ecology/IS110_fragment/repo/scripts}"
 
 echo "=== Search 123 split IS110 CDS vs all GTDB ==="
@@ -47,6 +47,9 @@ print(f'  Extracted {count} / {len(ids)} query sequences')
 # Step 2: minimap2 search against all GTDB
 echo "Step 2: Searching against all GTDB genomes..."
 
+# sequence names must be unique across the concatenated files (stage_lib.sh)
+source "$SCRIPTS/stage_lib.sh"
+require_unique_seq_names "$GTDB_FNA"
 find "$GTDB_FNA" -name "*.fna" -print0 | xargs -0 cat \
     | minimap2 -x asm10 -c --eqx --secondary=yes -N 1000000 -p 0.05 -g 200 -r 200,200 \
         -t "$CPUS" \

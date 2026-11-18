@@ -18,8 +18,8 @@
 set -euo pipefail
 export PATH="$HOME/.conda/envs/claude-env/bin:$PATH"
 
-GENOME_DIR="/global/scratch/users/kh36969/ncbi_refs/ecoli_complete/ecoli_complete_data/ncbi_dataset/data"
-OUTDIR="/global/scratch/users/kh36969/logan_hmm/ncbi_ecoli"
+GENOME_DIR="${GENOME_DIR:-/global/scratch/users/kh36969/ncbi_refs/ecoli_complete/ecoli_complete_data/ncbi_dataset/data}"
+OUTDIR="${OUTDIR:-/global/scratch/users/kh36969/logan_hmm/ncbi_ecoli}"
 PROT_DIR="${OUTDIR}/per_genome_faa"
 HMM_DIR="/global/home/users/kh36969/IS110_ecology/IS110_fragment/repo/hmm"
 CPUS=${SLURM_CPUS_PER_TASK:-32}
@@ -76,8 +76,11 @@ if [ "$N_GENOMES" -eq 0 ]; then
     exit 1
 fi
 
-SIG1=$(stage_sig "prodigal single" "$(md5sum < "$MANIFEST")")
-if stage_done "$PROTEINS.done" "$SIG1"; then
+# the signature covers the genome FILES (size and modification time of each),
+# not only the list of their paths: a genome replaced at the same path left
+# the old proteins and everything downstream in place
+SIG1=$(stage_sig "prodigal single" "$(md5sum < "$MANIFEST")" "$(cut -f2 "$MANIFEST" | files_fp)")
+if stage_done "$PROTEINS.done" "$SIG1" "$PROTEINS" "$GFF"; then
     echo "Step 1: proteins exist for this manifest, skipping."
 else
     echo "Step 1: Running prodigal -p single per genome (parallel)..."
@@ -172,11 +175,13 @@ echo ""
 # STEP 3: Find IS110 (both domains) and map back
 # ────────────────────────────────────────────────
 echo "Step 3: Mapping IS110 proteins to genomes..."
+export OUTDIR
 python3 << 'PYEOF'
 import os
 from collections import defaultdict, Counter
 
-outdir = "/global/scratch/users/kh36969/logan_hmm/ncbi_ecoli"
+import os
+outdir = os.environ["OUTDIR"]
 
 def parse_domtbl(path):
     hits = set()

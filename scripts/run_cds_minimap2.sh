@@ -15,7 +15,7 @@ set -euo pipefail
 QUERY="${QUERY:-/home/kuangh/tools/IS110_fragment/results/is110_cds_queries.fna}"
 GTDB_DIR="${GTDB_DIR:-/groups/rubin/databases/GTDB/gtdb_genomes_v2024latest/gtdb_genomes_reps_r220/allfilestogether}"
 OUTDIR="${OUTDIR:-/home/kuangh/tools/IS110_fragment/results/cds_search}"
-CPUS=48
+CPUS="${CPUS:-48}"
 SCRIPTS="${IS110_FRAGMENT_SCRIPTS:-/global/home/users/kh36969/IS110_ecology/IS110_fragment/repo/scripts}"
 MIN_IDENT=0.80
 
@@ -35,6 +35,9 @@ echo ""
 # half of an interrupted copy is a low-scoring secondary of any intact copy and
 # was never reported (0 of 18 test configurations with an intact copy present).
 # -g/-r 200: do not chain the two halves across the insert into one alignment.
+# sequence names must be unique across the concatenated files (stage_lib.sh)
+source "$SCRIPTS/stage_lib.sh"
+require_unique_seq_names "$GTDB_DIR"
 find "$GTDB_DIR" -name "*.fna" -exec cat {} + \
     | minimap2 -x asm10 -c --eqx --secondary=yes -N 1000000 -p 0.05 -g 200 -r 200,200 \
         -t "$CPUS" \

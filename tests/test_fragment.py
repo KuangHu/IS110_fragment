@@ -352,6 +352,102 @@ stage_done "{d}/m" "$S2" && echo changed=done || echo changed=todo
               r.returncode == 0 and r.stdout.split() == ["n=0", "before=todo", "same=done", "changed=todo"],
               r.stdout + r.stderr)
 
+def sh(script, env, *args):
+    e = dict(os.environ, IS110_FRAGMENT_SCRIPTS=SCR, SLURM_CPUS_PER_TASK="2", **env)
+    return subprocess.run(["bash", os.path.join(SCR, script), *args], capture_output=True, text=True, env=e)
+
+def test_final_review_shell():
+    rnd = random.Random(31)
+    dna = lambda n: "".join(rnd.choice("ACGT") for _ in range(n))
+    with tempfile.TemporaryDirectory() as d:
+        # 16. a marker without its product is not "done"; 10. files_fp sees a replaced file
+        g = os.path.join(d, "g.fna"); open(g, "w").write(">c\n" + "A" * 2000 + "\n")
+        code = f"""set -euo pipefail
+source "{SCR}/stage_lib.sh"
+stage_mark "{d}/out.done" S
+stage_done "{d}/out.done" S && echo missing=done || echo missing=todo
+: > "{d}/out"
+stage_done "{d}/out.done" S && echo empty=done || echo empty=todo
+stage_done "{d}/out.done" S "{d}/out" "{d}/companion" && echo comp=done || echo comp=todo
+A=$(echo "{g}" | files_fp)
+printf '>c\\n%s\\n' "$(head -c 3000 /dev/zero | tr '\\0' A)" > "{g}"
+B=$(echo "{g}" | files_fp)
+[ "$A" != "$B" ] && echo fp=changed || echo fp=same
+"""
+        r = subprocess.run(["bash", "-c", code], capture_output=True, text=True)
+        check("stage_done needs its products; files_fp changes with the file",
+              r.stdout.split() == ["missing=todo", "empty=done", "comp=todo", "fp=changed"], r.stdout + r.stderr)
+        check("hmm_ncbi_ecoli signs the genome files, not only their paths",
+              'cut -f2 "$MANIFEST" | files_fp' in open(os.path.join(SCR, "hmm_ncbi_ecoli.sh")).read())
+        # 8. the same contig name in two genome files stops both searches
+        IS = dna(2000)
+        gt = os.path.join(d, "gtdb"); os.mkdir(gt)
+        open(os.path.join(gt, "a.fna"), "w").write(">ctg\n" + dna(500) + IS[:1000] + dna(6500) + "\n")
+        open(os.path.join(gt, "b.fna"), "w").write(">ctg\n" + dna(7999) + IS[1000:] + dna(500) + "\n")
+        q = os.path.join(d, "q.fna"); open(q, "w").write(">IS\n" + IS + "\n")
+        o1 = os.path.join(d, "cds"); os.mkdir(o1)
+        r = sh("run_cds_minimap2.sh", dict(QUERY=q, GTDB_DIR=gt, OUTDIR=o1, CPUS="2"))
+        check("run_cds_minimap2.sh refuses duplicate contig names",
+              r.returncode != 0 and "more than one genome file" in r.stderr and not os.path.exists(os.path.join(o1, "split_cds.tsv")),
+              r.stderr[-300:])
+        o2 = os.path.join(d, "gt2"); os.mkdir(o2)
+        open(os.path.join(o2, "split_is110_all.tsv"), "w").write("query\nIS\n")
+        for n in ("is110_cds_nr95.fna", "is110_cds_nuc.fna"):
+            open(os.path.join(o2, n), "w").write(">IS\n" + IS + "\n")
+        r = sh("search_split_vs_gtdb.sh", dict(OUTDIR=o2, GTDB_FNA=gt, CPUS="2"))
+        check("search_split_vs_gtdb.sh refuses duplicate contig names",
+              r.returncode != 0 and "more than one genome file" in r.stderr and not os.path.exists(os.path.join(o2, "split_123_all_hits.tsv")),
+              r.stderr[-300:])
+        # 12 + 7. reference extraction: flat genome layout through the manifest; new positions -> new representatives
+        gd = os.path.join(d, "genomes"); os.mkdir(gd)
+        contig = dna(20000)
+        fna = os.path.join(gd, "GCF_000000001.1_genomic.fna"); open(fna, "w").write(">c1\n" + contig + "\n")
+        hd = os.path.join(d, "hmm"); os.mkdir(hd)
+        pos = os.path.join(hd, "is110_positions.tsv")
+        def positions(rows):
+            open(pos, "w").write("protein_id\tassembly\tcontig\tstart\tend\tstrand\tlen\n" +
+                                 "".join(f"{pid}\tGCF_000000001.1\tc1\t{a}\t{b}\t+\t400\n" for pid, a, b in rows))
+        positions([("p1", 3001, 4200), ("p2", 12001, 13200)])
+        od = os.path.join(d, "refs")
+        env = dict(POSITIONS_TSV=pos, GENOME_DIR=gd, OUTDIR=od)
+        r = sh("extract_is110_refs.sh", env)
+        check("flat genome layout without a manifest: an error, not an empty result",
+              r.returncode != 0 and "positions without a sequence" in r.stderr and not os.path.exists(os.path.join(od, "is110_with_flanks.fa")),
+              r.stdout[-300:] + r.stderr[-300:])
+        open(os.path.join(hd, "genomes_one_per_assembly.tsv"), "w").write(f"GCF_000000001.1\t{fna}\n")
+        r = sh("extract_is110_refs.sh", env)
+        ids = lambda f: sorted(l[1:].split()[0] for l in open(os.path.join(od, f)) if l.startswith(">"))
+        check("flat genome layout with the census manifest: both records",
+              r.returncode == 0 and ids("is110_with_flanks.fa") == ["p1", "p2"] and ids("is110_reps_95.fa") == ["p1", "p2"],
+              r.stdout[-300:] + r.stderr[-300:])
+        r = sh("extract_is110_refs.sh", env)
+        check("unchanged inputs: both steps skipped", r.returncode == 0 and r.stdout.count("skipping") == 2, r.stdout[-400:])
+        positions([("p3", 7001, 8200)])
+        r = sh("extract_is110_refs.sh", env)
+        check("changed positions: references AND representatives are rebuilt",
+              r.returncode == 0 and ids("is110_with_flanks.fa") == ["p3"] and ids("is110_reps_95.fa") == ["p3"],
+              r.stdout[-300:] + r.stderr[-300:])
+        # 7. fragment origin: a new insertion table gives new fragments and new representatives
+        res = os.path.join(d, "res"); os.mkdir(res)
+        logan = os.path.join(d, "logan"); os.mkdir(logan)
+        fa = os.path.join(d, "S1.contigs.fa"); open(fa, "w").write(">S1_1\n" + dna(9000) + "\n")
+        subprocess.run(["zstd", "-q", fa, "-o", os.path.join(logan, "S1.contigs.fa.zst")], check=True)
+        hdr = ("type query qlen target_contig tlen part1_qs part1_qe part1_ts part1_te part1_strand part1_ident "
+               "part2_qs part2_qe part2_ts part2_te part2_strand part2_ident target_gap query_gap cds_coverage").split()
+        def table(te, ts):
+            with open(os.path.join(res, "is110_x_95_insertions.tsv"), "w") as f:
+                f.write("\t".join(hdr) + "\n" + "\t".join(map(str, ["insertion", "q", 2000, "S1_1", 9000, 0, 1000, te - 1000, te, "+", 100,
+                                                                     1000, 2000, ts, ts + 1000, "+", 100, ts - te, 0, 100])) + "\n")
+        env = dict(RESULTS_DIR=res, LOGAN_DIR=logan)
+        reps = lambda: sorted(l[1:].split()[0] for l in open(os.path.join(res, "fragments_x_cluster_rep.fasta")) if l.startswith(">"))
+        table(1000, 2000)
+        r1 = sh("find_fragment_origin.sh", env, "x"); a = reps() if r1.returncode == 0 else r1.stderr[-300:]
+        r2 = sh("find_fragment_origin.sh", env, "x")
+        table(4000, 5200)
+        r3 = sh("find_fragment_origin.sh", env, "x"); b = reps() if r3.returncode == 0 else r3.stderr[-300:]
+        check("fragment origin: same table skips, new table rebuilds fragments and representatives",
+              a == ["S1_1__1000_2000"] and r2.stdout.count("skipping") == 2 and b == ["S1_1__4000_5200"], f"{a} {b} {r2.stdout[-300:]}")
+
 def test_minimap2_round_trip():
     """Real minimap2 (the options of the pipeline scripts) -> detector."""
     rnd = random.Random(11)
@@ -383,7 +479,7 @@ def test_minimap2_round_trip():
                     ("two", "insertion"), ("two", "insertion")]
             check(f"minimap2 {preset} round trip: events on the right contigs only", got == want, str(got))
 
-for t in (test_identity, test_eqx_is_required, test_output_independent_of_hash_seed, test_detector, test_final_review_detector, test_multisplit, test_lineage, test_ref_core_and_origin, test_final_review_tables, test_stage_lib,
+for t in (test_identity, test_eqx_is_required, test_output_independent_of_hash_seed, test_detector, test_final_review_detector, test_multisplit, test_lineage, test_ref_core_and_origin, test_final_review_tables, test_stage_lib, test_final_review_shell,
           test_minimap2_round_trip):
 
 

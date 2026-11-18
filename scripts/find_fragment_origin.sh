@@ -18,10 +18,11 @@ export PATH="$HOME/.conda/envs/claude-env/bin:$PATH"
 module load bio/blast-plus/2.14.1-gcc-11.4.0 2>/dev/null || true
 
 ORG=${1:?Usage: sbatch find_fragment_origin.sh <organism>}
-SCRATCH="/global/scratch/users/kh36969"
-RESULTS_DIR="${SCRATCH}/logan_results/${ORG}"
-LOGAN_DIR="${SCRATCH}/logan_${ORG}"
-SCRIPTS="/global/home/users/kh36969/IS110_ecology/IS110_fragment/repo/scripts"
+SCRATCH="${SCRATCH:-/global/scratch/users/kh36969}"
+RESULTS_DIR="${RESULTS_DIR:-${SCRATCH}/logan_results/${ORG}}"
+LOGAN_DIR="${LOGAN_DIR:-${SCRATCH}/logan_${ORG}}"
+SCRIPTS="${IS110_FRAGMENT_SCRIPTS:-/global/home/users/kh36969/IS110_ecology/IS110_fragment/repo/scripts}"
+source "$SCRIPTS/stage_lib.sh"
 
 INS_TSV="${RESULTS_DIR}/is110_${ORG}_95_insertions.tsv"
 FRAG_FASTA="${RESULTS_DIR}/fragments_${ORG}.fasta"
@@ -32,41 +33,52 @@ echo "Start: $(date)"
 echo ""
 
 # ── Step 1: Extract inserted fragments from Logan contigs ──
-# redo when the insertion table is newer than the fragments (a FASTA from an
-# earlier detection run was otherwise kept)
-if [ ! -s "$FRAG_FASTA" ] || [ "$INS_TSV" -nt "$FRAG_FASTA" ]; then
+# A step is done for a signature of its inputs and options (stage_lib.sh):
+# a FASTA from an earlier detection run was otherwise kept, and so were the
+# representatives clustered from an earlier FASTA.
+SIG1=$(stage_sig "extract fragments" "--min-len 300 --max-len 50000" "$(file_fp "$INS_TSV")" \
+       "$(md5sum < "${SCRIPTS}/extract_insertion_fragments.py")")
+if stage_done "$FRAG_FASTA.done" "$SIG1"; then
+    echo "Step 1: Fragment FASTA exists for this insertion table, skipping."
+else
     echo "Step 1: Extracting inserted fragment sequences..."
+    rm -f "$FRAG_FASTA.done"
     python3 "${SCRIPTS}/extract_insertion_fragments.py" \
         "$INS_TSV" \
         "$LOGAN_DIR" \
-        "$FRAG_FASTA" \
+        "$FRAG_FASTA.tmp" \
         --min-len 300 \
         --max-len 50000
-else
-    echo "Step 1: Fragment FASTA exists, skipping."
+    mv "$FRAG_FASTA.tmp" "$FRAG_FASTA"
+    stage_mark "$FRAG_FASTA.done" "$SIG1"
 fi
 echo "  Fragments: $(grep -c '^>' "$FRAG_FASTA" 2>/dev/null || true)"
 echo "  Size: $(du -h "$FRAG_FASTA" | cut -f1)"
 echo "Step 1 done: $(date)"
 echo ""
 
-# ── Step 2: Cluster fragments at 90% identity with cd-hit-est ──
+# ── Step 2: Cluster fragments at 95% identity with cd-hit-est ──
 REP_FASTA="${CLUSTER_PREFIX}_rep.fasta"
 CLSTR="${CLUSTER_PREFIX}_rep.fasta.clstr"
 
-if [ ! -f "$REP_FASTA" ]; then
-    echo "Step 2: Clustering fragments at 90% identity..."
-    if ! command -v cd-hit-est &>/dev/null; then
-        echo "Installing cd-hit via conda..."
-        conda install -y -c bioconda cd-hit 2>&1 | tail -3
-    fi
-    cd-hit-est -i "$FRAG_FASTA" -o "$REP_FASTA" \
-        `# 95% identity (the project threshold) over >= 90% of BOTH sequences:` \
-        `# without -aL/-aS a 300-bp fragment clustered into any 5-kb one containing it` \
-        -c 0.95 -n 10 -aS 0.9 -aL 0.9 -T 16 -M 0 -d 0 -g 1 \
-        > "${CLUSTER_PREFIX}.log" 2>&1
+CDHIT_OPTS="-c 0.95 -n 10 -aS 0.9 -aL 0.9 -M 0 -d 0 -g 1"
+SIG2=$(stage_sig "cd-hit-est" "$CDHIT_OPTS" "$SIG1" "$(file_fp "$FRAG_FASTA")")
+if stage_done "$REP_FASTA.done" "$SIG2" "$REP_FASTA" "$CLSTR"; then
+    echo "Step 2: Representatives exist for these fragments, skipping clustering."
 else
-    echo "Step 2: Representatives exist, skipping clustering."
+    echo "Step 2: Clustering fragments at 95% identity..."
+    rm -f "$REP_FASTA.done"
+    if ! command -v cd-hit-est &>/dev/null; then
+        echo "ERROR: cd-hit-est not found (conda install -c bioconda cd-hit)" >&2
+        exit 1
+    fi
+    # 95% identity (the project threshold) over >= 90% of BOTH sequences:
+    # without -aL/-aS a 300-bp fragment clustered into any 5-kb one containing it
+    cd-hit-est -i "$FRAG_FASTA" -o "$REP_FASTA.tmp" $CDHIT_OPTS -T "${SLURM_CPUS_PER_TASK:-16}" \
+        > "${CLUSTER_PREFIX}.log" 2>&1
+    mv "$REP_FASTA.tmp.clstr" "$CLSTR"
+    mv "$REP_FASTA.tmp" "$REP_FASTA"
+    stage_mark "$REP_FASTA.done" "$SIG2"
 fi
 
 N_REPS=$(grep -c '^>' "$REP_FASTA" 2>/dev/null || true)

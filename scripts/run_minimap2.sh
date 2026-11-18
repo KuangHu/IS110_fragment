@@ -90,13 +90,8 @@ echo ""
 # Sequence names must be unique across the files that are concatenated:
 # two genomes that both have a contig "ctg" become one target, and halves of
 # an IS in two different genomes were joined into one "insertion".
-DUP=$(find "$GTDB_DIR" -name "*.fna" -print0 | xargs -0 grep -h '^>' | awk '{print $1}' | sort | uniq -d | head -3 || true)
-if [ -n "$DUP" ]; then
-    echo "ERROR: sequence names occur in more than one genome file, e.g.:" >&2
-    echo "$DUP" >&2
-    echo "Give the records unique names (prefix the assembly) before searching." >&2
-    exit 1
-fi
+source "$SCRIPTS/stage_lib.sh"
+require_unique_seq_names "$GTDB_DIR"
 find "$GTDB_DIR" -name "*.fna" -exec cat {} + \
     | minimap2 -x asm5 -c --eqx --secondary=yes -N 1000000 -p 0.05 -g 200 -r 200,200 \
         -t "$CPUS" \

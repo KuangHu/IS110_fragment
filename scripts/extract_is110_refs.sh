@@ -15,9 +15,13 @@
 set -euo pipefail
 export PATH="$HOME/.conda/envs/claude-env/bin:$PATH"
 
-POSITIONS_TSV="/global/scratch/users/kh36969/logan_hmm/ncbi_ecoli/is110_positions.tsv"
-GENOME_DIR="/global/scratch/users/kh36969/ncbi_refs/ecoli_complete/ecoli_complete_data/ncbi_dataset/data"
-OUTDIR="/global/scratch/users/kh36969/is110_refs"
+POSITIONS_TSV="${POSITIONS_TSV:-/global/scratch/users/kh36969/logan_hmm/ncbi_ecoli/is110_positions.tsv}"
+GENOME_DIR="${GENOME_DIR:-/global/scratch/users/kh36969/ncbi_refs/ecoli_complete/ecoli_complete_data/ncbi_dataset/data}"
+OUTDIR="${OUTDIR:-/global/scratch/users/kh36969/is110_refs}"
+# accession <TAB> genome file, written by hmm_ncbi_ecoli.sh next to the
+# positions table: the genomes the positions were called on
+MANIFEST="${MANIFEST:-$(dirname "$POSITIONS_TSV")/genomes_one_per_assembly.tsv}"
+source "${IS110_FRAGMENT_SCRIPTS:-/global/home/users/kh36969/IS110_ecology/IS110_fragment/repo/scripts}/stage_lib.sh"
 CPUS=${SLURM_CPUS_PER_TASK:-16}
 FLANK_BP=2000
 
@@ -37,8 +41,14 @@ EXTRACTED="${OUTDIR}/is110_with_flanks.fa"
 # the transposase gene alone (the "core"), same ids: this is what is clustered
 CORE="${OUTDIR}/is110_core.fa"
 
-if [ -s "$EXTRACTED" ] && [ -s "$CORE" ]; then
-    echo "Step 1: extracted sequences exist, skipping."
+# A step is done for a signature of its inputs and options (stage_lib.sh),
+# not because its output exists: new positions left the old references, and
+# new references left the old representatives.
+SIG1=$(stage_sig "extract refs" "$FLANK_BP" "$(file_fp "$POSITIONS_TSV")" \
+       "$( [ -f "$MANIFEST" ] && md5sum < "$MANIFEST" || echo no-manifest )" \
+       "$( [ -f "$MANIFEST" ] && cut -f2 "$MANIFEST" | files_fp || echo "$GENOME_DIR" )")
+if stage_done "$EXTRACTED.done" "$SIG1" "$EXTRACTED" "$CORE"; then
+    echo "Step 1: extracted sequences exist for these inputs, skipping."
 else
     echo "Step 1: Extracting IS110 + ${FLANK_BP}bp flanks..."
     python3 << PYEOF
@@ -47,6 +57,8 @@ from collections import defaultdict
 
 positions_tsv = "$POSITIONS_TSV"
 genome_dir = "$GENOME_DIR"
+manifest = "$MANIFEST"
+allow_missing = "${ALLOW_MISSING_GENOMES:-0}" == "1"
 out_path = "$EXTRACTED"
 core_path = "$CORE"
 flank = $FLANK_BP
@@ -74,19 +86,33 @@ def revcomp(seq):
     comp = str.maketrans("ACGTNacgtn", "TGCANtgcan")
     return seq.translate(comp)[::-1]
 
+# assembly -> genome file. From the manifest of the IS110 census when there
+# is one (any directory layout); otherwise <genome_dir>/<assembly>/*_genomic.fna.
+# The path used to be rebuilt from the accession only: with a flat layout
+# every assembly was skipped and the script wrote an empty result.
+genome_of = {}
+if os.path.exists(manifest):
+    with open(manifest) as f:
+        for line in f:
+            acc, path = line.rstrip("\n").split("\t")[:2]
+            genome_of[acc] = path
+def find_genome(assembly):
+    if assembly in genome_of:
+        return genome_of[assembly] if os.path.exists(genome_of[assembly]) else None
+    asm_dir = os.path.join(genome_dir, assembly)
+    if os.path.isdir(asm_dir):
+        for f in sorted(os.listdir(asm_dir)):
+            if f.endswith("_genomic.fna"):
+                return os.path.join(asm_dir, f)
+    return None
+
 n_extracted = 0
+missing_asm, missing_contig = [], 0
 with open(out_path + ".tmp", "w") as out, open(core_path + ".tmp", "w") as core_out:
     for assembly, positions in sorted(by_asm.items()):
-        # Find genome file for this assembly
-        asm_dir = os.path.join(genome_dir, assembly)
-        if not os.path.isdir(asm_dir):
-            continue
-        fna = None
-        for f in os.listdir(asm_dir):
-            if f.endswith("_genomic.fna"):
-                fna = os.path.join(asm_dir, f)
-                break
+        fna = find_genome(assembly)
         if not fna:
+            missing_asm.append(assembly)
             continue
 
         # Load contigs from this genome
@@ -109,6 +135,7 @@ with open(out_path + ".tmp", "w") as out, open(core_path + ".tmp", "w") as core_
         for p in positions:
             seq = contigs.get(p["contig"])
             if not seq:
+                missing_contig += 1
                 continue
             ext_start = max(0, p["start"] - 1 - flank)
             ext_end = min(len(seq), p["end"] + flank)
@@ -132,11 +159,18 @@ with open(out_path + ".tmp", "w") as out, open(core_path + ".tmp", "w") as core_
             core_out.write(f">{p['protein_id']}\n{extracted[core_s:core_e]}\n")
             n_extracted += 1
 
+print(f"  Sequences extracted: {n_extracted:,}")
+if missing_asm or missing_contig:
+    print(f"  assemblies without a genome file: {len(missing_asm):,} "
+          f"(e.g. {', '.join(missing_asm[:3])}); positions on a contig not in the file: {missing_contig:,}")
+    if not allow_missing:
+        os.remove(out_path + ".tmp"); os.remove(core_path + ".tmp")
+        raise SystemExit("ERROR: positions without a sequence; nothing written "
+                         "(ALLOW_MISSING_GENOMES=1 to write the rest)")
 os.replace(out_path + ".tmp", out_path)
 os.replace(core_path + ".tmp", core_path)
-
-print(f"  Sequences extracted: {n_extracted:,}")
 PYEOF
+    stage_mark "$EXTRACTED.done" "$SIG1"
 fi
 
 N_EXT=$(grep -c '^>' "$EXTRACTED" || true)
@@ -153,10 +187,13 @@ for IDENT in 0.95; do
     REPS="${OUTDIR}/is110_reps_${PCT}.fa"
     CLUSTER="${OUTDIR}/is110_cluster_${PCT}.tsv"
 
-    if [ -s "$REPS" ]; then
-        echo "Step 2 (${PCT}% id): reps exist, skipping."
+    SIG2=$(stage_sig "cluster cores" "$IDENT" "-c 0.80 --cov-mode 0" "$SIG1" "$(file_fp "$CORE")")
+    if stage_done "$REPS.done" "$SIG2" "$REPS" "$CLUSTER"; then
+        echo "Step 2 (${PCT}% id): reps exist for these cores, skipping."
         continue
     fi
+    rm -f "$REPS.done"
+    rm -rf "${OUTDIR}/mmseqs_tmp_${PCT}"
 
     # Clustered on the transposase gene, not on gene + 4 kb of flank: with the
     # flanks, two identical IS in different places were two "families" and two
@@ -176,6 +213,7 @@ for IDENT in 0.95; do
          /^>/ { on = (substr($1,2) in keep) } on' \
         "${OUTDIR}/cluster_${PCT}_rep_ids.txt" "$EXTRACTED" > "$REPS.tmp"
     mv "$REPS.tmp" "$REPS"
+    stage_mark "$REPS.done" "$SIG2"
     rm -f "${OUTDIR}/cluster_${PCT}_rep_seq.fasta"
     rm -rf "${OUTDIR}/mmseqs_tmp_${PCT}"
     rm -f "${OUTDIR}/cluster_${PCT}_all_seqs.fasta"
@@ -192,9 +230,11 @@ echo ""
 # STEP 3: Summarize cluster sizes
 # ────────────────────────────────────────────────
 echo "Step 3: Cluster size distributions..."
+export OUTDIR
 python3 << 'PYEOF'
+import os
 from collections import Counter
-outdir = "/global/scratch/users/kh36969/is110_refs"
+outdir = os.environ["OUTDIR"]
 
 for pct in [95]:
     cluster_file = f"{outdir}/is110_cluster_{pct}.tsv"
