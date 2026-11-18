@@ -39,7 +39,7 @@ CONFIRMED = {
     "translocation_only": {"CONFIRMED_BOTH"},   # already excludes contig-break artifacts
 }
 SVTYPE = {"inversion_only": "INV", "duplication": "DUP",
-          "translocation_only": "TRA"}
+          "translocation_only": "BND"}
 EVENT_PREFIX = {"inversion_only": "INV", "duplication": "DUP",
                 "translocation_only": "TRANSLOC"}
 
@@ -133,7 +133,6 @@ def write_vcf_header(fh, contigs, species):
     fh.write(f"##species={species}\n")
     fh.write("##ALT=<ID=INV,Description=\"Inversion\">\n")
     fh.write("##ALT=<ID=DUP,Description=\"Duplication\">\n")
-    fh.write("##ALT=<ID=TRA,Description=\"Translocation: the two flanks of the element lie on different target contigs\">\n")
     fh.write("##INFO=<ID=SVTYPE,Number=1,Type=String,Description=\"Type of structural variant\">\n")
     fh.write("##INFO=<ID=IMPRECISE,Number=0,Type=Flag,Description=\"POS is the first base of the IS element at which the target genome is rearranged; the breakpoints of the rearrangement are not resolved\">\n")
     fh.write("##INFO=<ID=IS_END,Number=1,Type=Integer,Description=\"Last base of the IS element (1-based)\">\n")
@@ -182,7 +181,15 @@ def collect_for_species(sp, args, out_root):
     os.makedirs(ev_dir, exist_ok=True)
 
     rows = list(csv.DictReader(open(val_tsv), delimiter="\t"))
-    confirmed = [r for r in rows if r["verdict"] in CONFIRMED.get(r["category"], set())]
+    confirmed, seen_ev = [], set()
+    for r in rows:
+        if r["verdict"] not in CONFIRMED.get(r["category"], set()):
+            continue
+        k = (r["category"], r["ref_id"], r["tgt_asm"])
+        if k in seen_ev:          # the same validation row twice is one event
+            continue
+        seen_ev.add(k)
+        confirmed.append(r)
     print(f"  {sp}: {len(confirmed)} confirmed of {len(rows)} validated", file=sys.stderr)
     # no early return: the per-species files are always rewritten, so the
     # combined tables can never pick up a stale file from an earlier run
@@ -224,6 +231,9 @@ def collect_for_species(sp, args, out_root):
 
         # --- per-event evidence pack ---
         ev = os.path.join(ev_dir, event_id)
+        # start from an empty directory: IDs are positional, so a rerun with
+        # other inputs left another event's dnadiff report under this name
+        shutil.rmtree(ev, ignore_errors=True)
         os.makedirs(ev, exist_ok=True)
         ref_fa_obj = open_asm(ref_asm)
         qry_fa_obj = open_asm(tgt_asm)
@@ -252,6 +262,13 @@ def collect_for_species(sp, args, out_root):
                 if sp_span:
                     anchor_records.append({"contig": c, "anchor_start": s,
                                            "anchor_end": e, "extracted_span": sp_span})
+
+        if not anchor_records:
+            # none of the anchor contigs is in the target FASTA: nothing to
+            # show for this event -- it was still written as confirmed
+            skipped["target region not extractable"] += 1
+            shutil.rmtree(ev, ignore_errors=True)
+            continue
 
         # --- regenerate dnadiff + Mauve evidence (optional) ---
         dnadiff_report = ""
@@ -335,8 +352,13 @@ def collect_for_species(sp, args, out_root):
         if r.get("dnadiff") == "YES": _cby.append("MUMmer4_dnadiff")
         if r.get("mauve")   == "YES": _cby.append("progressiveMauve")
         cby_vcf = ",".join(_cby) if _cby else "."
-        clean = lambda v: (str(v) if v not in (None, "") else ".").replace("=", ":").replace(";", ",")  # noqa: E731
-        tgt_pos = ",".join(f"{a['contig']}:{a['anchor_start'] + 1}-{a['anchor_end']}"
+        # INFO values: no '=', ';', ',', or spaces (',' separates list items)
+        clean = lambda v: (str(v) if v not in (None, "") else ".").replace(  # noqa: E731
+            "=", ":").replace(";", "|").replace(",", "|").replace(" ", "_")
+        if ref_base not in "ACGTN":
+            ref_base = "N"                      # IUPAC codes are not allowed in REF
+        tgt_pos = ",".join(f"{a['contig']}:{a['anchor_start'] + 1}-{a['anchor_end']}".replace(
+                               ";", "_").replace("=", "_").replace(" ", "_")
                            for a in anchor_records) or "."
         info = (f"IMPRECISE;SVTYPE={SVTYPE[cat]};IS_END={locus['end']};IS_STRAND={locus['strand']};"
                 f"IS_MEDIATED;IS_FAMILY=IS110;REF_ID={ref_id};TGT_ASM={tgt_asm};"
@@ -345,8 +367,11 @@ def collect_for_species(sp, args, out_root):
                 f"VAL_METRIC={clean(r.get('mauve_metric'))};"
                 f"MIN_ANCHOR_END_DIST={clean(r.get('min_anchor_end_dist'))};"
                 f"CONFIRMED_BY={cby_vcf}")
-        vcf_records.append((sv_chrom, sv_pos, event_id, ref_base, f"<{SVTYPE[cat]}>",
-                            ".", "PASS", info))
+        # translocation: a single breakend with unknown mate ("N."), the VCF
+        # form for "joined to something else here"; <TRA> is not a permitted
+        # symbolic allele
+        alt = f"{ref_base}." if cat == "translocation_only" else f"<{SVTYPE[cat]}>"
+        vcf_records.append((sv_chrom, sv_pos, event_id, ref_base, alt, ".", "PASS", info))
         contig_len[sv_chrom] = ref_fa_obj.get_reference_length(locus["contig"])
 
         # which gold-standard tools backed this event

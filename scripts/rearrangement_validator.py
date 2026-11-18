@@ -81,6 +81,8 @@ def parse_show_coords(delta):
         ["show-coords", "-r", "-c", "-l", "-T", delta],
         capture_output=True, text=True
     )
+    if res.returncode != 0:      # a tool error is not "no alignment"
+        raise RuntimeError(f"show-coords failed: {res.stderr[-300:]}")
     blocks = []
     for line in res.stdout.splitlines():
         if not line:
@@ -118,6 +120,8 @@ def parse_show_diff(delta, mode="r"):
         ["show-diff", f"-{mode}", "-H", delta],
         capture_output=True, text=True
     )
+    if res.returncode != 0:
+        raise RuntimeError(f"show-diff failed: {res.stderr[-300:]}")
     diffs = []
     for line in res.stdout.splitlines():
         f = line.split("\t")

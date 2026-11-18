@@ -27,29 +27,46 @@ import lib_rearr as lr  # noqa: E402
 from lib_alleles import assembly_core  # noqa: E402
 
 
-def event_key(row, bin_bp=2000):
-    """One key per EVENT in a target genome: (assembly core, contigs, the two
-    anchor positions rounded to `bin_bp`). The same inversion/translocation is
-    reached from IS_a and from IS_b, from every reference strain that carries
-    the element, and from contig/scaffold twins -- all of which used to count
-    as separate 'unique IS loci'."""
+def event_points(row):
+    """(assembly core, sorted [(contig, position)] of the first up/down anchor)."""
     d = lr.parse_details(row.get("details", ""))
-    pts = sorted((c, round(s / bin_bp)) for c, s, e, st in d["up"][:1] + d["down"][:1])
-    return (assembly_core(row["assembly"]),) + tuple(pts)
+    return assembly_core(row["assembly"]), sorted((c, s) for c, s, e, st in d["up"][:1] + d["down"][:1])
 
 
-def write_events(rows_by_ref, path):
-    """rows_by_ref: {ref_id: [rows]} -> events table; returns {event: [ref_ids]}."""
-    ev = defaultdict(set)
+def write_events(rows_by_ref, path, tol=6000):
+    """One row per EVENT in a target genome.
+
+    The same inversion / translocation is reached from IS_a and from IS_b
+    (anchor positions a few kb apart: one IS plus the anchor offsets), from
+    every reference strain carrying the element, and from GCA/GCF twins. Rows
+    whose endpoints are ALL within `tol` bp of each other on the same contigs
+    of the same assembly core are one event. (Rounding positions into bins
+    split one inversion seen from its two IS copies and could merge events
+    on either side of a bin edge; two real events closer than `tol` at both
+    ends are still merged -- reported as n_merged_rows.)"""
+    items = []
     for ref_id, rows in rows_by_ref.items():
         for r in rows:
-            ev[event_key(r)].add(ref_id)
+            core, pts = event_points(r)
+            if pts:
+                items.append((core, tuple(c for c, _ in pts), tuple(p for _, p in pts), ref_id))
+    items.sort()
+    events = []          # [core, contigs, [positions...], {ref_ids}, n_rows]
+    for core, contigs, pos, ref_id in items:
+        for ev in events[::-1]:
+            if ev[0] != core or ev[1] != contigs:
+                continue
+            if all(abs(a - b) <= tol for a, b in zip(ev[2], pos)):
+                ev[3].add(ref_id); ev[4] += 1
+                break
+        else:
+            events.append([core, contigs, pos, {ref_id}, 1])
     with open(path, "w") as fh:
-        fh.write("target_assembly_core\tanchor_positions\tn_ref_ids\tref_ids\n")
-        for k in sorted(ev):
-            pos = ";".join(f"{c}:~{b * 2000}" for c, b in k[1:])
-            fh.write(f"{k[0]}\t{pos}\t{len(ev[k])}\t{','.join(sorted(ev[k]))}\n")
-    return ev
+        fh.write("target_assembly_core\tanchor_positions\tn_ref_ids\tn_merged_rows\tref_ids\n")
+        for core, contigs, pos, refs, n in events:
+            where = ";".join(f"{c}:~{p}" for c, p in zip(contigs, pos))
+            fh.write(f"{core}\t{where}\t{len(refs)}\t{n}\t{','.join(sorted(refs))}\n")
+    return events
 
 
 def parse_args():
@@ -105,7 +122,7 @@ def main():
             fh.write("\t".join([
                 rep["category"], rep["ref_id"], rep["assembly"],
                 rep["up_contigs"], rep["down_contigs"], rep["details"],
-                str(rep["_est"]), str(len(rows)), support_compact,
+                str(rep["_est"]), str(len({assembly_core(r["assembly"]) for r in rows})), support_compact,
             ]) + "\n")
             # detailed JSON entry
             full_dict[ref_id] = {

@@ -188,7 +188,16 @@ does not see arrays of units shorter than ~150 bp -- use `verify_tandem_enrichme
 (TRF + ULTRA) for those. Rows of the movement / inversion / translocation / duplication
 tables are per (reference element, target genome): the same event is reported from every
 reference that carries the element. Use the `*_events.tsv` files of the dedup scripts,
-or collapse by target site, before counting events. Reviews: `docs/reviews/`.
+or collapse by target site, before counting events.
+Verdicts that are still weaker than their names: the inversion checks can be satisfied by
+inverted paralogs present in both genomes; `MOVED` means "the reference has this site
+without the element" and `DIFFERENT_CONTEXT` is unresolved, not movement;
+`rearrangement_validator.py` (MUMmer show-diff) misses clean tandem duplications and its
+`is_mediated` flag is unreliable -- use `validate_rearrangements_gold.py`; inversions
+shorter than ~6 kb are not assessable by `inversion_full_check.py`. The three review /
+figure scripts (`prepare_review_cases.py`, `inversion_focal_pair.py`,
+`composite_transposon_review_pair.py`) were read but not corrected (1-bp IS start
+offset, old contig-name parser). Reviews with every finding: `docs/reviews/`.
 
 Tests: `sbatch tests/run_tests.sh [WORK_DIR]` runs unit tests and a synthetic
 end-to-end run with known boundaries (both strands, a GCA/GCF twin, a SNP-divergent

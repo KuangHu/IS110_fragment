@@ -22,9 +22,12 @@ PASS_strict: BOTH C and X align to ref at ≥ 80 % cov, ≥ 95 % identity, AND
              both alignment positions are within 10 kb of an IS in ref.
 PASS_lenient: same but only ONE of C/X needs to be IS-adjacent in ref.
 """
-import argparse, csv, gzip, json, os, re, shutil, subprocess, tempfile
+import argparse, csv, gzip, json, os, re, shutil, subprocess, tempfile, sys
 from collections import defaultdict
 import pysam
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import lib_rearr as lr  # noqa: E402
 
 
 def parse_args():
@@ -149,12 +152,9 @@ def best_forward_block(ref_index_fa, query_fa, work, threads):
     return best
 
 
-ANCHOR_RE = re.compile(r"([\w.|]+):(\d+)-(\d+)\(([+-])\)")
 def parse_anchors_block(details, side):
-    m = re.search(rf"{side}=\[([^\]]*)\]", details)
-    if not m: return []
-    return [(mm.group(1), int(mm.group(2)), int(mm.group(3)), mm.group(4))
-            for mm in ANCHOR_RE.finditer(m.group(1))]
+    """Structural parser (keeps '-' and ':' in contig names)."""
+    return lr.parse_details(details)[side]
 
 
 def main():
@@ -286,7 +286,7 @@ def main():
             ref_is_full = ih.get(ref_asm, {})
 
             def block_summary(blk, seq_len, prox_start):
-                if blk is None: return (0, 0.0, "", 999999, False, False)
+                if blk is None: return (0, 0.0, "", 999999, False, False, None)
                 qname, tname, ts, te, bp, ident, bstrand, qlen, qs, qe = blk
                 # local contig name for IS lookup
                 contig_full = tname
@@ -312,11 +312,16 @@ def main():
                 nis = find_nearest_is(hits, prox, max_dist=args.is_tol)
                 is_adj = nis is not None
                 d_to_is = nis[3] if nis else 999999
-                return (bp, ident, f"{tname}:{ts}-{te}", d_to_is, aligns, is_adj)
+                return (bp, ident, f"{tname}:{ts}-{te}", d_to_is, aligns, is_adj,
+                        (tname,) + tuple(nis[:2]) if nis else None)
 
-            C_bp, C_id, C_pos, C_d, C_ok, C_isadj = block_summary(C_block, len(C_seq), C_prox_start)
-            X_bp, X_id, X_pos, X_d, X_ok, X_isadj = block_summary(X_block, len(X_seq), X_prox_start)
-            both_isadj = (C_ok and C_isadj and X_ok and X_isadj)
+            C_bp, C_id, C_pos, C_d, C_ok, C_isadj, C_is = block_summary(C_block, len(C_seq), C_prox_start)
+            X_bp, X_id, X_pos, X_d, X_ok, X_isadj, X_is = block_summary(X_block, len(X_seq), X_prox_start)
+            # reciprocal = C and X flank the SAME reference IS (the partner
+            # X-IS-C). Each being next to SOME IS, on different contigs, was
+            # accepted as the strict pass.
+            both_isadj = (C_ok and C_isadj and X_ok and X_isadj
+                          and C_is is not None and C_is == X_is)
 
             if C_ok and X_ok: n_both_align += 1
             elif not C_ok and not X_ok: n_neither_align += 1

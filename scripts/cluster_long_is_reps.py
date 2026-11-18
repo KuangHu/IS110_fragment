@@ -155,7 +155,9 @@ def main():
             asms = set()
             for m in cl["members"]:
                 rec = is_id_to_record.get(m)
-                if rec: asms.add(rec["assembly"])
+                # a GCA/GCF pair is one genome
+                if rec: asms.add(rec["assembly"][4:] if rec["assembly"][:4] in ("GCA_", "GCF_")
+                                 else rec["assembly"])
             fh.write(f"{cl['id']}\t{cl['rep']}\t{len(cl['members'])}\t"
                      f"{len(asms)}\t{','.join(cl['members'][:10])}"
                      f"{'...' if len(cl['members'])>10 else ''}\n")
