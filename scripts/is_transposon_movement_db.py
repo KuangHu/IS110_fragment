@@ -84,6 +84,10 @@ def merge_is(hits, gap=500):
 def main():
     args = parse_args()
     os.makedirs(args.out, exist_ok=True)
+    # a rerun that finds nothing must not leave the previous table in place
+    _old = os.path.join(args.out, f"{args.ref_asm}_movement.tsv")
+    if os.path.exists(_old):
+        os.remove(_old)
     is_hits = load_is_hits(args.is_hits)
 
     work_root = tempfile.mkdtemp(prefix="movedb_")
@@ -100,17 +104,21 @@ def main():
     # for an identical site).
     candidates = []
     skipped = defaultdict(int)
+    ref_names = set(ref_fa.references)
     for contig, hits in sorted(is_hits.get(args.ref_asm, {}).items()):
         merged = merge_is(hits)
-        try:
-            clen = ref_fa.get_reference_length(contig)
-        except (KeyError, ValueError):
-            try:
-                clen = ref_fa.get_reference_length(f"{args.ref_asm}|{contig}")
-                contig = f"{args.ref_asm}|{contig}"
-            except (KeyError, ValueError):
-                skipped["contig not in --ref-fa"] += 1
-                continue
+        # records / is_hits name contigs "assembly|contig"; a per-assembly
+        # FASTA has the bare name. Try as given, bare, then prefixed (the
+        # retry used to build "asm|asm|contig" and skip every candidate).
+        for name in (contig, contig.split("|", 1)[-1],
+                     f"{args.ref_asm}|{contig.split('|', 1)[-1]}"):
+            if name in ref_names:
+                contig = name
+                break
+        else:
+            skipped["contig not in --ref-fa"] += 1
+            continue
+        clen = ref_fa.get_reference_length(contig)
         for i in range(len(merged)):
             for j in (range(i + 1, len(merged)) if args.all_pairs
                       else range(i + 1, min(i + 2, len(merged)))):

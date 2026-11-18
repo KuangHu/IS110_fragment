@@ -21,24 +21,29 @@ r = lambda n: "".join(rng.choice("ACGT") for _ in range(n))  # noqa: E731
 A, B, C, D, E_ = r(20000), r(20000), r(20000), r(20000), r(20000)   # backbone blocks
 EL = r(8000)                                                    # the element
 OTHER = r(30000)
+F = r(8000)                                                     # another element, same size
+INS1, INS2 = r(6000), r(6000)
 
 genomes = {
-    # reference: element between A and B; site C|D is empty
-    "GCA_000000001.1": {"c1": A + EL + B + C + D + E_},
+    # reference: element between A and B; a different element F between C and D
+    "GCA_000000001.1": {"c1": A + EL + B + C + F + D + E_},
     # its RefSeq twin: identical -> must be ignored entirely
-    "GCF_000000001.1": {"c1": A + EL + B + C + D + E_},
+    "GCF_000000001.1": {"c1": A + EL + B + C + F + D + E_},
     # same site, same orientation
-    "GCA_000000002.1": {"c1": A + EL + B + C + D + E_},
+    "GCA_000000002.1": {"c1": A + EL + B + C + F + D + E_},
     # same site, contig assembled in the other orientation (used to vanish)
-    "GCA_000000003.1": {"c1": revcomp(A + EL + B + C + D + E_)},
-    # element at C|D instead; A|B empty  -> MOVED, reference site empty
-    "GCA_000000004.1": {"c1": A + B + C + EL + D + E_},
+    "GCA_000000003.1": {"c1": revcomp(A + EL + B + C + F + D + E_)},
+    # element at D|E instead (empty in the reference) -> MOVED
+    "GCA_000000004.1": {"c1": A + B + C + F + D + EL + E_},
     # same site but the contig ends 300 bp after the element -> not assessable
     "GCA_000000005.1": {"c1": A + EL + B[:300]},
     # moved AND reverse orientation of the whole contig
-    "GCA_000000006.1": {"c1": revcomp(A + B + C + EL + D + E_)},
+    "GCA_000000006.1": {"c1": revcomp(A + B + C + F + D + EL + E_)},
     # element in unrelated sequence the reference does not have
     "GCA_000000007.1": {"c1": OTHER[:15000] + EL + OTHER[15000:]},
+    "GCA_000000008.1": {"c1": A[:-2200] + INS1 + A[-2200:] + EL + B[:2200] + INS2 + B[2200:]
+                        + C + F + D + E_},
+    "GCA_000000009.1": {"c1": A + B + C + EL + D + E_},
 }
 
 
@@ -69,7 +74,11 @@ def main():
     assert len(rows) == len(got), "one row per target copy"
     want = {"GCA_000000002.1": "SYNTENIC", "GCA_000000003.1": "SYNTENIC",
             "GCA_000000004.1": "MOVED", "GCA_000000005.1": "FLANK_UNASSESSABLE",
-            "GCA_000000006.1": "MOVED", "GCA_000000007.1": "MOVED"}
+            "GCA_000000006.1": "MOVED", "GCA_000000007.1": "DIFFERENT_CONTEXT",
+            # same site, 6 kb of unrelated DNA inserted 2.2 kb away on each side
+            "GCA_000000008.1": "DIFFERENT_CONTEXT",
+            # reference has a DIFFERENT 8-kb element F at C|D; here E replaced it
+            "GCA_000000009.1": "MOVED"}
     assert "GCF_000000001.1" not in got and "GCA_000000001.1" not in got, \
         "reference and its GCF twin must be excluded"
     for asm, v in want.items():
@@ -79,6 +88,7 @@ def main():
     assert got["GCA_000000004.1"]["ref_site"] == "empty"
     assert got["GCA_000000006.1"]["ref_site"] == "empty"
     assert got["GCA_000000007.1"]["ref_site"] == "absent"
+    assert got["GCA_000000009.1"]["ref_site"] == "occupied_other"
     assert got["GCA_000000003.1"]["strand"] == "-"
     assert all(float(r_["IS_cov"]) > 0.99 for r_ in rows), "1-based start: whole element queried"
     print("PASS ref_site states, twin exclusion, coverage")
@@ -116,6 +126,25 @@ def paralog():
     print("PASS two copies in both genomes: no MOVED (was 2 MOVED)")
 
 
+def adjacent_copies():
+    """Target carries two adjacent copies: two placements, not one cluster."""
+    import lib_movement as lm
+    with tempfile.TemporaryDirectory() as wd:
+        t, q = os.path.join(wd, "t.fa"), os.path.join(wd, "q.fa")
+        open(t, "w").write(f">T|c1\n{A + EL + EL + B}\n>T|c2\n{A + EL[4000:] + EL[:4000] + B}\n")
+        open(q, "w").write(f">q\n{EL}\n")
+        paf = os.path.join(wd, "x.paf")
+        subprocess.run(["minimap2", "-x", "asm10", "-c", "--eqx"] + lm.census_args(100, 0.5)
+                       + [t, q, "-o", paf], check=True, stderr=subprocess.DEVNULL)
+        cl = lm.parse_clusters(paf, {"q": len(EL)}, 2000)
+    c1 = [c for c in cl if c["tname"] == "T|c1" and c["cov"] > 0.9]
+    assert len(c1) == 2, cl
+    assert not [c for c in cl if c["tname"] == "T|c2" and c["cov"] > 0.9], \
+        "a copy with swapped halves must not have full coverage"
+    print("PASS adjacent copies are two placements; a scrambled copy is not intact")
+
+
 if __name__ == "__main__":
     main()
     paralog()
+    adjacent_copies()

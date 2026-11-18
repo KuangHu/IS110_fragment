@@ -345,6 +345,14 @@ def main():
                     R = lm.flank_match(cand["right_flank"].upper(), trf, args.flank_match_cov,
                                        args.flank_match_id, work, args.threads)
                     verdict = lm.site_verdict(L[0], R[0])
+                    if verdict == "MOVED":
+                        # same refinement as the *_db scripts: is the target
+                        # site empty in the reference, or does the reference
+                        # carry another copy of this unit there?
+                        rs = lm.ref_site_states(
+                            ref_fa_path, [(0, tlf, trf, seg_len + la + lb, None)],
+                            work, args.threads).get(0, "absent")
+                        verdict = lm.refine(verdict, rs)
                     n[verdict] += 1
                     out.write(f"{head}{tgt}\t{ki}\t{len(passing)}\t"
                               f"{cl['cov']:.3f}\t{cl['weighted_ident']:.1f}\t{cl['n_blocks']}\t"

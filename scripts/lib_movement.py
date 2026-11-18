@@ -77,7 +77,15 @@ def parse_clusters(paf_path, qlen_lookup, cluster_gap, rows_per_query=None):
         blks = sorted(by_qts[(qname, tname, strand)], key=lambda x: (x["ts"], x["te"]))
         groups, cur, cur_te = [], [blks[0]], blks[0]["te"]
         for b in blks[1:]:
-            if b["ts"] - cur_te <= cluster_gap:
+            # one COPY = blocks that also advance along the query in step with
+            # the target ('-' strand: backwards). Proximity alone merged two
+            # adjacent copies (A-E-E-B) into one cluster and gave a copy with
+            # swapped halves coverage 1.0 / "strict".
+            prev = cur[-1]
+            in_order = (b["qs"] >= prev["qs"] + 0.5 * (prev["qe"] - prev["qs"])) if strand == "+" \
+                else (b["qe"] <= prev["qe"] - 0.5 * (prev["qe"] - prev["qs"]))
+            contained = prev["ts"] <= b["ts"] and b["te"] <= cur_te
+            if b["ts"] - cur_te <= cluster_gap and (in_order or contained):
                 cur.append(b)
                 cur_te = max(cur_te, b["te"])
             else:
@@ -192,28 +200,34 @@ def fmt(state, cov, ident):
 def ref_site_states(ref_fa_path, moved, work, threads, max_slack=2000):
     """What does the REFERENCE genome have at each 'MOVED' target site?
 
-    moved: list of (key, left_flank, right_flank, element_len) in query
-    orientation. The two target flanks are aligned to the whole reference
-    assembly:
+    moved: list of (key, left_flank, right_flank, element_len[, body_seq]) in
+    query orientation. The two target flanks are aligned to the whole
+    reference assembly:
 
       empty      both flanks land next to each other -> the reference has the
-                 site without the element: the strongest evidence of movement
-      occupied   both flanks land with ~element_len between them -> the
-                 reference carries ANOTHER COPY at this very site. The target
-                 copy is syntenic with that copy, not moved. (A reference with
-                 copies at X and Y against a target with the same two copies
-                 gave 'X moved to Y' and 'Y moved to X'.)
+                 site without the element: the evidence of movement
+      occupied   both flanks land ~element_len apart AND the reference
+                 sequence between them is the element (when body_seq is
+                 given): the reference carries ANOTHER COPY at this very site,
+                 the target copy is syntenic with it. (A reference with copies
+                 at X and Y against a target with the same two gave 'X moved
+                 to Y' and 'Y moved to X'.)
+      occupied_other   ~element_len apart but the sequence there is something
+                 else (a different element of similar size was replaced)
       absent     the flanks do not both map: the target site is not in the
-                 reference (no statement possible about the reference)
+                 reference -- no statement about the reference is possible
+    The gap tolerance scales with the element: with a fixed 2 kb, a 1.5-kb
+    IS still sitting at the site read as 'empty'.
     Returns {key: state}."""
     if not moved:
         return {}
+    import pysam
     d = tempfile.mkdtemp(prefix="refsite_", dir=work)
     try:
         q = os.path.join(d, "flanks.fa")
         with open(q, "w") as fh:
-            for i, (_, lf, rf, _) in enumerate(moved):
-                fh.write(f">{i}_L\n{lf}\n>{i}_R\n{rf}\n")
+            for i, m in enumerate(moved):
+                fh.write(f">{i}_L\n{m[1]}\n>{i}_R\n{m[2]}\n")
         res = subprocess.run(["minimap2", "-x", "asm10", "-c", "--eqx", "-N", "20",
                               "-t", str(threads), ref_fa_path, q],
                              check=True, capture_output=True, text=True)
@@ -233,30 +247,80 @@ def ref_site_states(ref_fa_path, moved, work, threads, max_slack=2000):
             else:
                 edge = ts - (qlen - qe) if side == "L" else te + qs
             hits[(int(idx), side)].append((c[5], c[4], edge))
+        ref_fa = pysam.FastaFile(ref_fa_path)
         out = {}
-        for i, (key, _, _, elen) in enumerate(moved):
+        for i, m in enumerate(moved):
+            key, elen = m[0], m[3]
+            body = m[4] if len(m) > 4 else None
+            empty_max = min(max_slack, max(200, 0.3 * elen))
+            occ_tol = max(200, 0.2 * elen)
             state = "absent"
-            for (ct, st, e_l) in hits.get((i, "L"), ()):
-                for (ct2, st2, e_r) in hits.get((i, "R"), ()):
+            for (ct, st, e_l) in sorted(hits.get((i, "L"), ())):
+                for (ct2, st2, e_r) in sorted(hits.get((i, "R"), ())):
                     if ct != ct2 or st != st2:
                         continue
                     gap = (e_r - e_l) if st == "+" else (e_l - e_r)
-                    if -200 <= gap <= max_slack and state != "occupied":
+                    if abs(gap - elen) <= occ_tol:
+                        lo, hi = sorted((e_l, e_r))
+                        same = True
+                        if body:
+                            there = ref_fa.fetch(ct, max(0, lo), hi).upper()
+                            span, ident = _best_any_strand(there, body, d, threads)
+                            same = span >= 0.5 * len(body) and ident >= 90
+                        if same:
+                            state = "occupied"
+                        elif state not in ("occupied", "empty"):
+                            state = "occupied_other"
+                    elif -200 <= gap <= empty_max and state != "occupied":
                         state = "empty"
-                    elif abs(gap - elen) <= max(max_slack, 0.2 * elen):
-                        state = "occupied"
             out[key] = state
+        ref_fa.close()
         return out
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
 
+def _best_any_strand(ref_seq, qry_seq, work, threads):
+    """(query bp aligned, identity) of the longest alignment, either strand."""
+    dd = tempfile.mkdtemp(prefix="bd_", dir=work)
+    try:
+        r, q = os.path.join(dd, "r.fa"), os.path.join(dd, "q.fa")
+        write_fasta("r", ref_seq, r)
+        write_fasta("q", qry_seq, q)
+        res = subprocess.run(["minimap2", "-x", "asm10", "-c", "--eqx", "-t", str(threads), r, q],
+                             check=True, capture_output=True, text=True)
+        cov, m_, b_ = [], 0, 0
+        for line in res.stdout.splitlines():
+            c = line.split("\t")
+            if len(c) < 12:
+                continue
+            cov.append((int(c[2]), int(c[3]))); m_ += int(c[9]); b_ += int(c[10])
+        tot, cs, ce = 0, None, None
+        for s0, e0 in sorted(cov):
+            if ce is None or s0 > ce:
+                if ce is not None: tot += ce - cs
+                cs, ce = s0, e0
+            else:
+                ce = max(ce, e0)
+        tot += (ce - cs) if ce is not None else 0
+        return tot, (m_ / b_ * 100 if b_ else 0.0)
+    finally:
+        shutil.rmtree(dd, ignore_errors=True)
+
+
 def refine(verdict, ref_site):
     """A 'MOVED' copy that sits where the reference has another copy is not
     a movement."""
-    if verdict == "MOVED" and ref_site == "occupied":
+    if verdict != "MOVED":
+        return verdict
+    if ref_site == "occupied":
         return "SYNTENIC_OTHER_REF_COPY"
-    return verdict
+    if ref_site in ("empty", "occupied_other"):
+        return "MOVED"            # the reference has this site WITHOUT the element
+    # Flanks differ, but the target site cannot be found in the reference.
+    # That is also what unrelated insertions in both flanks, a deleted element
+    # end, or a strain-specific region look like -- not evidence of movement.
+    return "DIFFERENT_CONTEXT"
 
 
 def split_tname(tname):
@@ -315,12 +379,12 @@ def search_and_judge(args, candidates, db_fa, work_root, out_path,
                         work_root, args.threads)
         verdict = site_verdict(L[0], R[0])
         if verdict == "MOVED":
-            moved.append((ki, tlf, trf, qlen[cl["qname"]]))
+            moved.append((ki, tlf, trf, qlen[cl["qname"]], cand["is_seq"]))
         rows.append((ki, cand, cl, L, R, verdict))
     ref_site = ref_site_states(args.ref_fa, moved, work_root, args.threads)
 
-    verdicts = ("MOVED", "SYNTENIC", "SYNTENIC_OTHER_REF_COPY", "PARTIAL_MATCH",
-                "FLANK_UNASSESSABLE")
+    verdicts = ("MOVED", "DIFFERENT_CONTEXT", "SYNTENIC", "SYNTENIC_OTHER_REF_COPY",
+                "PARTIAL_MATCH", "FLANK_UNASSESSABLE")
     n = dict.fromkeys(verdicts, 0)
     n_strict = dict.fromkeys(verdicts, 0)
     with open(out_path + ".tmp", "w") as out:

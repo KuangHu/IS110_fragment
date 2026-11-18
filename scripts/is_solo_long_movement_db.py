@@ -78,6 +78,10 @@ def load_long_is(path, ref_asm, min_tnp_len, require_both):
 def main():
     args = parse_args()
     os.makedirs(args.out, exist_ok=True)
+    # a rerun that finds nothing must not leave the previous table in place
+    _old = os.path.join(args.out, f"{args.ref_asm}_solo_movement.tsv")
+    if os.path.exists(_old):
+        os.remove(_old)
     work_root = tempfile.mkdtemp(prefix="solomov_")
 
     long_is = load_long_is(args.is_hits, args.ref_asm,
@@ -93,16 +97,20 @@ def main():
     # Build candidates: IS body + A_flank + B_flank
     candidates = []
     skipped = defaultdict(int)
+    ref_names = set(ref_fa.references)
     for (contig, ts, te, strand, tlen, is_id) in long_is:
-        try:
-            clen = ref_fa.get_reference_length(contig)
-        except (KeyError, ValueError):
-            alt = f"{args.ref_asm}|{contig}"
-            try:
-                clen = ref_fa.get_reference_length(alt); contig = alt
-            except (KeyError, ValueError):
-                skipped["contig not in --ref-fa"] += 1
-                continue
+        # records / is_hits name contigs "assembly|contig"; a per-assembly
+        # FASTA has the bare name. Try as given, bare, then prefixed (the
+        # retry used to build "asm|asm|contig" and skip every candidate).
+        for name in (contig, contig.split("|", 1)[-1],
+                     f"{args.ref_asm}|{contig.split('|', 1)[-1]}"):
+            if name in ref_names:
+                contig = name
+                break
+        else:
+            skipped["contig not in --ref-fa"] += 1
+            continue
+        clen = ref_fa.get_reference_length(contig)
         # tnp_start/tnp_end are 1-based inclusive (is_hits.tsv)
         is_s = max(0, ts - 1 - args.is_pad); is_e = min(clen, te + args.is_pad)
         is_seq = ref_fa.fetch(contig, is_s, is_e).upper()

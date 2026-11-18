@@ -159,19 +159,31 @@ def copy_depth(blocks, min_block, min_ident, strand=None):
     use = sorted((b for b in blocks if b["ident"] >= min_ident
                   and b["qe"] - b["qs"] >= min_block
                   and (strand is None or b["strand"] == strand)),
-                 key=lambda b: -(b["qe"] - b["qs"]))
+                 # longest first, then a full positional key: the result must
+                 # not depend on the order minimap2 printed equal blocks in
+                 key=lambda b: (-(b["qe"] - b["qs"]), b["ts"], b["te"], b["qs"], b["strand"]))
     places = []
     for b in use:
         if not any(min(b["te"], p["te"]) - max(b["ts"], p["ts"]) > 0 for p in places):
             places.append(b)
+    # sweep over query coordinates; run[k] = length of the current
+    # uninterrupted stretch covered by >= k places (it continues across
+    # endpoints of other places -- resetting at every endpoint reported 0
+    # copies for two places covering the same 1,500 bp)
     pts = sorted([(p["qs"], 1) for p in places] + [(p["qe"], -1) for p in places])
     dup_bp, max_copies, depth, last = 0, 0, 0, None
+    run = {}
     for pos, d in pts:
         if last is not None and pos > last:
+            seg = pos - last
             if depth >= 2:
-                dup_bp += pos - last
-            if pos - last >= min_block:
-                max_copies = max(max_copies, depth)
+                dup_bp += seg
+            for k in range(1, depth + 1):
+                run[k] = run.get(k, 0) + seg
+                if run[k] >= min_block:
+                    max_copies = max(max_copies, k)
+            for k in [k for k in run if k > depth]:
+                run[k] = 0
         depth += d
         last = pos
     return dup_bp, max_copies, places

@@ -66,6 +66,10 @@ def load_refs(path, ref_asm):
 def main():
     args = parse_args()
     os.makedirs(args.out, exist_ok=True)
+    # a rerun that finds nothing must not leave the previous table in place
+    _old = os.path.join(args.out, f"{args.ref_asm}_large_movement.tsv")
+    if os.path.exists(_old):
+        os.remove(_old)
     work_root = tempfile.mkdtemp(prefix="largemov_")
 
     rows = load_refs(args.records_tsv, args.ref_asm)
@@ -80,17 +84,21 @@ def main():
     # Build candidates with whole-element body + 5 kb flanks
     candidates = []
     skipped = defaultdict(int)
+    ref_names = set(ref_fa.references)
     for r in rows:
         contig = r["contig"]
-        try:
-            clen = ref_fa.get_reference_length(contig)
-        except (KeyError, ValueError):
-            alt = f"{args.ref_asm}|{contig}"
-            try:
-                clen = ref_fa.get_reference_length(alt); contig = alt
-            except (KeyError, ValueError):
-                skipped["contig not in --ref-fa"] += 1
-                continue
+        # records / is_hits name contigs "assembly|contig"; a per-assembly
+        # FASTA has the bare name. Try as given, bare, then prefixed (the
+        # retry used to build "asm|asm|contig" and skip every candidate).
+        for name in (contig, contig.split("|", 1)[-1],
+                     f"{args.ref_asm}|{contig.split('|', 1)[-1]}"):
+            if name in ref_names:
+                contig = name
+                break
+        else:
+            skipped["contig not in --ref-fa"] += 1
+            continue
+        clen = ref_fa.get_reference_length(contig)
         # is_start/is_end are records.json source_start/source_end: 1-based
         # inclusive. Used as 0-based they dropped the element's first base
         # and put it in the left flank.
