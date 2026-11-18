@@ -55,6 +55,24 @@ def test_eqx_is_required():
     c = row("q", 1000, 0, 1000, "+", "t", 9000, 0, 1000, "950=50X").split("\t")
     check("identity is '=' / ('=' + 'X')", abs(pu.aligned_identity(c) - 95.0) < 1e-9)
 
+def test_output_independent_of_hash_seed():
+    rows = []
+    for k in range(5):
+        for q in ("qa", "qb", "qc"):
+            rows += [row(q, 2000, 0, 1000, "+", f"t{k}", 9000, 0, 1000 + k, f"{1000 + k}="),
+                     row(q, 2000, 1000, 2000, "+", f"t{k}", 9000, 1600 + k, 2600, f"{1000 - k}=")]
+    outs = []
+    with tempfile.TemporaryDirectory() as d:
+        open(os.path.join(d, "x.paf"), "w").write("\n".join(rows) + "\n")
+        for seed in ("1", "2"):
+            for script, suffix in (("detect_is110_variants.py", "_all.tsv"), ("detect_multisplit.py", "_chains.tsv")):
+                subprocess.run([sys.executable, os.path.join(SCR, script), os.path.join(d, "x.paf"),
+                                os.path.join(d, "o" + seed)], env=dict(os.environ, PYTHONHASHSEED=seed),
+                               capture_output=True, check=True)
+            outs.append(open(os.path.join(d, f"o{seed}_all.tsv")).read() + open(os.path.join(d, f"o{seed}_chains.tsv")).read())
+    check("detector and multisplit tables identical under PYTHONHASHSEED=1 and 2",
+          outs[0] == outs[1] and outs[0].count("insertion") >= 5, str(len(outs[0])))
+
 def test_detector():
     two = [row("q", 2000, 0, 1000, "+", "t", 9000, 0, 1000, "1000="),
            row("q", 2000, 1000, 2000, "+", "t", 9000, 1600, 2600, "1000="),
@@ -221,7 +239,7 @@ def test_minimap2_round_trip():
                     ("two", "insertion"), ("two", "insertion")]
             check(f"minimap2 {preset} round trip: events on the right contigs only", got == want, str(got))
 
-for t in (test_identity, test_eqx_is_required, test_detector, test_multisplit, test_lineage, test_ref_core_and_origin, test_stage_lib,
+for t in (test_identity, test_eqx_is_required, test_output_independent_of_hash_seed, test_detector, test_multisplit, test_lineage, test_ref_core_and_origin, test_stage_lib,
           test_minimap2_round_trip):
 
 
