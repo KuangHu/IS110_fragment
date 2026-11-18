@@ -22,6 +22,7 @@ python3 "$REPO/tests/test_lib_alleles.py"
 python3 "$REPO/tests/test_self_align.py"
 python3 "$REPO/tests/test_stage_units.py"
 python3 "$REPO/tests/test_downstream.py"
+python3 "$REPO/tests/test_movement.py"
 
 echo "=== synthetic data ==="
 python3 "$REPO/tests/make_synthetic.py" "$WORK/syn"

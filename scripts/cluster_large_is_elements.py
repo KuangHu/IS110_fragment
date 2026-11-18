@@ -11,6 +11,8 @@ Output: cluster reps + reps_records.tsv subset + rep_ref_assemblies.txt.
 import argparse, json, os, subprocess, sys
 import pysam
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -37,10 +39,21 @@ def main():
 
     # Filter to whole-element length >= threshold
     kept = []
+    # Only CALLED boundaries. For peak_symmetric_fallback / no_empty_tnp_only
+    # the "element" is a length guess split evenly around the ORF (or the ORF
+    # itself): not an element whose movement can be asked about. Records
+    # without a method label (older files) are all kept.
+    labelled = any((r.get("boundary_evidence") or {}).get("method")
+                   == "empty_vs_filled_decomposition" for r in recs)
+    n_uncalled = 0
     for r in recs:
         ie = r.get("is_element", {})
         L = ie.get("length", 0)
         if L < args.min_element_bp: continue
+        if labelled and (r.get("boundary_evidence") or {}).get("method") \
+                != "empty_vs_filled_decomposition":
+            n_uncalled += 1
+            continue
         src = r.get("source", {})
         if not all(k in src for k in ("assembly", "contig")):
             continue
@@ -55,35 +68,56 @@ def main():
             "length":   int(L),
             "sequence": ie.get("sequence", ""),
         })
-    print(f"[cluster] {len(kept)} IS elements with length >= {args.min_element_bp} bp",
-          flush=True)
+    print(f"[cluster] {len(kept)} IS elements with length >= {args.min_element_bp} bp"
+          f" ({n_uncalled} more dropped: boundary not called)", flush=True)
+    # one record per genome: a GCA/GCF pair is the same element twice
+    from lib_alleles import assembly_core, _asm_rank
+    best = {}
+    for r in kept:
+        k = (assembly_core(r["assembly"]), r["contig"].split("|")[-1].replace("NZ_", ""),
+             r["is_start"], r["is_end"])
+        if k not in best or _asm_rank(r["assembly"]) > _asm_rank(best[k]["assembly"]):
+            best[k] = r
+    if len(best) < len(kept):
+        print(f"[cluster] {len(kept) - len(best)} GCA/GCF twin records collapsed", flush=True)
+    kept = sorted(best.values(), key=lambda r: r["ref_id"])
     if not kept:
         sys.exit("No large IS elements found.")
 
     # Extract sequence from DB if missing (sanity-check)
     fa = pysam.FastaFile(args.db)
     fa_path = os.path.join(args.out, "large_is_bodies.fa")
-    n_written = 0
+    n_written = n_nofetch = 0
     with open(fa_path, "w") as out:
         for r in kept:
             seq = r["sequence"]
             if not seq:
+                # source_start is 1-based inclusive
                 try:
-                    seq = fa.fetch(r["contig"], r["is_start"], r["is_end"])
+                    seq = fa.fetch(r["contig"], r["is_start"] - 1, r["is_end"])
                 except (KeyError, ValueError):
+                    n_nofetch += 1
                     continue
-            if not seq: continue
+            if not seq:
+                n_nofetch += 1
+                continue
             out.write(f">{r['ref_id']}\n")
             for i in range(0, len(seq), 80):
                 out.write(seq[i:i+80] + "\n")
             n_written += 1
     fa.close()
-    print(f"[cluster] wrote {n_written} body sequences to {fa_path}", flush=True)
+    print(f"[cluster] wrote {n_written} body sequences to {fa_path}"
+          f"{f' ({n_nofetch} without sequence, DROPPED)' if n_nofetch else ''}", flush=True)
 
     # cd-hit-est
     reps_fa = os.path.join(args.out, "reps.fa")
     cmd = ["cd-hit-est", "-i", fa_path, "-o", reps_fa,
+           # -aL as well as -aS, and global identity: with -aS alone a 5 kb
+           # element identical to PART of a 40 kb one joined its cluster, only
+           # the 40 kb representative was searched, and the short element's
+           # own copies were never tested
            "-c", str(args.identity), "-aS", str(args.coverage),
+           "-aL", str(args.coverage), "-g", "1",
            "-n", str(args.word_size), "-T", str(args.threads),
            "-M", "16000", "-d", "0"]
     print(f"[cluster] cd-hit-est: {' '.join(cmd)}", flush=True)
@@ -119,7 +153,8 @@ def main():
             if not r: continue
             fh.write(f"{r['ref_id']}\t{r['assembly']}\t{r['contig']}\t"
                      f"{r['is_start']}\t{r['is_end']}\t{r['length']}\n")
-    print(f"[cluster] wrote reps_records.tsv with {len(clusters)} reps", flush=True)
+    n_reps = sum(1 for cl in clusters if cl["rep"] in by_refid)
+    print(f"[cluster] wrote reps_records.tsv with {n_reps} reps", flush=True)
 
     # Distinct ref assemblies
     refs = set()
@@ -139,7 +174,7 @@ def main():
             asms, lens = set(), []
             for m in cl["members"]:
                 if m in by_refid:
-                    asms.add(by_refid[m]["assembly"])
+                    asms.add(assembly_core(by_refid[m]["assembly"]))
                     lens.append(by_refid[m]["length"])
             lens_str = ",".join(str(x) for x in lens[:5]) + ("..." if len(lens)>5 else "")
             fh.write(f"{cl['id']}\t{cl['rep']}\t{len(cl['members'])}\t"

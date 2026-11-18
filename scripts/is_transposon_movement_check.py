@@ -30,9 +30,13 @@ For each (ref candidate B, tgt assembly) pair:
         - if DIFFER → MOVED (composite transposon mobilization confirmed)
         - if alignment of B fails → ABSENT (B not found in tgt)
 """
-import argparse, csv, gzip, json, os, re, shutil, subprocess, tempfile
+import argparse, csv, gzip, json, os, re, shutil, subprocess, sys, tempfile
 from collections import defaultdict
 import pysam
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import lib_movement as lm  # noqa: E402
+from lib_alleles import revcomp  # noqa: E402
 
 
 def parse_args():
@@ -220,15 +224,20 @@ def find_composite_candidates(ref_is_index, ref_fa, args):
         except (KeyError, ValueError):
             continue
         for i in range(len(merged)):
-            for j in range(i + 1, len(merged)):
+            # adjacent pairs only: with every pair, IS at A, B, C gave the
+            # overlapping candidates (A,B), (B,C) and (A,C) and one relocated
+            # region up to three MOVED rows
+            for j in range(i + 1, min(i + 2, len(merged))):
                 is_a = merged[i]; is_b = merged[j]
-                seg_start = is_a[1]; seg_end = is_b[0]
+                # ORF coordinates are 1-based inclusive; segment = the bases
+                # strictly between the two IS (0-based half-open)
+                seg_start = is_a[1]; seg_end = is_b[0] - 1
                 seg_len = seg_end - seg_start
                 if seg_len < args.min_segment_bp or seg_len > args.max_segment_bp:
                     continue
                 if args.require_same_strand and is_a[2] != is_b[2]:
                     continue
-                lf_s = max(0, is_a[0] - args.flank); lf_e = is_a[0]
+                lf_s = max(0, is_a[0] - 1 - args.flank); lf_e = is_a[0] - 1
                 rf_s = is_b[1]; rf_e = min(clen, is_b[1] + args.flank)
                 seg = ref_fa.fetch(contig, seg_start, seg_end)
                 lf = ref_fa.fetch(contig, lf_s, lf_e) if lf_e > lf_s else ""
@@ -262,27 +271,41 @@ def main():
         print("no candidates — exiting"); return
 
     tgts = [t.strip() for t in open(args.tgt_list) if t.strip()]
-    # skip self-comparison
-    tgts = [t for t in tgts if t != args.ref_asm]
+    # skip the reference AND its GCA/GCF twin (the twin counted as another genome)
+    tgts = [t for t in tgts if not lm.same_genome(t, args.ref_asm)]
     print(f"testing {len(candidates)} candidates against {len(tgts)} target assemblies", flush=True)
 
     out_path = os.path.join(args.out, "per_candidate_movement.tsv")
-    n_moved = n_syntenic = n_partial = n_absent = n_failed = 0
-    n_multi  = 0   # candidates with >= 2 clusters in one tgt
+    n = defaultdict(int)
+    n_multi = 0   # candidates with >= 2 clusters in one tgt
+
+    def tgt_flanks(fa, cl, la, lb):
+        """Target sequence outside the segment, long enough to reach past the
+        bracketing IS copies: the reference flanks lie OUTSIDE IS_a / IS_b,
+        so the target window must be flank + IS long (query orientation)."""
+        tlen = fa.get_reference_length(cl["tname"])
+        a, b = lm.projected_ends(cl)
+        a, b = max(0, min(tlen, a)), max(0, min(tlen, b))
+        if cl["strand"] == "+":
+            return (fa.fetch(cl["tname"], max(0, a - args.flank - la), a).upper(),
+                    fa.fetch(cl["tname"], b, min(tlen, b + args.flank + lb)).upper())
+        return (revcomp(fa.fetch(cl["tname"], b, min(tlen, b + args.flank + la)).upper()),
+                revcomp(fa.fetch(cl["tname"], max(0, a - args.flank - lb), a).upper()))
+
     with open(out_path, "w") as out:
         out.write("ref_asm\tref_contig\tref_is_a_start\tref_is_b_start\tsegment_bp\t"
                   "tgt_asm\tcluster_idx\tn_clusters_in_tgt\tB_cov\tB_ident\tn_aln_blocks\t"
                   "tgt_contig\ttgt_pos\t"
-                  "left_flank_match\tright_flank_match\tverdict\n")
+                  "left_flank_match\tright_flank_match\tverdict\ttgt_strand\n")
         for ci, cand in enumerate(candidates):
             work = tempfile.mkdtemp(prefix=f"c{ci}_", dir=work_root)
             seg_path = os.path.join(work, "segment.fa")
-            lf_path  = os.path.join(work, "left_flank.fa")
-            rf_path  = os.path.join(work, "right_flank.fa")
             write_fasta("SEG", cand["segment_seq"], seg_path)
-            write_fasta("LF",  cand["left_flank"], lf_path)
-            write_fasta("RF",  cand["right_flank"], rf_path)
             seg_len = len(cand["segment_seq"])
+            la = cand["is_a"][1] - cand["is_a"][0] + 1
+            lb = cand["is_b"][1] - cand["is_b"][0] + 1
+            head = (f"{args.ref_asm}\t{cand['contig']}\t"
+                    f"{cand['is_a'][0]}\t{cand['is_b'][0]}\t{seg_len}\t")
             print(f"\n  cand {ci+1}/{len(candidates)}: "
                   f"{cand['contig']}:{cand['segment_pos'][0]}-{cand['segment_pos'][1]} "
                   f"({seg_len} bp)", flush=True)
@@ -290,71 +313,49 @@ def main():
             for ti, tgt in enumerate(tgts):
                 tgt_path = find_assembly_fa(args.src_dir, tgt, work_root)
                 if not tgt_path:
-                    n_failed += 1; continue
-                try:
-                    clusters = all_forward_clusters(tgt_path, seg_path, work,
-                                                    args.threads, cluster_gap=10000)
-                except Exception:
-                    n_failed += 1; continue
-                # filter clusters by thresholds
+                    # an explicit row: these used to vanish (only a counter)
+                    out.write(f"{head}{tgt}\t0\t0\t0.000\t0.0\t0\t\t\tNA\tNA\tNO_FASTA\t\n")
+                    n["NO_FASTA"] += 1; continue
+                paf = os.path.join(work, f"t{ti}.paf")
+                # a minimap2 failure raises: caught as "failed" it produced no row
+                subprocess.run(["minimap2", "-x", "asm10", "-c", "--eqx",
+                                "-t", str(args.threads), tgt_path, seg_path, "-o", paf],
+                               check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                # both strands: a target contig assembled in the other
+                # orientation used to be reported ABSENT
+                clusters = lm.parse_clusters(paf, {"SEG": seg_len}, 10000)
+                os.remove(paf)
                 passing = [c for c in clusters
                            if c["cov"] >= args.min_coverage
                            and c["weighted_ident"] >= args.min_identity]
                 if not passing:
-                    out.write(f"{args.ref_asm}\t{cand['contig']}\t"
-                              f"{cand['is_a'][0]}\t{cand['is_b'][0]}\t{seg_len}\t"
-                              f"{tgt}\t0\t0\t0.000\t0.0\t0\t\t\tNA\tNA\tABSENT\n")
-                    n_absent += 1; continue
+                    out.write(f"{head}{tgt}\t0\t0\t0.000\t0.0\t0\t\t\tNA\tNA\tABSENT\t\n")
+                    n["ABSENT"] += 1; continue
                 if len(passing) > 1:
                     n_multi += 1
-                # Process each passing cluster as a separate verdict line
                 tgt_fa = pysam.FastaFile(tgt_path)
                 for ki, cl in enumerate(passing):
-                    tname = cl["tname"]; ts = cl["ts"]; te = cl["te"]
-                    try:
-                        tlen = tgt_fa.get_reference_length(tname)
-                    except (KeyError, ValueError):
-                        continue
-                    tgt_lf_s = max(0, ts - args.flank); tgt_lf_e = ts
-                    tgt_rf_s = te; tgt_rf_e = min(tlen, te + args.flank)
-                    tgt_lf = tgt_fa.fetch(tname, tgt_lf_s, tgt_lf_e) if tgt_lf_e > tgt_lf_s else ""
-                    tgt_rf = tgt_fa.fetch(tname, tgt_rf_s, tgt_rf_e) if tgt_rf_e > tgt_rf_s else ""
-                    tgt_lf_path = os.path.join(work, f"tgt_lf_{ki}.fa")
-                    tgt_rf_path = os.path.join(work, f"tgt_rf_{ki}.fa")
-                    if tgt_lf: write_fasta("TLF", tgt_lf, tgt_lf_path)
-                    if tgt_rf: write_fasta("TRF", tgt_rf, tgt_rf_path)
-                    def flanks_match(rf_path, tgt_flank_path):
-                        if not os.path.exists(tgt_flank_path): return (False, 0, 0)
-                        try:
-                            b = best_forward_block(rf_path, tgt_flank_path, work, args.threads)
-                        except Exception:
-                            return (False, 0, 0)
-                        if b is None: return (False, 0, 0)
-                        _, _, _, bp2, id2 = b
-                        cov2 = bp2 / args.flank
-                        return (cov2 >= args.flank_match_cov and id2 >= args.flank_match_id,
-                                cov2, id2)
-                    lf_ok, lf_cov, lf_id = flanks_match(lf_path, tgt_lf_path)
-                    rf_ok, rf_cov, rf_id = flanks_match(rf_path, tgt_rf_path)
-                    if lf_ok and rf_ok:
-                        verdict = "SYNTENIC"; n_syntenic += 1
-                    elif not lf_ok and not rf_ok:
-                        verdict = "MOVED"; n_moved += 1
-                    else:
-                        verdict = "PARTIAL_MATCH"; n_partial += 1
-                    out.write(f"{args.ref_asm}\t{cand['contig']}\t"
-                              f"{cand['is_a'][0]}\t{cand['is_b'][0]}\t{seg_len}\t"
-                              f"{tgt}\t{ki}\t{len(passing)}\t"
+                    # flanks are compared as SEQUENCES per cluster. They were
+                    # files named by cluster index and reused on existence: a
+                    # target with an empty flank was judged on the previous
+                    # target's flank file.
+                    tlf, trf = tgt_flanks(tgt_fa, cl, la, lb)
+                    L = lm.flank_match(cand["left_flank"].upper(), tlf, args.flank_match_cov,
+                                       args.flank_match_id, work, args.threads)
+                    R = lm.flank_match(cand["right_flank"].upper(), trf, args.flank_match_cov,
+                                       args.flank_match_id, work, args.threads)
+                    verdict = lm.site_verdict(L[0], R[0])
+                    n[verdict] += 1
+                    out.write(f"{head}{tgt}\t{ki}\t{len(passing)}\t"
                               f"{cl['cov']:.3f}\t{cl['weighted_ident']:.1f}\t{cl['n_blocks']}\t"
-                              f"{tname}\t{ts}\t"
-                              f"{lf_ok}({lf_cov:.2f}/{lf_id:.0f})\t{rf_ok}({rf_cov:.2f}/{rf_id:.0f})\t{verdict}\n")
+                              f"{cl['tname']}\t{cl['ts']}\t"
+                              f"{lm.fmt(*L)}\t{lm.fmt(*R)}\t{verdict}\t{cl['strand']}\n")
                 tgt_fa.close()
             shutil.rmtree(work, ignore_errors=True)
 
     ref_fa.close()
     shutil.rmtree(work_root, ignore_errors=True)
-    print(f"\nDONE. SYNTENIC={n_syntenic}  MOVED={n_moved}  PARTIAL_MATCH={n_partial}  "
-          f"ABSENT={n_absent}  multi-cluster tgts={n_multi}  failed={n_failed}")
+    print(f"\nDONE. {dict(n)}  multi-cluster tgts={n_multi}")
     print(f"Wrote {out_path}")
 
 

@@ -7,7 +7,8 @@ Output:
   is110_filtered.fa       — subset FASTA of IS110 elements
   is110_hits.tsv          — per-IS: is_id, seq_len, tnp orf coords, domains_hit, n_orfs
 
-Two-domain rule matches Cross_reference_IS is_detect.py (set intersection).
+Two-domain rule matches Cross_reference_IS is_detect.py (set intersection):
+hmmsearch with the same E-value thresholds, and BOTH profile names required.
 """
 import argparse, os, subprocess, tempfile, shutil, sys
 from collections import defaultdict
@@ -64,30 +65,36 @@ def predict_orfs(sequences, threads):
     return proteins, orf_info
 
 
-def run_hmmscan(proteins_faa, hmm_db_path, out_domtbl, threads, e_value):
-    """Run hmmscan; produce domain table (--domtblout)."""
-    cmd = ["hmmscan",
-           "--domtblout", out_domtbl,
-           "--noali",
-           "-E", str(e_value),
-           "--cpu", str(threads),
-           hmm_db_path,
-           proteins_faa]
+def hmm_name(path):
+    """NAME field of an HMM file."""
+    with open(path) as fh:
+        for line in fh:
+            if line.startswith("NAME"):
+                return line.split()[1]
+    raise ValueError(f"no NAME line in {path}")
+
+
+def run_hmmsearch(proteins_faa, hmm_db_path, out_domtbl, threads, e_value):
+    """hmmsearch, as is_detect.py does. hmmscan computes E-values with
+    Z = number of PROFILES (2 here) instead of the number of proteins, so
+    the same -E 1e-5 was ~Z_proteins/2 times more permissive than the main
+    pipeline, although the docstring said the two matched."""
+    cmd = ["hmmsearch", "--domtblout", out_domtbl, "--noali",
+           "-E", str(e_value), "--domE", str(e_value),
+           "--cpu", str(threads), hmm_db_path, proteins_faa]
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
 
 def parse_domtbl(path):
-    """Parse hmmscan --domtblout. Return dict {protein_id: set(domain_names)}."""
+    """Parse hmmsearch --domtblout. Return dict {protein_id: set(profile_names)}."""
     hits = defaultdict(set)
     with open(path) as fh:
         for line in fh:
             if line.startswith("#"): continue
             fields = line.split()
             if len(fields) < 22: continue
-            target = fields[0]   # domain name (from HMM)
-            query  = fields[3]   # protein id
-            e_value = float(fields[6])
-            hits[query].add(target)
+            # hmmsearch: target = protein (col 0), query = profile (col 3)
+            hits[fields[0]].add(fields[3])
     return hits
 
 
@@ -110,20 +117,21 @@ def main():
             for pid, aa in proteins:
                 fh.write(f">{pid}\n{aa}\n")
 
-        # 3. Build combined HMM db (concatenate + hmmpress)
-        print(f"Preparing combined HMM db ...", file=sys.stderr, flush=True)
+        # 3. Combined HMM file
         hmm_db = f"{tmp}/domains.hmm"
         with open(hmm_db, "w") as fout:
             for h in [args.hmm_dedd, args.hmm_tnp20]:
                 with open(h) as fin: fout.write(fin.read())
-        subprocess.run(["hmmpress", "-f", hmm_db], check=True,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        required = {hmm_name(args.hmm_dedd), hmm_name(args.hmm_tnp20)}
 
-        # 4. Run hmmscan
-        print(f"Running hmmscan ({args.threads} threads, E<{args.e_value}) ...",
+        # 4. Run hmmsearch
+        print(f"Running hmmsearch ({args.threads} threads, E<{args.e_value}) ...",
               file=sys.stderr, flush=True)
         domtbl = f"{tmp}/hits.domtbl"
-        run_hmmscan(proteins_faa, hmm_db, domtbl, args.threads, args.e_value)
+        if proteins:
+            run_hmmsearch(proteins_faa, hmm_db, domtbl, args.threads, args.e_value)
+        else:
+            open(domtbl, "w").close()
 
         # 5. Parse hits
         hits_by_protein = parse_domtbl(domtbl)
@@ -132,9 +140,11 @@ def main():
 
         # 6. Determine which IS elements pass
         # Domain names in the .hmm files (short names, not accessions)
-        target_domains = set()
-        for prots in hits_by_protein.values():
-            target_domains |= prots
+        # The required set is the two PROFILES asked for. It used to be "the
+        # profiles that hit anything in this input": if nothing in the file
+        # hit one of them, a single-domain protein passed as "all 1 domains",
+        # and the verdict for one sequence depended on the others in the file.
+        target_domains = required
         print(f"  HMM target names present: {target_domains}",
               file=sys.stderr)
 
@@ -152,7 +162,7 @@ def main():
             best_orf = None
             for pid, info in orfs.items():
                 doms = info["doms"]
-                ok = len(doms) >= (1 if args.any_domain else len(target_domains))
+                ok = bool(doms) if args.any_domain else required <= doms
                 if not ok: continue
                 if best_orf is None or (info["end"] - info["start"]) > (best_orf["end"] - best_orf["start"]):
                     best_orf = {**info, "protein_id": pid}
@@ -161,7 +171,7 @@ def main():
 
         print(f"  IS110-passing (>=1 ORF with all {len(target_domains)} domains): "
               f"{len(passing_is):,} / {len(seqs):,} "
-              f"({len(passing_is)*100/len(seqs):.1f}%)",
+              f"({len(passing_is)*100/max(1, len(seqs)):.1f}%)",
               file=sys.stderr)
 
         # 7. Write output FASTA + TSV
@@ -182,7 +192,7 @@ def main():
                 fout.write(f"{is_id}\t{len(seq_by_id[is_id])}\t"
                            f"{info['orf_num']}\t{info['start']}\t{info['end']}\t"
                            f"{'+' if info['strand'] == 1 else '-'}\t"
-                           f"{info['end']-info['start']}\t{doms}\t{n_orfs}\n")
+                           f"{info['end']-info['start']+1}\t{doms}\t{n_orfs}\n")
 
         print(f"Wrote {args.out_fa}", file=sys.stderr)
         print(f"Wrote {args.out_tsv}", file=sys.stderr)

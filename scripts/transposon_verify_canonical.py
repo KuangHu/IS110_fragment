@@ -12,8 +12,11 @@ BOTH the start and end of the moved DNA segment.
                   → DNA at new location but NOT bracketed by IS → not a
                     composite transposon mobilization (could be HGT cargo etc.)
 """
-import argparse, csv, os
+import argparse, csv, os, sys
 from collections import defaultdict
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from lib_alleles import assembly_core  # noqa: E402
 
 
 def parse_args():
@@ -40,12 +43,18 @@ def load_is_hits(path):
     return idx
 
 
-def has_is_within(hits, pos, tol):
-    for (s, e) in hits:
-        d = 0 if s <= pos <= e else min(abs(pos - s), abs(pos - e))
-        if d <= tol:
-            return True, d
-    return False, None
+def bracketing_is(hits, ts, te, tol):
+    """Is the interval [ts, te] bracketed by TWO DISTINCT IS copies?
+
+    start: an IS hit overlapping [ts - tol, ts + tol]; end: a DIFFERENT hit
+    overlapping [te - tol, te + tol] that lies after the first. The old test
+    looked for 'any hit within tol of ts' and 'any hit within tol of te'
+    independently: one IS in the middle of a 5.5 kb interval satisfied both
+    and the event was CANONICAL."""
+    near_s = [h for h in hits if h[0] <= ts + tol and h[1] >= ts - tol]
+    near_e = [h for h in hits if h[0] <= te + tol and h[1] >= te - tol]
+    both = any(a != b and a[1] < b[0] for a in near_s for b in near_e)
+    return bool(near_s), bool(near_e), both
 
 
 def main():
@@ -66,13 +75,21 @@ def main():
             ts = int(r["ts"]); te = int(r["te"])
             tgt_hits = is_hits.get(tgt_asm, {}).get(tgt_contig, [])
             if not tgt_hits:
+                # is_hits.tsv keeps one of a GCA/GCF pair: look up the twin
+                twin = next((a for a in is_hits if a != tgt_asm
+                             and assembly_core(a) == assembly_core(tgt_asm)), None)
+                if twin:
+                    tgt_hits = (is_hits[twin].get(tgt_contig)
+                                or is_hits[twin].get("NZ_" + tgt_contig)
+                                or is_hits[twin].get(tgt_contig[3:] if tgt_contig.startswith("NZ_") else "")
+                                or [])
+            if not tgt_hits:
                 v_start = v_end = False
                 verdict = "NO_HITS_FOR_TGT"
             else:
-                start_ok, _ = has_is_within(tgt_hits, ts, args.is_tol)
-                end_ok,   _ = has_is_within(tgt_hits, te, args.is_tol)
+                start_ok, end_ok, both = bracketing_is(tgt_hits, ts, te, args.is_tol)
                 v_start, v_end = start_ok, end_ok
-                if start_ok and end_ok:
+                if both:
                     verdict = "CANONICAL"
                 elif start_ok or end_ok:
                     verdict = "PARTIAL_IS"
@@ -83,8 +100,9 @@ def main():
                        + f"\t{v_start}\t{v_end}\t{verdict}\n")
 
     print(f"\nDONE.")
+    total = sum(n.values())
     for v, c in sorted(n.items(), key=lambda x: -x[1]):
-        pct = 100 * c / sum(n.values())
+        pct = 100 * c / total if total else 0.0
         print(f"  {v:<20} {c:>7} ({pct:.1f}%)")
     print(f"\nWrote {out_path}")
 

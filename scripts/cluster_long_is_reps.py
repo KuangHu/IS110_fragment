@@ -27,7 +27,8 @@ def parse_args():
     p.add_argument("--db",      required=True, help="species FASTA (indexed)")
     p.add_argument("--out",     required=True)
     p.add_argument("--min-tnp-len",     type=int,   default=1000)
-    p.add_argument("--require-both-domains", action="store_true", default=True)
+    p.add_argument("--require-both-domains", action=argparse.BooleanOptionalAction,
+                   default=True, help="(--no-require-both-domains to turn off)")
     p.add_argument("--is-pad",          type=int,   default=50)
     p.add_argument("--identity",        type=float, default=0.99)
     p.add_argument("--coverage",        type=float, default=0.95,
@@ -56,11 +57,13 @@ def main():
             rows.append(r)
     print(f"[cluster] {len(rows)} long IS records (≥{args.min_tnp_len} bp + both Pfam domains)",
           flush=True)
+    if not rows:
+        sys.exit("No long IS records pass the filters.")
 
     # 2. Extract IS body FASTA (with is_pad on each side)
     fa_path = os.path.join(args.out, "long_is_bodies.fa")
     is_id_to_record = {}
-    n_written = 0
+    n_written = n_nocontig = 0
     with open(fa_path, "w") as out:
         for r in rows:
             asm = r["assembly"]; contig = r["contig"]
@@ -69,8 +72,11 @@ def main():
             except (KeyError, ValueError):
                 alt = f"{asm}|{contig}"
                 try: clen = fa.get_reference_length(alt); contig = alt
-                except (KeyError, ValueError): continue
-            is_s = max(0, ts - args.is_pad); is_e = min(clen, te + args.is_pad)
+                except (KeyError, ValueError):
+                    n_nocontig += 1
+                    continue
+            # tnp_start is 1-based inclusive
+            is_s = max(0, ts - 1 - args.is_pad); is_e = min(clen, te + args.is_pad)
             seq = fa.fetch(contig, is_s, is_e)
             if not seq: continue
             is_id = r["is_id"]
@@ -79,14 +85,18 @@ def main():
             is_id_to_record[is_id] = r
             n_written += 1
     fa.close()
-    print(f"[cluster] wrote {n_written} IS bodies to {fa_path}", flush=True)
+    print(f"[cluster] wrote {n_written} IS bodies to {fa_path}"
+          f"{f' ({n_nocontig} DROPPED: contig not in --db)' if n_nocontig else ''}", flush=True)
     if n_written == 0:
         sys.exit("No long IS to cluster.")
 
     # 3. cd-hit-est
     reps_fa  = os.path.join(args.out, "reps.fa")
     cmd = ["cd-hit-est", "-i", fa_path, "-o", reps_fa,
+           # -aL too: with -aS alone a short body joins any longer sequence
+           # that contains it, and only the long representative is searched
            "-c", str(args.identity), "-aS", str(args.coverage),
+           "-aL", str(args.coverage), "-g", "1",
            "-n", str(args.word_size), "-T", str(args.threads),
            "-M", "16000", "-d", "0"]
     print(f"[cluster] cd-hit-est: {' '.join(cmd)}", flush=True)
@@ -125,7 +135,8 @@ def main():
             if rep_id not in is_id_to_record: continue
             r = is_id_to_record[rep_id]
             fh.write("\t".join(r[k] for k in fieldnames) + "\n")
-    print(f"[cluster] wrote reps_is_hits.tsv with {len(clusters)} reps", flush=True)
+    n_reps = sum(1 for cl in clusters if cl["rep"] in is_id_to_record)
+    print(f"[cluster] wrote reps_is_hits.tsv with {n_reps} reps", flush=True)
 
     # 6. Distinct ref assemblies
     ref_asms = set()
