@@ -41,7 +41,7 @@ import pysam
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from lib_alleles import (load_anchor_hits, place_per_assembly, source_core,  # noqa: E402
                          gap_tolerance, classify_gap, decompose_alleles,
-                         find_tsd, canon_key, revcomp)
+                         find_tsd, canon_key, revcomp, ANCHOR_RE)
 
 
 def parse_args():
@@ -82,6 +82,11 @@ def parse_args():
     p.add_argument("--tol-bp", type=int, default=100)
     p.add_argument("--tol-frac", type=float, default=0.002)
     p.add_argument("--margin", type=float, default=0.05)
+    p.add_argument("--max-secondary", type=int, default=0,
+                   help="the minimap2 -N of the anchor search (pipeline.py passes "
+                        "it). An anchor with more than N PAF rows may have had "
+                        "targets cut off; records with such an anchor get "
+                        "anchor_cap_reached=yes. 0 = not known (column 'unknown')")
     p.add_argument("--drop-unsupported", action="store_true",
                    help="write no record for an element with neither a filled nor "
                         "an empty observation in another genome (default: keep it, "
@@ -315,6 +320,12 @@ def _build_one_record(packed):
                              if has_empty else 0)),
             "is_element_length_inferred": is_length,
             "call_confidence": None,       # filled in below from the two fields above
+            # did any anchor of this element (any distance, either side) reach
+            # the secondary cap of the anchor search? Then genomes were cut
+            # off and every count here is a lower bound / a sample.
+            "n_anchors_at_cap": best.get("n_anchors_at_cap"),
+            "anchor_cap_reached": ("unknown" if best.get("n_anchors_at_cap") is None
+                                   else "yes" if best["n_anchors_at_cap"] else "no"),
             "n_v0_observations": len(best["v0_obs"]),
             "n_empty_observations": len(best["empty_obs"]),
             "n_empty_rejected_flank_deletion": n_rejected,
@@ -649,8 +660,23 @@ def main():
 
     # Parse anchor PAF
     print(f"Parsing anchor PAF...", file=sys.stderr)
+    row_counts = {}
     ncbi_hits, n_total, n_kept = load_anchor_hits(args.paf, args.min_identity,
-                                                  args.min_coverage)
+                                                  args.min_coverage, row_counts)
+    # Anchors that reached the secondary cap of the search. minimap2 prints at
+    # most N+1 rows per query and index part, so "more than N rows" is the
+    # conservative test (an anchor below it was certainly not cut off).
+    cap = args.max_secondary + 1 if args.max_secondary > 0 else None
+    capped_by_ref = defaultdict(int)
+    if cap:
+        for q, n in row_counts.items():
+            if n >= cap:
+                m = ANCHOR_RE.match(q)
+                if m:
+                    capped_by_ref[m.group(1)] += 1
+        print(f"  anchors at the -N cap ({cap}+ rows): "
+              f"{sum(capped_by_ref.values()):,} / {len(row_counts):,}; "
+              f"elements with such an anchor: {len(capped_by_ref):,}", file=sys.stderr)
     print(f"  PAF: {n_total:,} rows, {n_kept:,} kept", file=sys.stderr)
 
     # Build records — parallelize per-ref using pysam (in-process FASTA reads)
@@ -665,6 +691,7 @@ def main():
             "min_is_size": args.min_is_size, "max_is_size": args.max_is_size}
     for ref_id, info in ref_info.items():
         best = pick_best_d(ncbi_hits, ref_id, info, distances, opts)
+        best["n_anchors_at_cap"] = capped_by_ref.get(ref_id, 0) if cap else None
         if not best["v0_obs"] and not best["empty_obs"]:
             n_neither += 1
             if args.drop_unsupported:
@@ -755,7 +782,8 @@ def main():
                 "boundary_method\toffset_5p\toffset_3p\tdecomp_D\tdecomp_support\t"
                 "junction_microhomology_bp\ttsd_len\tevent_key\t"
                 "call_support\tcall_n_tied\tv0_peak_count\tv0_peak_n_tied\t"
-                "empty_peak_count\tempty_peak_n_tied\tcall_confidence\n")
+                "empty_peak_count\tempty_peak_n_tied\tcall_confidence\t"
+                "anchor_cap_reached\tn_anchors_at_cap\n")
         for r in all_records:
             be = r["boundary_evidence"]
             dc = be.get("decomposition") or {}
@@ -775,7 +803,8 @@ def main():
                     f"{be['call_support']}\t{be['call_n_tied']}\t"
                     f"{be['v0_peak_count']}\t{be['v0_peak_n_tied']}\t"
                     f"{be['empty_peak_count']}\t{be['empty_peak_n_tied']}\t"
-                    f"{be['call_confidence']}\n")
+                    f"{be['call_confidence']}\t{be['anchor_cap_reached']}\t"
+                    f"{'' if be['n_anchors_at_cap'] is None else be['n_anchors_at_cap']}\n")
 
     print(f"\n=== Build summary ===", file=sys.stderr)
     print(f"  Records built:       {len(all_records):,} of {n_done:,} refs with "

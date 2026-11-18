@@ -254,6 +254,7 @@ def find_is_boundaries(
            # about what an empty site is
            "--min-is-size", str(expected_is_size_range[0]),
            "--max-is-size", str(expected_is_size_range[1]),
+           "--max-secondary", str(max_secondary),
            "--threads", str(threads)],
           [records_json] + [os.path.join(records_dir, f) for f in (
               "summary.tsv", "is_elements.fa", "transposase_cds.fa",

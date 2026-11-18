@@ -408,6 +408,20 @@ def test_call_confidence_flag():
     assert rec["boundary_evidence"]["call_confidence"] == "support1", rec["boundary_evidence"]
 
 
+
+def test_anchor_cap_column():
+    g = rseq(20000)
+    src = {"contig": "S", "assembly": "S", "start": 8001, "end": 9200, "strand": "+"}
+    build_records._FA, build_records._SRC = _FakeFasta({"S": g}), None
+    for n, want in ((None, "unknown"), (0, "no"), (3, "yes")):
+        best = {"D": 1000, "expected_v0": 3200, "v0_peak": (3200, 3), "empty_peak": None,
+                "v0_obs": [], "v1plus_obs": [], "empty_obs": [], "decompose": None,
+                "n_anchors_at_cap": n}
+        be = build_records._build_one_record(
+            (("r", {"tnp_len": 1200}, best, src), "db", 100, 5, "db", 2e7))[0]["boundary_evidence"]
+        assert (be["anchor_cap_reached"], be["n_anchors_at_cap"]) == (want, n), be
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
