@@ -1,4 +1,7 @@
 #!/bin/bash
+# hmmsearch uses --cut_ga (the Pfam gathering thresholds in PF01548.hmm / PF02371.hmm):
+# an E-value cutoff depends on the number of proteins searched, so the same
+# protein could pass in one dataset and fail in another.
 #SBATCH --job-name=hmm_IS110
 #SBATCH --partition=standard
 #SBATCH --cpus-per-task=48
@@ -50,14 +53,14 @@ TNP20_HITS="$OUTDIR/tnp20_hits.domtbl"
 
 if [ ! -f "$DEDD_HITS" ] || [ ! -s "$DEDD_HITS" ]; then
     hmmsearch --domtblout "$DEDD_HITS" \
-        --cpu "$CPUS" -E 1e-5 --domE 1e-5 \
+        --cpu "$CPUS" --cut_ga \
         "$HMM_DIR/PF01548.hmm" "$PROTEIN_FILE" > /dev/null
 fi
 echo "  DEDD hits: $(grep -cv '^#' "$DEDD_HITS") domain hits"
 
 if [ ! -f "$TNP20_HITS" ] || [ ! -s "$TNP20_HITS" ]; then
     hmmsearch --domtblout "$TNP20_HITS" \
-        --cpu "$CPUS" -E 1e-5 --domE 1e-5 \
+        --cpu "$CPUS" --cut_ga \
         "$HMM_DIR/PF02371.hmm" "$PROTEIN_FILE" > /dev/null
 fi
 echo "  Tnp20 hits: $(grep -cv '^#' "$TNP20_HITS") domain hits"
@@ -232,8 +235,12 @@ echo "Step 6: Searching dereplicated IS110 CDS against GTDB..."
 
 SEARCH_OUT="$OUTDIR/is110_vs_gtdb.paf"
 
+# -N/-p: every copy, not the 100 best scoring >= half of the best one -- each
+# half of an interrupted copy is a low-scoring secondary of any intact copy and
+# was never reported (0 of 18 test configurations with an intact copy present).
+# -g/-r 200: do not chain the two halves across the insert into one alignment.
 find "$GTDB_FNA" -name "*.fna" -print0 | xargs -0 cat \
-    | minimap2 -x asm10 -c --eqx --secondary=yes -N 100 -p 0.5 \
+    | minimap2 -x asm10 -c --eqx --secondary=yes -N 1000000 -p 0.05 -g 200 -r 200,200 \
         -t "$CPUS" \
         /dev/stdin "$OUTDIR/is110_cds_nr95.fna" \
         -o "$SEARCH_OUT"
@@ -261,7 +268,11 @@ with open(paf) as fh:
         c = line.strip().split("\t")
         if len(c) < 12: continue
         matches, block = int(c[9]), int(c[10])
-        ident = matches / block * 100 if block > 0 else 0
+        # identity over aligned columns: PAF column 11 counts gap columns, so a
+        # copy with an indel fell below the threshold and was dropped
+        _cg = next((t[5:] for t in c[12:] if t.startswith('cg:Z:')), '')
+        _gaps = sum(int(n) for n, op in __import__('re').findall(r'(\d+)([IDN])', _cg))
+        ident = matches / (block - _gaps) * 100 if block - _gaps > 0 else 0
         if ident < MIN_IDENT: continue
         hits[(c[0], c[5])].append({
             "qs": int(c[2]), "qe": int(c[3]), "qlen": int(c[1]),

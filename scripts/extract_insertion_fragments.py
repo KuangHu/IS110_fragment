@@ -97,6 +97,8 @@ def main():
     print(f"Accessions to process: {len(by_accession):,}")
 
     written = 0
+    seen_loci = set()
+    n_dup = 0
     failed_files = 0
     failed_contigs = 0
 
@@ -142,11 +144,17 @@ def main():
                 if seq is None:
                     failed_contigs += 1
                     continue
-                if f["ins_end"] > len(seq):
-                    continue
-                frag = seq[f["ins_start"]:f["ins_end"]]
+                # clamp (a padded interval can run past the contig end) and
+                # write each locus ONCE: the same insert was written once per
+                # reference IS that matched it, which inflated cluster sizes
+                frag = seq[max(0, f["ins_start"]):min(len(seq), f["ins_end"])]
                 if len(frag) < args.min_len:
                     continue
+                key = (f["target"], f["ins_start"] // 20, f["ins_end"] // 20)
+                if key in seen_loci:
+                    n_dup += 1
+                    continue
+                seen_loci.add(key)
 
                 hdr = (f">{f['target']}__{f['ins_start']}_{f['ins_end']}"
                        f" query={f['query']}"
@@ -156,7 +164,7 @@ def main():
                     out.write(frag[j:j+80] + "\n")
                 written += 1
 
-    print(f"\nTotal fragments written: {written:,}")
+    print(f"\nTotal fragments written: {written:,}  (duplicate loci skipped: {n_dup:,})")
     print(f"Failed file lookups: {failed_files:,}")
     print(f"Failed contig lookups: {failed_contigs:,}")
 

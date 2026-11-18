@@ -1,4 +1,7 @@
 #!/bin/bash
+# hmmsearch uses --cut_ga (the Pfam gathering thresholds in PF01548.hmm / PF02371.hmm):
+# an E-value cutoff depends on the number of proteins searched, so the same
+# protein could pass in one dataset and fail in another.
 #SBATCH --job-name=hmm_ncbi_ecoli
 #SBATCH --account=pc_jbei005
 #SBATCH --partition=lr6
@@ -47,20 +50,38 @@ else
         local acc=$(basename "$(dirname "$fna")")
         local out="${PROT_DIR}/${acc}.faa"
         local gff="${PROT_DIR}/${acc}.gff"
-        prodigal -i "$fna" -a "$out" -o "$gff" -f gff -p single -q > /dev/null 2>&1 || true
+        # a failure is recorded, not hidden ("|| true" left a missing or
+        # partial .faa that was counted as a completed genome)
+        prodigal -i "$fna" -a "$out.tmp" -o "$gff" -f gff -p single -q > /dev/null 2>&1 \
+            && mv "$out.tmp" "$out" || { rm -f "$out.tmp"; echo "$acc" >> "${PROT_DIR}/FAILED.txt"; }
     }
     export -f run_prodigal
     export PROT_DIR
 
     # Find all genome files and process in parallel
-    N_GENOMES=$(find "$GENOME_DIR" -name "*_genomic.fna" | wc -l)
-    echo "  Genomes to process: $N_GENOMES"
+    # One copy of each genome. The download holds most assemblies twice, as
+    # GCA_x (GenBank) and GCF_x (RefSeq): 5,304 of the 13,027 directories were
+    # the twin of another one, so "assemblies with IS110", copies per assembly
+    # and cluster sizes all counted those genomes double. Keep the GCF copy.
+    GENOME_LIST="${OUTDIR}/genomes_one_per_assembly.txt"
+    find "$GENOME_DIR" -name "*_genomic.fna" | sort | awk -F/ '
+        { acc=$(NF-1); core=substr(acc,5); path[acc]=$0; if (acc ~ /^GCF_/) gcf[core]=1; order[++n]=acc }
+        END { for (i=1;i<=n;i++) { a=order[i]; c=substr(a,5);
+                if (a ~ /^GCA_/ && (c in gcf)) continue; print path[a] } }' > "$GENOME_LIST"
+    N_ALL=$(find "$GENOME_DIR" -name "*_genomic.fna" | wc -l)
+    N_GENOMES=$(wc -l < "$GENOME_LIST")
+    echo "  Genomes to process: $N_GENOMES  (of $N_ALL directories; GCA twins of a GCF skipped)"
 
-    find "$GENOME_DIR" -name "*_genomic.fna" -print0 \
+    rm -f "${PROT_DIR}/FAILED.txt"
+    tr '\n' '\0' < "$GENOME_LIST" \
         | xargs -0 -P "$CPUS" -I{} bash -c 'run_prodigal "$@"' _ {}
 
     N_DONE=$(ls "$PROT_DIR"/*.faa 2>/dev/null | wc -l)
     echo "  Prodigal completed: $N_DONE / $N_GENOMES genomes"
+    if [ -s "${PROT_DIR}/FAILED.txt" ]; then
+        echo "ERROR: prodigal failed for $(wc -l < "${PROT_DIR}/FAILED.txt") genomes (${PROT_DIR}/FAILED.txt)" >&2
+        exit 1
+    fi
 
     # Concatenate all per-genome proteins, prefixing protein IDs with assembly accession
     echo "  Concatenating per-genome proteins..."
@@ -99,7 +120,7 @@ TNP20_HITS="${OUTDIR}/tnp20_hits.domtbl"
 if [ ! -s "$DEDD_HITS" ]; then
     echo "Step 2a: hmmsearch DEDD (PF01548)..."
     hmmsearch --domtblout "$DEDD_HITS" \
-        --cpu "$CPUS" -E 1e-5 --domE 1e-5 \
+        --cpu "$CPUS" --cut_ga \
         "${HMM_DIR}/PF01548.hmm" "$PROTEINS" > /dev/null
 fi
 echo "  DEDD hits: $(grep -cv '^#' "$DEDD_HITS")"
@@ -107,7 +128,7 @@ echo "  DEDD hits: $(grep -cv '^#' "$DEDD_HITS")"
 if [ ! -s "$TNP20_HITS" ]; then
     echo "Step 2b: hmmsearch Tnp20 (PF02371)..."
     hmmsearch --domtblout "$TNP20_HITS" \
-        --cpu "$CPUS" -E 1e-5 --domE 1e-5 \
+        --cpu "$CPUS" --cut_ga \
         "${HMM_DIR}/PF02371.hmm" "$PROTEINS" > /dev/null
 fi
 echo "  Tnp20 hits: $(grep -cv '^#' "$TNP20_HITS")"

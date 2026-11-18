@@ -19,10 +19,14 @@ Usage:
 import argparse
 import csv
 import os
+import sys
 import re
 import subprocess
 import tempfile
 from collections import defaultdict, Counter
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from paf_utils import aligned_identity  # noqa: E402
 
 
 def parse_args():
@@ -148,8 +152,7 @@ def cluster_sequences(seqs, identity_thresh, threads):
             qname, tname = c[0], c[5]
             if qname == tname:
                 continue
-            matches, block = int(c[9]), int(c[10])
-            ident = matches / block * 100 if block > 0 else 0
+            ident = aligned_identity(c)   # gap columns excluded (paf_utils)
             if ident < identity_thresh:
                 continue
             qi = int(qname[1:])

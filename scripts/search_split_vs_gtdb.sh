@@ -45,7 +45,7 @@ print(f'  Extracted {count} / {len(ids)} query sequences')
 echo "Step 2: Searching against all GTDB genomes..."
 
 find "$GTDB_FNA" -name "*.fna" -print0 | xargs -0 cat \
-    | minimap2 -x asm10 -c --eqx --secondary=yes -N 1000 -p 0.3 \
+    | minimap2 -x asm10 -c --eqx --secondary=yes -N 1000000 -p 0.05 -g 200 -r 200,200 \
         -t "$CPUS" \
         /dev/stdin "$OUTDIR/split_123_queries.fna" \
         -o "$OUTDIR/split_123_vs_gtdb.paf"
@@ -72,7 +72,11 @@ with open(paf) as fh:
         c = line.strip().split("\t")
         if len(c) < 12: continue
         matches, block = int(c[9]), int(c[10])
-        ident = matches / block * 100 if block > 0 else 0
+        # identity over aligned columns: PAF column 11 counts gap columns, so a
+        # copy with an indel fell below the threshold and was dropped
+        _cg = next((t[5:] for t in c[12:] if t.startswith('cg:Z:')), '')
+        _gaps = sum(int(n) for n, op in __import__('re').findall(r'(\d+)([IDN])', _cg))
+        ident = matches / (block - _gaps) * 100 if block - _gaps > 0 else 0
         if ident < MIN_IDENT: continue
         hits_by_query[c[0]].append({
             "qlen": int(c[1]),

@@ -73,7 +73,11 @@ for org in organisms:
                 if len(c) < 12: continue
                 qname = c[0]
                 matches, block = int(c[9]), int(c[10])
-                ident = matches / block * 100 if block > 0 else 0
+                # identity over aligned columns: PAF column 11 counts gap columns, so a
+                # copy with an indel fell below the threshold and was dropped
+                _cg = next((t[5:] for t in c[12:] if t.startswith('cg:Z:')), '')
+                _gaps = sum(int(n) for n, op in __import__('re').findall(r'(\d+)([IDN])', _cg))
+                ident = matches / (block - _gaps) * 100 if block - _gaps > 0 else 0
                 if ident < 90: continue  # high identity only
                 hits_per_query_per_org[qname][org] += 1
                 cur_best = best_identity[qname].get(org, 0)

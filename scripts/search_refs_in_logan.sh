@@ -37,8 +37,12 @@ if [ -s "$PAF" ]; then
     echo "PAF exists, skipping."
 else
     echo "Running minimap2 (asm10, sensitive)..."
+# -N/-p: every copy, not the 100 best scoring >= half of the best one -- each
+# half of an interrupted copy is a low-scoring secondary of any intact copy and
+# was never reported (0 of 18 test configurations with an intact copy present).
+# -g/-r 200: do not chain the two halves across the insert into one alignment.
     minimap2 -x asm10 -c --eqx \
-        --secondary=yes -N 100 -p 0.5 \
+        --secondary=yes -N 1000000 -p 0.05 -g 200 -r 200,200 \
         -t "$CPUS" \
         "$LOGAN_FA" "$REFS" \
         -o "$PAF"
@@ -82,7 +86,11 @@ with open(paf) as f:
         qlen = int(c[1])
         qs, qe = int(c[2]), int(c[3])
         matches, block = int(c[9]), int(c[10])
-        ident = matches / block * 100 if block > 0 else 0
+        # identity over aligned columns: PAF column 11 counts gap columns, so a
+        # copy with an indel fell below the threshold and was dropped
+        _cg = next((t[5:] for t in c[12:] if t.startswith('cg:Z:')), '')
+        _gaps = sum(int(n) for n, op in __import__('re').findall(r'(\d+)([IDN])', _cg))
+        ident = matches / (block - _gaps) * 100 if block - _gaps > 0 else 0
         cov = (qe - qs) / qlen * 100
         hit_count[qname] += 1
         if ident >= 95:

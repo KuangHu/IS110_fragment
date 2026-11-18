@@ -66,7 +66,10 @@ with open("$OUT", "w") as out:
                  "-outfmt", "6 sseqid stitle pident length qcovs evalue bitscore"],
                 capture_output=True, text=True, timeout=300
             )
-            if r.stdout.strip():
+            if r.returncode != 0:
+                # a network / remote failure is not "no hits"
+                out.write(f"{name.split()[0]}\tERROR\t{r.stderr.strip()[:200]}\t-\t-\t-\t-\t-\n")
+            elif r.stdout.strip():
                 for ln in r.stdout.strip().split("\n"):
                     out.write(f"{name.split()[0]}\t{ln}\n")
             else:

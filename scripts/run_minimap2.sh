@@ -85,9 +85,9 @@ echo ""
 
 # ── Run minimap2 (one pass for all queries) ──
 # -c --eqx: CIGAR with =/X for precise identity calculation
-# --secondary=yes -N 50 -p 0.8: report multiple/split alignments
+# --secondary=yes -N 1000000 -p 0.05 -g 200 -r 200,200: report multiple/split alignments
 find "$GTDB_DIR" -name "*.fna" -exec cat {} + \
-    | minimap2 -x asm5 -c --eqx --secondary=yes -N 50 -p 0.8 \
+    | minimap2 -x asm5 -c --eqx --secondary=yes -N 1000000 -p 0.05 -g 200 -r 200,200 \
         -t "$CPUS" \
         /dev/stdin "$COMBINED_QUERY" \
         -o "$RAW_PAF"

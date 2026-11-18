@@ -76,9 +76,13 @@ else
 
     # Process in parallel batches, append to single file
     ZSTD_BIN=$(which zstd)
-    find "$LOGAN_DIR" -name "*.contigs.fa.zst" -print0 \
-        | xargs -0 -P "$CPUS" -I{} "$ZSTD_BIN" -dcq {} \
-        >> "$CONCAT"
+    # ONE writer, files in sorted order. `xargs -P` let all zstd processes
+    # write to the same file at once: their output blocks interleaved in the
+    # middle of records (sequence of one sample continuing into another's,
+    # headers swallowed), and the record order changed from run to run.
+    find "$LOGAN_DIR" -name "*.contigs.fa.zst" -print0 | sort -z \
+        | xargs -0 "$ZSTD_BIN" -dcq > "$CONCAT.tmp"
+    mv "$CONCAT.tmp" "$CONCAT"
 
     echo "  Size: $(du -h "$CONCAT" | cut -f1)"
 fi
@@ -92,8 +96,12 @@ if [ -f "$PAF" ] && [ "$(stat -c%s "$PAF" 2>/dev/null || echo 0)" -gt 0 ]; then
     echo "Step 2: PAF file exists, skipping minimap2."
 else
     echo "Step 2: Running minimap2 (asm10, sensitive)..."
+# -N/-p: every copy, not the 100 best scoring >= half of the best one -- each
+# half of an interrupted copy is a low-scoring secondary of any intact copy and
+# was never reported (0 of 18 test configurations with an intact copy present).
+# -g/-r 200: do not chain the two halves across the insert into one alignment.
     minimap2 -x asm10 -c --eqx \
-        --secondary=yes -N 100 -p 0.5 \
+        --secondary=yes -N 1000000 -p 0.05 -g 200 -r 200,200 \
         -t "$CPUS" \
         "$CONCAT" "$QUERY" \
         -o "$PAF"

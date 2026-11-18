@@ -2,7 +2,11 @@
 """Detect split IS110 transposases across ALL contigs (not restricted to same contig)."""
 
 import os
+import sys
 from collections import defaultdict
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from paf_utils import aligned_identity  # noqa: E402
 
 paf = "/groups/rubin/projects/kuang/out/IS110_fragment/hmm_search/is110_vs_gtdb.paf"
 outdir = "/groups/rubin/projects/kuang/out/IS110_fragment/hmm_search"
@@ -17,8 +21,7 @@ with open(paf) as fh:
         c = line.strip().split("\t")
         if len(c) < 12:
             continue
-        matches, block = int(c[9]), int(c[10])
-        ident = matches / block * 100 if block > 0 else 0
+        ident = aligned_identity(c)   # gap columns excluded (paf_utils)
         if ident < MIN_IDENT:
             continue
         hits_by_query[c[0]].append({
@@ -62,8 +65,17 @@ for qname, hlist in hits_by_query.items():
             same_contig = hi["tname"] == hj["tname"]
 
             if same_contig:
-                # Same contig: gap must be <= 20kb
-                gap = abs(hj["ts"] - hi["te"]) if hj["ts"] > hi["te"] else abs(hi["ts"] - hj["te"])
+                # one interrupted copy: both parts on the same strand and in
+                # the same order on the contig as on the query (an inverted
+                # second half or two swapped parts were also "split")
+                if hi.get("strand") != hj.get("strand"):
+                    continue
+                a_, b_ = sorted((hi, hj), key=lambda h: h["ts"])
+                if (a_["qs"] < b_["qs"]) != (hi.get("strand", "+") == "+"):
+                    continue
+                # Same contig: gap must be <= 20kb. Gap = distance between the
+                # two target intervals (overlapping hits gave a positive "gap")
+                gap = max(hi["ts"], hj["ts"]) - min(hi["te"], hj["te"])
                 if gap > MAX_GAP:
                     continue
                 if gap < 50:  # too close = not a real split

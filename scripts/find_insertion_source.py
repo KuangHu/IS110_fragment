@@ -17,9 +17,13 @@ Usage:
 import argparse
 import csv
 import os
+import sys
 import subprocess
 import tempfile
 from collections import defaultdict
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from paf_utils import aligned_identity  # noqa: E402
 
 
 def parse_args():
@@ -109,17 +113,19 @@ def run_minimap2(query_fa, target_fa, threads):
     """Run minimap2, return list of (qname, qlen, qs, qe, tname, tlen, ts, te, strand, ident)."""
     result = subprocess.run(
         ["minimap2", "-x", "asm10", "-c", "--eqx", "--secondary=yes",
-         "-N", "50", "-p", "0.5", "-t", str(threads),
+         "-N", "100000", "-p", "0.05", "-t", str(threads),
          target_fa, query_fa],
         capture_output=True, text=True
     )
+    if result.returncode != 0:
+        # a killed/failed minimap2 used to read as "No source found" for all
+        raise RuntimeError(f"minimap2 failed ({result.returncode}): {result.stderr[-500:]}")
     hits = []
     for line in result.stdout.split("\n"):
         c = line.strip().split("\t")
         if len(c) < 12:
             continue
-        matches, block = int(c[9]), int(c[10])
-        ident = matches / block * 100 if block > 0 else 0
+        ident = aligned_identity(c)   # gap columns excluded (paf_utils)
         hits.append({
             "qname": c[0],
             "qlen": int(c[1]),

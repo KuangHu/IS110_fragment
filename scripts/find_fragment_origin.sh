@@ -59,7 +59,9 @@ if [ ! -f "$REP_FASTA" ]; then
         conda install -y -c bioconda cd-hit 2>&1 | tail -3
     fi
     cd-hit-est -i "$FRAG_FASTA" -o "$REP_FASTA" \
-        -c 0.90 -n 8 -T 16 -M 0 -d 0 -g 1 \
+        `# 95% identity (the project threshold) over >= 90% of BOTH sequences:` \
+        `# without -aL/-aS a 300-bp fragment clustered into any 5-kb one containing it` \
+        -c 0.95 -n 10 -aS 0.9 -aL 0.9 -T 16 -M 0 -d 0 -g 1 \
         > "${CLUSTER_PREFIX}.log" 2>&1
 else
     echo "Step 2: Representatives exist, skipping clustering."

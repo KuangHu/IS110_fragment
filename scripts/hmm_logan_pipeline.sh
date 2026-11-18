@@ -1,4 +1,7 @@
 #!/bin/bash
+# hmmsearch uses --cut_ga (the Pfam gathering thresholds in PF01548.hmm / PF02371.hmm):
+# an E-value cutoff depends on the number of proteins searched, so the same
+# protein could pass in one dataset and fail in another.
 #SBATCH --job-name=hmm_logan
 #SBATCH --account=pc_jbei005
 #SBATCH --partition=lr_bigmem
@@ -157,10 +160,16 @@ else
 
     # Run prodigal in parallel
     echo "  Running prodigal on each chunk..."
+    # each chunk is checked: a bare `wait` returns 0 even if prodigal crashed
+    # on a chunk, whose short .faa was then concatenated as if complete
+    PIDS=()
     for f in "$SPLIT_DIR"/chunk_*.fa; do
-        (prodigal -i "$f" -a "${f%.fa}.faa" -o "${f%.fa}.gff" -f gff -p meta -q > /dev/null 2>&1) &
+        (prodigal -i "$f" -a "${f%.fa}.faa" -o "${f%.fa}.gff" -f gff -p meta -q > "${f%.fa}.log" 2>&1) &
+        PIDS+=($!)
     done
-    wait
+    for pid in "${PIDS[@]}"; do
+        wait "$pid" || { echo "ERROR: prodigal failed on a chunk (see $SPLIT_DIR/*.log)" >&2; exit 1; }
+    done
 
     # Concatenate
     cat "$SPLIT_DIR"/chunk_*.faa > "$PROTEINS"
@@ -212,7 +221,7 @@ if [ -s "$DEDD_HITS" ]; then
 else
     echo "Step 4a: hmmsearch DEDD (PF01548)..."
     hmmsearch --domtblout "$DEDD_HITS" \
-        --cpu "$CPUS" -E 1e-5 --domE 1e-5 \
+        --cpu "$CPUS" --cut_ga \
         "${HMM_DIR}/PF01548.hmm" "$PROT_REPS" > /dev/null
 fi
 echo "  DEDD hits: $(grep -cv '^#' "$DEDD_HITS")"
@@ -222,7 +231,7 @@ if [ -s "$TNP20_HITS" ]; then
 else
     echo "Step 4b: hmmsearch Tnp20 (PF02371)..."
     hmmsearch --domtblout "$TNP20_HITS" \
-        --cpu "$CPUS" -E 1e-5 --domE 1e-5 \
+        --cpu "$CPUS" --cut_ga \
         "${HMM_DIR}/PF02371.hmm" "$PROT_REPS" > /dev/null
 fi
 echo "  Tnp20 hits: $(grep -cv '^#' "$TNP20_HITS")"
@@ -339,7 +348,7 @@ samples = set()
 n_written = 0
 with open(out_path, "w") as f:
     f.write("protein_id\tcontig\tsample\tstart\tend\tstrand\n")
-    for pid in all_is110_prots:
+    for pid in sorted(all_is110_prots):
         if pid not in prot_info2:
             continue
         contig, start, end, strand = prot_info2[pid]

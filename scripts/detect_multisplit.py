@@ -19,8 +19,13 @@ Usage:
 """
 
 import argparse
+import os
+import sys
 import csv
 from collections import defaultdict
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from paf_utils import aligned_identity  # noqa: E402
 
 
 def parse_args():
@@ -58,8 +63,7 @@ def parse_paf(path, min_identity, min_aln_len):
             if len(c) < 12:
                 continue
             total += 1
-            matches, block = int(c[9]), int(c[10])
-            ident = matches / block * 100 if block > 0 else 0
+            ident = aligned_identity(c)   # gap columns excluded (paf_utils)
             if ident < min_identity:
                 continue
             qs, qe = int(c[2]), int(c[3])
