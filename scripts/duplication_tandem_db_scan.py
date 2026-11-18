@@ -123,7 +123,7 @@ def main():
     asm_list = sorted(set(representative_asm(contigs_by_asm.keys()).values()))
     from lib_alleles import assembly_core
     _by_core = defaultdict(list)
-    for a_ in set(contigs_by_asm) | set(is_hits):
+    for a_ in sorted(set(contigs_by_asm) | set(is_hits)):      # not in hash order
         _by_core[assembly_core(a_)].append(a_)
     twins_of = {a_: [b_ for b_ in v if b_ != a_] for v in _by_core.values() for a_ in v}
     start = args.assembly_chunk_start

@@ -325,7 +325,9 @@ def place_per_assembly(up_by_tname, down_by_tname, exclude_core=None, **kw):
     for t, hs in down_by_tname.items():
         by_asm_down.setdefault(split_target(t)[0], []).extend(hs)
     by_core = {}
-    for asm in set(by_asm_up) & set(by_asm_down):
+    # sorted(): the per-core lists are ranked below with a stable sort, so two
+    # assemblies of equal rank would otherwise be tried in hash order
+    for asm in sorted(set(by_asm_up) & set(by_asm_down)):
         if exclude_core is not None and assembly_core(asm) == exclude_core:
             continue
         by_core.setdefault(assembly_core(asm), []).append(asm)

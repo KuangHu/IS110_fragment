@@ -117,7 +117,7 @@ def main():
         # the event when the preferred copy lacked one anchor (as
         # place_per_assembly learned earlier).
         by_core = defaultdict(list)
-        for a in asms:
+        for a in sorted(asms):
             by_core[assembly_core(a)].append(a)
         for twins in by_core.values():
             usable = lambda a: bool(obs[(ref_id, a)]["up"]) and bool(obs[(ref_id, a)]["down"])  # noqa: E731

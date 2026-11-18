@@ -209,7 +209,10 @@ def main():
     n_refs = n_anchors = n_skipped = 0
     with Pool(args.threads, initializer=_worker_init,
               initargs=(args.genome_db, args.flank, args.anchor_length, distances)) as pool:
-        for i, res in enumerate(pool.imap_unordered(_extract_one, hits, chunksize=16)):
+        # imap (ordered): the three output files are written in the order of
+        # the hits table. imap_unordered wrote them in completion order, so
+        # two runs gave the same records in a different order.
+        for i, res in enumerate(pool.imap(_extract_one, hits, chunksize=16)):
             if i % 5000 == 0:
                 print(f"  processed {i:,}/{len(hits):,}", file=sys.stderr, flush=True)
             if res is None:

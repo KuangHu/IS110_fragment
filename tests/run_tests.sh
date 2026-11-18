@@ -39,3 +39,21 @@ python3 "$REPO/scripts/pipeline.py" \
 
 echo "=== checks ==="
 python3 "$REPO/tests/check_synthetic.py" "$WORK/syn" "$RUN"
+
+echo "=== same result under another hash seed (stages 2-6) ==="
+# Python randomises str hashes per process; any output that depends on set
+# iteration order differs between runs. Run the pipeline again with other
+# seeds and compare every stage 2 and stage 6 file byte for byte.
+for seed in 1 2; do
+    R2="$WORK/run_seed$seed"
+    rm -rf "$R2"; mkdir -p "$R2"
+    cp "$WORK/syn/is_hits.tsv" "$R2/"
+    PYTHONHASHSEED=$seed python3 "$REPO/scripts/pipeline.py" \
+        --hmm unused.hmm --db "$WORK/syn/db.fa" --out "$R2" \
+        --distances 1000,5000 --flank 6000 --threads 4 --no-render-figures > "$R2/log.txt" 2>&1
+done
+for f in anchors_anchors.fa anchors_refs.fa anchors_table.tsv boundaries_summary.tsv pairs_summary.tsv \
+         records/records.json records/summary.tsv records/is_elements.fa records/empty_junctions.fa; do
+    cmp "$WORK/run_seed1/$f" "$WORK/run_seed2/$f" || { echo "FAIL hash-seed dependence: $f"; exit 1; }
+done
+echo "PASS outputs identical under PYTHONHASHSEED=1 and 2 (9 files)"

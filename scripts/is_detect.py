@@ -93,7 +93,7 @@ def run_orfs_pyrodigal(db_fa, out_faa, out_gff, threads):
     with open(out_faa, "w") as ffaa, open(out_gff, "w") as fgff:
         with Pool(threads) as pool:
             for i, (faa_part, gff_part, err) in enumerate(
-                    pool.imap_unordered(_pyrodigal_process_one,
+                    pool.imap(_pyrodigal_process_one,          # ordered: same file every run
                                         _iter_fasta_records(db_fa),
                                         chunksize=4)):
                 if err:
