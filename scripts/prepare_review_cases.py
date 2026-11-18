@@ -52,8 +52,11 @@ def load_locus(records_path, ref_id):
         ie = r.get("is_element") or src.get("is_element") or {}
         contig = src.get("contig")
         local = contig.split("|", 1)[1] if "|" in contig else contig
+        # records.json holds 1-based inclusive coordinates; every caller
+        # slices and builds features 0-based half-open, so the start comes
+        # down by one (the focal feature used to lose its first base)
         return (local,
-                int(ie.get("source_start") or src.get("transposase_start")),
+                int(ie.get("source_start") or src.get("transposase_start")) - 1,
                 int(ie.get("source_end")   or src.get("transposase_end")))
     return None
 

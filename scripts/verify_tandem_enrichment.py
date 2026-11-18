@@ -136,8 +136,10 @@ def load_is_sequences(records_path, min_len, called_only=True, dedup=True):
     # "labelled" = the file uses the current method vocabulary at all. Testing
     # for a successful call meant that a file with ONLY fallback records was
     # taken for an old unlabelled one and every record was kept.
-    VOCAB = {"empty_vs_filled_decomposition", "peak_symmetric_fallback", "no_empty_tnp_only"}
-    labelled = any((r.get("boundary_evidence") or {}).get("method") in VOCAB for r in records)
+    # (any method label counts: a list of known labels went stale as soon as
+    # a new one was added, and a file holding only the new label was read as
+    # an unlabelled old file -- every record kept)
+    labelled = any((r.get("boundary_evidence") or {}).get("method") for r in records)
     for r in records:
         rid = r.get("ref_id") or r.get("is110_id")
         ie = r.get("is_element") or (r.get("source", {}) or {}).get("is_element") or {}
