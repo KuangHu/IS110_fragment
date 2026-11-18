@@ -82,6 +82,10 @@ def parse_args():
     p.add_argument("--tol-bp", type=int, default=100)
     p.add_argument("--tol-frac", type=float, default=0.002)
     p.add_argument("--margin", type=float, default=0.05)
+    p.add_argument("--drop-unsupported", action="store_true",
+                   help="write no record for an element with neither a filled nor "
+                        "an empty observation in another genome (default: keep it, "
+                        "method no_observation_tnp_only)")
     p.add_argument("--max-extra-bp", type=int, default=50000)
     p.add_argument("--threads", type=int, default=32,
                    help="Number of worker processes for sequence extraction (default 32)")
@@ -204,7 +208,19 @@ def _build_one_record(packed):
         # With no empty site at all there is no length evidence either: the
         # "element" is just the transposase ORF. Label it so it is never
         # mistaken for a boundary call (it used to share the fallback label).
-        method = "peak_symmetric_fallback" if has_empty else "no_empty_tnp_only"
+        # no_empty_tnp_only    : seen filled in >= 1 OTHER genome, never empty
+        # no_observation_tnp_only: neither a filled nor an empty observation in
+        #   any other genome (no anchor pair at all, or only pairs that are
+        #   neither -- larger than the filled state, or overlapping anchors).
+        #   Such records used to be labelled no_empty_tnp_only, as if a filled
+        #   observation stood behind them (or, with no pair at all, were
+        #   dropped without a record).
+        if has_empty:
+            method = "peak_symmetric_fallback"
+        elif best["v0_obs"]:
+            method = "no_empty_tnp_only"
+        else:
+            method = "no_observation_tnp_only"
         ext5 = (is_length - info["tnp_len"]) // 2
         ext3 = is_length - info["tnp_len"] - ext5
         # offsets are in TRANSPOSASE orientation: on the minus strand the 5'
@@ -430,7 +446,14 @@ def pick_best_d(hits, ref_id, info, distances, opts):
         })
 
     if not candidates:
-        return None
+        # No anchor pair in any other genome. The transposase hit is real, so
+        # the element is still catalogued -- as an explicitly unsupported
+        # record (method no_observation_tnp_only), unless --drop-unsupported.
+        D0 = distances[0]
+        return {"D": D0, "pairs": [], "expected_v0": 2 * D0 + info["tnp_len"],
+                "n_ambiguous": 0, "n_anchor_overlap": 0, "n_anchor_overlap_all_d": 0,
+                "v0_peak": None, "empty_peak": None, "v0_obs": [], "empty_obs": [],
+                "v1plus_obs": [], "decompose": None}
 
     best = None
     # Prefer smallest D with both V0 and empty (highest-quality boundary call)
@@ -625,16 +648,19 @@ def main():
             "min_is_size": args.min_is_size, "max_is_size": args.max_is_size}
     for ref_id, info in ref_info.items():
         best = pick_best_d(ncbi_hits, ref_id, info, distances, opts)
-        if not best:
+        if not best["v0_obs"] and not best["empty_obs"]:
             n_neither += 1
-            continue
+            if args.drop_unsupported:
+                continue
         src = source_positions.get(ref_id)
         if not src:
             continue
         n_done += 1
         work_items.append((ref_id, info, best, src))
 
-    print(f"  Refs to process: {len(work_items):,} (skipped {n_neither:,} with no usable D)",
+    print(f"  Refs to process: {len(work_items):,} ({n_neither:,} without any filled or "
+          f"empty observation in another genome: "
+          f"{'dropped' if args.drop_unsupported else 'kept as no_observation_tnp_only'})",
           file=sys.stderr, flush=True)
 
     # Worker pool: each worker opens its own pysam.FastaFile (not fork-safe to share)
@@ -749,7 +775,7 @@ def main():
     print(f"  Distinct exact element+context keys (event_key; upper bound on "
           f"insertion events): {len({r['event_key'] for r in all_records}):,}",
           file=sys.stderr)
-    print(f"  No empty found:      {n_neither}", file=sys.stderr)
+    print(f"  No observation in another genome: {n_neither}", file=sys.stderr)
     print(f"  All outputs in: {args.out}", file=sys.stderr)
 
 

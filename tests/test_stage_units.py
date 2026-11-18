@@ -257,7 +257,8 @@ def test_flank_deletion_is_not_an_empty():
     rec = build_records._build_one_record(
         (("r", {"tnp_len": 1200}, best, dict(src, assembly="S")), "db", 100, 5, "db", 2e7))[0]
     be = rec["boundary_evidence"]
-    assert be["method"] == "no_empty_tnp_only", be["method"]
+    # (the test record has no filled observation, and its only empty is rejected)
+    assert be["method"] == "no_observation_tnp_only", be["method"]
     assert be["n_empty_observations"] == 0 and be["n_empty_rejected_flank_deletion"] == 1
     assert rec["is_element"]["length"] == 1200
 
@@ -354,6 +355,39 @@ def test_own_genome_and_twin_are_not_observations():
     only_self = _anchor_hits(rid, 1000, ["GCA_000001.1|CP1.1", "GCF_000001.1|NZ_CP1.1"])
     pairs, _, _ = build_records.pair_anchors(only_self, rid, 1000, {"tnp_len": 1000}, opts)
     assert pairs == []
+
+
+
+def test_record_without_observation_is_labelled():
+    """No filled and no empty observation in another genome -> an explicit
+    no_observation_tnp_only record (never 'no_empty_tnp_only', which claims a
+    filled observation)."""
+    rid = "GCA_000001.1|CP1.1_7"
+    opts = {"tol_bp": 100, "tol_frac": 0.002, "margin": 0.05, "max_extra_bp": 50000,
+            "decompose_max_d": 5000, "min_is_size": 0, "max_is_size": 0}
+    info = {"tnp_len": 1200}
+    g = rseq(20000)
+    src = {"contig": "S", "assembly": "S", "start": 8001, "end": 9200, "strand": "+"}
+    build_records._FA, build_records._SRC = _FakeFasta({"S": g}), None
+
+    def method(hits):
+        best = build_records.pick_best_d(hits, rid, info, [1000, 5000], opts)
+        rec = build_records._build_one_record(((rid, info, best, src), "db", 100, 5, "db", 2e7))[0]
+        return rec["boundary_evidence"]["method"], rec["boundary_evidence"]["n_v0_observations"]
+
+    # 1. only the own genome and its twin
+    own = _anchor_hits(rid, 1000, ["GCA_000001.1|CP1.1", "GCF_000001.1|NZ_CP1.1"], tnp_len=1200)
+    assert method(own) == ("no_observation_tnp_only", 0)
+    # 2. another genome, but its pair is far larger than the filled state (v1+)
+    from lib_alleles import Hit
+    big = {(rid, "up", 1000): {"GCA_000002.1|X": [Hit("u", 500, 0, 500, "+", "GCA_000002.1|X", 900000,
+                                                      10000, 10500, 500, 500, 100.0, 100.0)]},
+           (rid, "down", 1000): {"GCA_000002.1|X": [Hit("d", 500, 0, 500, "+", "GCA_000002.1|X", 900000,
+                                                        40000, 40500, 500, 500, 100.0, 100.0)]}}
+    assert method(big) == ("no_observation_tnp_only", 0)
+    # 3. a filled observation in another genome
+    other = _anchor_hits(rid, 1000, ["GCA_000002.1|X"], tnp_len=1200)
+    assert method(other) == ("no_empty_tnp_only", 1)
 
 
 if __name__ == "__main__":

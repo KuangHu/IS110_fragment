@@ -45,7 +45,8 @@ def main():
     # without a method label (older files) are all kept.
     # labelled = the file uses the method vocabulary at all (a file holding
     # only fallback records must not be taken for an unlabelled old one)
-    VOCAB = {"empty_vs_filled_decomposition", "peak_symmetric_fallback", "no_empty_tnp_only"}
+    VOCAB = {"empty_vs_filled_decomposition", "peak_symmetric_fallback", "no_empty_tnp_only",
+             "no_observation_tnp_only"}
     labelled = any((r.get("boundary_evidence") or {}).get("method") in VOCAB for r in recs)
     n_uncalled = 0
     for r in recs:
