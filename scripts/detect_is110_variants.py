@@ -25,7 +25,7 @@ import sys
 from collections import defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from paf_utils import aligned_identity, aligned_blocks  # noqa: E402
+from paf_utils import aligned_identity, aligned_blocks_iv, union_length  # noqa: E402
 
 
 def parse_args():
@@ -55,9 +55,13 @@ def parse_args():
     p.add_argument("--max-junction-overlap", type=int, default=100,
                    help="Both scenarios: the two parts may overlap by up to this "
                         "many bp on the IS or on the contig (default: 100)")
+    p.add_argument("--max-arm-overlap-frac", type=float, default=0.5,
+                   help="Both scenarios: the overlap of the two parts on the IS may "
+                        "be at most this fraction of the shorter part (default: 0.5)")
     p.add_argument("--locus-tol", type=int, default=20,
-                   help="Records whose junctions lie within this many bp are one "
-                        "locus (default: 20)")
+                   help="Records of different reference IS whose junctions lie within "
+                        "this many bp of the group's first junction are one locus "
+                        "(default: 20)")
     return p.parse_args()
 
 
@@ -82,11 +86,12 @@ def parse_paf(path, min_identity, ins_min=500, del_min=200, counts=None):
                 continue
             kept += 1
             row_id += 1
-            for qs, qe, ts, te in aligned_blocks(c, ins_min, del_min):
+            for qs, qe, ts, te, ivs in aligned_blocks_iv(c, ins_min, del_min):
                 blocks[(c[0], c[5], c[4])].append({
                     "qname": c[0], "qlen": int(c[1]), "qs": qs, "qe": qe,
                     "strand": c[4], "tname": c[5], "tlen": int(c[6]),
                     "ts": ts, "te": te, "ident": ident, "row": row_id,
+                    "aln": ivs, "n_aln": sum(e - s for s, e in ivs),
                 })
     print(f"Parsed {total} alignments, {kept} pass identity >= {min_identity}%")
     print(f"Unique queries with hits: {len(set(k[0] for k in blocks))}")
@@ -112,7 +117,7 @@ def classify_pair(a, b, args):
     if qgap < -ov or tgap < -ov:
         return None
     # the overlap must stay a small part of either arm
-    if -qgap > 0.5 * min(first["qe"] - first["qs"], second["qe"] - second["qs"]):
+    if -qgap > getattr(args, "max_arm_overlap_frac", 0.5) * min(first["qe"] - first["qs"], second["qe"] - second["qs"]):
         return None
     net_ins = tgap - qgap            # extra bases in the genome
     net_del = qgap - tgap            # IS bases missing from the genome
@@ -124,59 +129,164 @@ def classify_pair(a, b, args):
     return None
 
 
+def drop_contained(blocks, slop=5):
+    """Remove alternative alignments that lie INSIDE another alignment.
+
+    A reference IS with an internal repeat aligns to an intact copy once in
+    full and again, shifted, with each repeat unit (minimap2 reports these
+    as secondary rows). The shifted pieces of two intact copies paired up
+    as an "interrupted copy" spanning the DNA between them. A block whose
+    target interval lies within the target interval of a block from another
+    row of the same reference on the same contig (either strand) carries no
+    information of its own about that stretch of the contig and is dropped.
+
+    Returns (blocks, n_dropped)."""
+    by_qc = defaultdict(list)
+    for (q, contig, strand), bl in blocks.items():
+        by_qc[(q, contig)] += bl
+    out = defaultdict(list)
+    dropped = 0
+    for (q, contig) in sorted(by_qc):
+        bl = sorted(by_qc[(q, contig)], key=lambda x: (x["ts"], -x["te"], x["row"], x["qs"]))
+        active = []                          # earlier blocks still open on the target
+        for b in bl:
+            active = [a for a in active if a["te"] + slop >= b["te"] or a["te"] > b["ts"]]
+            inside = False
+            for a in active:
+                if a["row"] == b["row"] or a["ts"] - slop > b["ts"] or a["te"] + slop < b["te"]:
+                    continue
+                la, lb = a["te"] - a["ts"], b["te"] - b["ts"]
+                if la > lb or (la == lb and (a["n_aln"], -a["row"]) > (b["n_aln"], -b["row"])):
+                    inside = True
+                    break
+            if inside:
+                dropped += 1
+                continue
+            active.append(b)
+            out[(q, contig, b["strand"])].append(b)
+    return dict(out), dropped
+
+
+def _best_paths(nodes, edges, bl):
+    """Split one connected group of blocks into chains.
+
+    Repeatedly takes the path (blocks in target order, joined by candidate
+    junctions) that covers the most aligned IS bases, then continues with the
+    blocks that are left. Ties: more junctions inside one alignment row, then
+    the smaller total target gap, then the leftmost blocks.
+
+    The earlier rule gave every block its NEAREST partner first: a 200-bp
+    match inside an insert took the left arm, the pair failed the coverage
+    filter, and the real right arm was left without a partner."""
+    left = set(nodes)
+    paths = []
+    while left:
+        order = sorted(left)
+        best = {}                            # node -> (score tuple, previous node)
+        for j in order:
+            cur = ((bl[j]["n_aln"], 0, 0), None)
+            for i, ev in edges.get(j, ()):
+                if i not in left:
+                    continue
+                (sc, same, gap), _ = best[i]
+                cand = (sc + bl[j]["n_aln"] - max(0, -ev[2]),
+                        same + (bl[i]["row"] == bl[j]["row"]),
+                        gap - max(0, ev[1]))
+                if cand > cur[0]:
+                    cur = (cand, i)
+            best[j] = cur
+        end = max(order, key=lambda j: (best[j][0], -j))
+        path = [end]
+        while best[path[-1]][1] is not None:
+            path.append(best[path[-1]][1])
+        path.reverse()
+        paths.append(path)
+        left -= set(path)
+    return paths
+
+
 def build_chains(blocks, args):
     """Chain blocks into loci.
 
-    Per (query, contig, strand), blocks are taken in target order. Each block
-    gets at most ONE right-hand partner and one left-hand partner: the nearest
-    block on the target with which it forms an insertion or a deletion (two
-    blocks cut from the same row first). Every permissible pair used to be
-    reported, so two interrupted copies on one contig gave a third
+    Per (query, contig, strand), blocks are taken in target order; every pair
+    that forms an insertion or a deletion is a candidate junction. The blocks
+    are then split into chains by `_best_paths`: each block is in exactly one
+    chain, so two interrupted copies on one contig do not give a third
     "insertion" (left arm of copy 1 + right arm of copy 2).
 
     Returns (chains, stats). A chain = {"blocks": [...target order...],
-    "links": [(a, b, (type, target_gap, query_gap)), ...], "cov_pct": float};
-    a block with no partner is a chain of one. Coverage is the union of the
-    aligned query intervals of the whole chain (a copy with two insertions is
-    three blocks, two events, one coverage)."""
+    "links": [(a, b, (type, target_gap, query_gap)), ...], "cov_pct": float,
+    "id": int}; a block with no partner is a chain of one. Coverage is the
+    union of the ALIGNED query intervals of the whole chain: a copy with two
+    insertions is three blocks, two events, one coverage, and small 'I' runs
+    inside a block are not counted as covered."""
+    blocks, n_contained = drop_contained(blocks)
     chains = []
-    stats = {"competing": 0}
+    stats = {"competing": 0, "contained": n_contained, "replacement_like": 0}
+    # a junction may leave up to ins_max_query_gap unaligned IS bases, so the
+    # target gap of a net insertion of exactly the maximum is larger than it
+    window = args.ins_max_target_gap + max(0, args.ins_max_query_gap)
     for key in sorted(blocks):
-        bl = sorted(blocks[key], key=lambda x: (x["ts"], x["te"]))
-        cand = []
+        bl = sorted(blocks[key], key=lambda x: (x["ts"], x["te"], x["qs"], x["row"]))
+        edges = defaultdict(list)            # right block -> [(left block, event)]
+        nbr = defaultdict(set)
+        n_cand = 0
         for i, a in enumerate(bl):
             for j in range(i + 1, len(bl)):
                 b = bl[j]
-                if b["ts"] - a["te"] > args.ins_max_target_gap:
+                if b["ts"] - a["te"] > window:
                     break
                 ev = classify_pair(a, b, args)
                 if ev:
-                    cand.append((a["row"] != b["row"], max(0, ev[1]), i, j, ev))
-        cand.sort(key=lambda x: x[:4])
-        right_of, left_of, link_ev = {}, {}, {}
-        for _, _, i, j, ev in cand:
-            if i in right_of or j in left_of:
-                stats["competing"] += 1
+                    edges[j].append((i, ev))
+                    nbr[i].add(j)
+                    nbr[j].add(i)
+                    n_cand += 1
+                elif is_replacement_like(a, b, args):
+                    stats["replacement_like"] += 1
+        seen = set()
+        n_used = 0
+        for start in range(len(bl)):
+            if start in seen:
                 continue
-            right_of[i] = j
-            left_of[j] = i
-            link_ev[i] = ev
-        for i in range(len(bl)):
-            if i in left_of:
-                continue
-            k, members, links = i, [i], []
-            while k in right_of:
-                links.append((bl[k], bl[right_of[k]], link_ev[k]))
-                k = right_of[k]
-                members.append(k)
-            iv = sorted((bl[m]["qs"], bl[m]["qe"]) for m in members)
-            covered, end = 0, 0
-            for qs, qe in iv:
-                covered += max(0, qe - max(qs, end))
-                end = max(end, qe)
-            chains.append({"blocks": [bl[m] for m in members], "links": links,
-                           "cov_pct": covered / bl[i]["qlen"] * 100})
+            comp, stack = [], [start]
+            seen.add(start)
+            while stack:
+                k = stack.pop()
+                comp.append(k)
+                for m in sorted(nbr[k]):
+                    if m not in seen:
+                        seen.add(m)
+                        stack.append(m)
+            for path in _best_paths(comp, edges, bl):
+                links = []
+                for i, j in zip(path, path[1:]):
+                    ev = next(e for k, e in edges[j] if k == i)
+                    links.append((bl[i], bl[j], ev))
+                n_used += len(links)
+                covered = union_length([iv for m in path for iv in bl[m]["aln"]])
+                chains.append({"blocks": [bl[m] for m in path], "links": links,
+                               "cov_pct": covered / bl[path[0]]["qlen"] * 100})
+        stats["competing"] += n_cand - n_used
+    chains.sort(key=lambda ch: (ch["blocks"][0]["qname"], ch["blocks"][0]["tname"],
+                                ch["blocks"][0]["ts"], ch["blocks"][0]["strand"],
+                                ch["blocks"][0]["row"]))
+    for n, ch in enumerate(chains):
+        ch["id"] = n
     return chains, stats
+
+
+def is_replacement_like(a, b, args):
+    """Two colinear parts with BOTH a large gap on the IS and a large gap on
+    the contig (IS sequence replaced by other DNA). Neither scenario of this
+    script; such pairs are counted in the log and not reported."""
+    first, second = (a, b) if a["strand"] == "+" else (b, a)
+    if not (first["qs"] < second["qs"] and first["qe"] < second["qe"]):
+        return False
+    qgap = second["qs"] - first["qe"]
+    tgap = b["ts"] - a["te"]
+    return (qgap >= args.del_min_query_gap and args.ins_min_target_gap <= tgap
+            and tgap > args.del_max_target_gap)
 
 
 def detect_events(blocks, args):
@@ -191,53 +301,47 @@ def detect_events(blocks, args):
                 "type": etype, "qname": a["qname"], "qlen": a["qlen"],
                 "tname": a["tname"], "tlen": a["tlen"], "hi": a, "hj": b,
                 "target_gap": tgap, "query_gap": qgap, "cov_pct": ch["cov_pct"],
+                "chain": ch["id"],
             })
     return results, stats
 
 
-def deduplicate(results, tol=20):
-    """One row per PHYSICAL LOCUS: records on the same contig whose two
-    junction positions lie within `tol` bp of another member of the group
-    (single linkage, so offsets 0 / 20 / 21 are one locus), whatever the
-    reference IS and whatever the event type it suggests. The record with the
-    best coverage is kept.
+def junction(r):
+    a, b = sorted((r["hi"], r["hj"]), key=lambda h: h["ts"])
+    return a["te"], b["ts"]
 
-    The key used to be (type, query, contig): the same interrupted copy was
-    reported once for every near-identical reference IS, while a SECOND event
-    on the same contig was dropped."""
-    def junction(r):
-        a, b = sorted((r["hi"], r["hj"]), key=lambda h: h["ts"])
-        return a["te"], b["ts"]
+
+def deduplicate(results, tol=20):
+    """One row per PHYSICAL JUNCTION: the same junction is reported once for
+    every near-identical reference IS, and those records are merged; the one
+    with the best coverage is kept.
+
+    Records are taken in order of their junction position on the contig. A
+    record joins the first group whose FIRST junction lies within `tol` bp on
+    both sides, unless that group already holds a junction of the same chain:
+    two junctions of one copy (`500=200I10=200I500=`: deletions at 500 and
+    510) are two events however close they are. Measuring from the first
+    member bounds a group to `tol` bp; chaining neighbours without a bound
+    merged junctions 40 bp apart through a third record between them.
+    The result does not depend on the order of the input."""
     by_contig = defaultdict(list)
     for r in results:
         by_contig[r["tname"]].append(r)
     kept = []
     for tname in sorted(by_contig):
-        rs = sorted(by_contig[tname], key=junction)
+        rs = sorted(by_contig[tname],
+                    key=lambda r: (junction(r), -r["cov_pct"], r["qname"], r["type"], r["chain"]))
         groups = []
         for r in rs:
             j = junction(r)
             for g in groups:
-                if any(abs(junction(k)[0] - j[0]) <= tol and abs(junction(k)[1] - j[1]) <= tol
-                       for k in g):
+                j0 = junction(g[0])
+                if (abs(j0[0] - j[0]) <= tol and abs(j0[1] - j[1]) <= tol
+                        and all(k["chain"] != r["chain"] for k in g)):
                     g.append(r)
                     break
             else:
                 groups.append([r])
-        # single linkage: join groups that a later record connects
-        merged = True
-        while merged:
-            merged = False
-            for x in range(len(groups)):
-                for y in range(x + 1, len(groups)):
-                    if any(abs(junction(k)[0] - junction(m)[0]) <= tol
-                           and abs(junction(k)[1] - junction(m)[1]) <= tol
-                           for k in groups[x] for m in groups[y]):
-                        groups[x] += groups.pop(y)
-                        merged = True
-                        break
-                if merged:
-                    break
         for g in groups:
             kept.append(min(g, key=lambda x: (-x["cov_pct"], x["qname"], x["type"],
                                               junction(x))))
@@ -306,9 +410,15 @@ def main():
     events = deduplicate(events, args.locus_tol)
     print(f"Events: {n_before} reference x locus records -> {len(events)} physical loci "
           f"(within {args.locus_tol} bp)")
+    if stats["contained"]:
+        print(f"  {stats['contained']} alignment pieces lay inside another alignment of the "
+              "same reference (alternative placements of a repeat) and were not used")
     if stats["competing"]:
         print(f"  {stats['competing']} further pairings were possible but used a block "
-              "that already had a nearer partner (not reported)")
+              "that is part of a better-covered chain (not reported)")
+    if stats["replacement_like"]:
+        print(f"  {stats['replacement_like']} pairs have a large gap on the IS AND on the "
+              "contig (replacement); neither scenario, not reported")
     print()
 
     print("--- Scenario 1: INSERTION in genome (target gap) ---")

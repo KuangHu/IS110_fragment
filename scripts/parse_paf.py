@@ -9,9 +9,14 @@ Usage:
 
 import argparse
 import json
+import os
 import sys
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
+
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import paf_utils  # noqa: E402
 
 
 @dataclass
@@ -32,6 +37,9 @@ class PafHit:
     divergence: float
     cigar: str | None = None
     tags: dict = field(default_factory=dict)
+    # query intervals that are really aligned ('=' / 'X'); query_end -
+    # query_start also contains the 'I' runs, which are absent from the target
+    aligned_iv: list = field(default_factory=list)
 
 
 def _parse_tags(fields: list[str]) -> dict:
@@ -99,6 +107,8 @@ def parse_paf(path: str) -> list[PafHit]:
                 divergence=divergence,
                 cigar=tags.get("cg"),
                 tags=tags,
+                aligned_iv=[iv for b in paf_utils.aligned_blocks_iv(cols, None, 1)
+                            for iv in b[4]],
             ))
     return hits
 
@@ -134,15 +144,14 @@ def summarize_groups(groups: dict[str, list[PafHit]]) -> list[dict]:
     """Summarize grouped hits into a table."""
     rows = []
     for (genome, query), ghits in groups.items():
-        total_bp = sum(h.query_end - h.query_start for h in ghits)
+        # aligned bases, not query spans: `400=600I400=600I400=` is 1200
+        # aligned bases of a 2400-bp query (50%), it was reported as 2400 / 100%
+        total_bp = sum(e - s for h in ghits for s, e in h.aligned_iv)
         mean_ident = sum(h.identity for h in ghits) / len(ghits) if ghits else 0
         query_len = ghits[0].query_len
-        # coverage = part of the query seen at least once (merged intervals);
+        # coverage = part of the query aligned at least once;
         # total_aligned_bp / n_hits carry the copy number
-        merged, end = 0, 0
-        for s, e in sorted((h.query_start, h.query_end) for h in ghits):
-            merged += max(0, e - max(s, end))
-            end = max(end, e)
+        merged = paf_utils.union_length([iv for h in ghits for iv in h.aligned_iv])
         coverage = merged / query_len * 100 if query_len > 0 else 0
         rows.append({
             "genome": genome,

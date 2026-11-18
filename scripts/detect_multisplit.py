@@ -55,7 +55,8 @@ def parse_args():
                    help="Min aligned query coverage %% to call a chain without "
                         "events 'intact' (default: 95)")
     p.add_argument("--max-query-overlap", type=float, default=0.3,
-                   help="Max fraction of query overlap between consecutive segments (default: 0.3)")
+                   help="Max overlap of two consecutive segments on the IS, as a "
+                        "fraction of the shorter one (default: 0.3)")
     return p.parse_args()
 
 
@@ -72,7 +73,7 @@ def locus_rows(paf, args):
         min_query_cov=0, ins_min_target_gap=args.min_tgap_insertion,
         ins_max_target_gap=args.max_tgap_insertion, ins_max_query_gap=args.min_qgap_deletion - 1,
         del_min_query_gap=args.min_qgap_deletion, del_max_target_gap=args.max_tgap_deletion,
-        max_junction_overlap=100)
+        max_junction_overlap=100, max_arm_overlap_frac=args.max_query_overlap)
     blocks = dv.parse_paf(paf, args.min_identity, args.min_tgap_insertion, args.min_qgap_deletion)
     blocks = {k: [b for b in v if b["qe"] - b["qs"] >= args.min_aln_len]
               for k, v in blocks.items()}

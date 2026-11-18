@@ -59,8 +59,8 @@ def test_output_independent_of_hash_seed():
     rows = []
     for k in range(5):
         for q in ("qa", "qb", "qc"):
-            rows += [row(q, 2000, 0, 1000, "+", f"t{k}", 9000, 0, 1000 + k, f"{1000 + k}="),
-                     row(q, 2000, 1000, 2000, "+", f"t{k}", 9000, 1600 + k, 2600, f"{1000 - k}=")]
+            rows += [row(q, 2000, 0, 1000 + k, "+", f"t{k}", 9000, 0, 1000 + k, f"{1000 + k}="),
+                     row(q, 2000, 1000 + k, 2000, "+", f"t{k}", 9000, 1600 + k, 2600, f"{1000 - k}=")]
     outs = []
     with tempfile.TemporaryDirectory() as d:
         open(os.path.join(d, "x.paf"), "w").write("\n".join(rows) + "\n")
@@ -111,10 +111,104 @@ def test_detector():
     # one locus seen by three references with junction offsets 0 / 20 / 21
     rows = []
     for k, off in enumerate((0, 20, 21)):
-        rows += [row(f"q{k}", 2000, 0, 1000, "+", "t", 9000, 0, 1000 + off, f"{1000 + off}="),
-                 row(f"q{k}", 2000, 1000, 2000, "+", "t", 9000, 1600 + off, 2600, f"{1000 - off}=")]
+        rows += [row(f"q{k}", 2000, 0, 1000 + off, "+", "t", 9000, 0, 1000 + off, f"{1000 + off}="),
+                 row(f"q{k}", 2000, 1000 + off, 2000, "+", "t", 9000, 1600 + off, 2600, f"{1000 - off}=")]
     out = detect(rows, "--max-junction-overlap", "100")
-    check("junction offsets 0/20/21 are one locus", len(out) == 1, str(len(out)))
+    import itertools
+    outs = {tuple(map(tuple, detect([x for k in perm for x in rows[2 * k:2 * k + 2]])))
+            for perm in itertools.permutations(range(3))}
+    check("junction offsets 0/20/21: 0 and 20 are one locus, 21 is outside the 20-bp bound, "
+          "whatever the input order", len(out) == 2 and len(outs) == 1, f"{len(out)} {len(outs)}")
+
+def mm2_detect(query, contigs, script="detect_is110_variants.py", suffix="_all.tsv", opts=()):
+    """real minimap2 with the pipeline options, both presets -> {preset: rows}"""
+    res = {}
+    with tempfile.TemporaryDirectory() as d:
+        q, t, paf = (os.path.join(d, n) for n in ("q.fa", "t.fa", "x.paf"))
+        open(q, "w").write(f">IS\n{query}\n")
+        open(t, "w").write("".join(f">{k}\n{v}\n" for k, v in contigs.items()))
+        for preset in ("asm10", "asm5"):
+            r = subprocess.run(["minimap2", "-x", preset, "-c", "--eqx", "--secondary=yes", "-N", "1000000",
+                                "-p", "0.05", "-g", "200", "-r", "200,200", t, q, "-o", paf],
+                               capture_output=True, text=True)
+            assert r.returncode == 0, r.stderr
+            subprocess.run([sys.executable, os.path.join(SCR, script), paf, os.path.join(d, "o"), *opts],
+                           capture_output=True, text=True, check=True)
+            res[preset] = [l.split("\t") for l in open(os.path.join(d, "o" + suffix)).read().splitlines()[1:]]
+    return res
+
+def test_final_review_detector():
+    rnd = random.Random(23)
+    dna = lambda n: "".join(rnd.choice("ACGT") for _ in range(n))
+    rc = lambda x: x.translate(str.maketrans("ACGT", "TGCA"))[::-1]
+    # 1. reference with an internal repeat, two INTACT copies on the contig
+    R = dna(500); IS = R + R + dna(800)
+    for name, tgt in (("plus", dna(300) + IS + dna(1000) + IS + dna(300)),
+                      ("minus", dna(300) + rc(IS) + dna(1000) + rc(IS) + dna(300))):
+        got = mm2_detect(IS, {"t": tgt})
+        check(f"repeat pieces inside two intact copies ({name}) are no event",
+              got["asm10"] == [] and got["asm5"] == [], str(got))
+    # 2. a short competing match must not take the arm of the real junction
+    A = row("q", 2000, 0, 500, "+", "t", 9000, 0, 500, "500=")
+    B = row("q", 2000, 500, 700, "+", "t", 9000, 1100, 1300, "200=")
+    C = row("q", 2000, 500, 2000, "+", "t", 9000, 1800, 3300, "1500=")
+    for order in ((A, B, C), (C, B, A), (B, A, C)):
+        out = detect(list(order))
+        check("competing 200-bp match: the full-coverage insertion is kept",
+              len(out) == 1 and out[0][0] == "insertion" and (out[0][8], out[0][13], out[0][19]) == ("500", "1800", "100.0"),
+              str(out))
+    IS2 = dna(2000)
+    got = mm2_detect(IS2, {"p": dna(500) + IS2[:500] + dna(600) + IS2[500:700] + dna(500) + IS2[500:] + dna(500),
+                           "m": dna(500) + rc(IS2[:500] + dna(600) + IS2[500:700] + dna(500) + IS2[500:]) + dna(500)})
+    for preset, rows in got.items():
+        check(f"minimap2 {preset}: insert carrying a 200-bp piece of the IS, one insertion per strand",
+              sorted((r[3], r[0], r[19]) for r in rows) == [("m", "insertion", "100.0"), ("p", "insertion", "100.0")], str(rows))
+    # 3. small I runs are not aligned sequence
+    r1 = row("q", 3000, 0, 1400, "+", "t", 9000, 0, 1100, "400=100I300=100I300=100I100=", 1100)
+    r2 = row("q", 3000, 1400, 1600, "+", "t", 9000, 1700, 1900, "200=")
+    out = detect([r1, r2])
+    check("three 100-bp I runs: 43% aligned does not pass the 50% filter", out == [], str(out))
+    out = detect([r1, r2], "--min-query-cov", "40")
+    check("... and is reported as 43.3% when the filter allows it", len(out) == 1 and out[0][19] == "43.3", str(out))
+    out = multisplit([row("q", 3000, 0, 3000, "+", "t", 9000, 0, 2700, "698=100I700=100I700=100I602=", 2700)])
+    check("full-span row with 300 unaligned bases is partial (90%), not intact",
+          [(r["status"], r["query_coverage"]) for r in out] == [("partial", "90.0")], str(out))
+    import parse_paf as pp
+    with tempfile.TemporaryDirectory() as d:
+        open(os.path.join(d, "x.paf"), "w").write(row("q", 2400, 0, 2400, "+", "t", 9000, 0, 1200, "400=600I400=600I400=", 1200) + "\n")
+        g = pp.summarize_groups(pp.group_by_genome(pp.parse_paf(os.path.join(d, "x.paf"))))
+    check("parse_paf summary counts aligned bases", (g[0]["total_aligned_bp"], g[0]["query_coverage_pct"]) == (1200, 50.0), str(g))
+    # 4. two junctions of one chain stay two events; no drift across references
+    out = detect([row("q", 1410, 0, 1410, "+", "t", 9000, 0, 1010, "500=200I10=200I500=", 1010)])
+    check("deletions at 500 and 510 of one copy are two events",
+          sorted(r[8] for r in out) == ["500", "510"] and all(r[0] == "deletion" for r in out), str(out))
+    rows = []
+    for k, off in enumerate((0, 20, 40)):
+        rows += [row(f"q{k}", 2000, 0, 1000, "+", "t", 90000, 0, 1000 + off, f"{1000 + off}="),
+                 row(f"q{k}", 2000, 1000, 2000, "+", "t", 90000, 1600 + off, 2600 + off, "1000=")]
+    out = detect(rows)
+    check("junctions 0 and 40 bp are not merged through one at 20", len(out) == 2, str(len(out)))
+    # 9. net insertion of exactly the maximum with unaligned IS bases at the junction
+    out = detect([row("q", 2000, 0, 1002, "+", "t", 90000, 0, 1002, "1002="),
+                  row("q", 2000, 1030, 2000, "+", "t", 90000, 51030, 52000, "970=")])
+    check("net insertion of 50,000 bp (target gap 50,028) is accepted",
+          len(out) == 1 and out[0][0] == "insertion" and out[0][17] == "50028", str(out))
+    out = detect([row("q", 2000, 0, 1002, "+", "t", 90000, 0, 1002, "1002="),
+                  row("q", 2000, 1030, 2000, "+", "t", 90000, 51031, 52001, "970=")])
+    check("net insertion of 50,001 bp is not", out == [], str(out))
+    # 13. --max-query-overlap of detect_multisplit
+    arms = [row("q", 1100, 0, 1000, "+", "t", 9000, 0, 1000, "1000="),
+            row("q", 1100, 900, 1100, "+", "t", 9000, 1600, 1800, "200=")]
+    st = {o: sorted(r["status"] for r in multisplit(arms, "--max-query-overlap", o)) for o in ("0", "0.3", "0.5")}
+    check("multisplit enforces --max-query-overlap",
+          st == {"0": ["partial", "partial"], "0.3": ["partial", "partial"], "0.5": ["variant"]}, str(st))
+    # 17. N operations
+    c = row("q", 2000, 0, 2000, "+", "t", 9000, 0, 2600, "1000=600N1000=", 2000).split("\t")
+    try:
+        pu.aligned_blocks(c, 500, 200); ok = False
+    except ValueError:
+        ok = True
+    check("a CIGAR with an N operation is refused", ok)
 
 def multisplit(rows, *opts):
     with tempfile.TemporaryDirectory() as d:
@@ -239,7 +333,7 @@ def test_minimap2_round_trip():
                     ("two", "insertion"), ("two", "insertion")]
             check(f"minimap2 {preset} round trip: events on the right contigs only", got == want, str(got))
 
-for t in (test_identity, test_eqx_is_required, test_output_independent_of_hash_seed, test_detector, test_multisplit, test_lineage, test_ref_core_and_origin, test_stage_lib,
+for t in (test_identity, test_eqx_is_required, test_output_independent_of_hash_seed, test_detector, test_final_review_detector, test_multisplit, test_lineage, test_ref_core_and_origin, test_stage_lib,
           test_minimap2_round_trip):
 
 
