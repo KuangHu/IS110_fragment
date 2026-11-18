@@ -75,12 +75,18 @@ def cluster_variants(seqs, identity, work_dir):
     out_fa = os.path.join(work_dir, "out.fa")
     write_fa(fa, seqs)
     word = 10 if identity >= 0.95 else 8
+    # -s/-aS: cd-hit's identity is over the SHORTER sequence, so without a
+    # length cutoff a variant fully contained in a longer one (exactly the
+    # nested series this script is meant to find) clusters with it and the
+    # step disappears. Only near-equal-length sequences may merge.
     r = subprocess.run(["cd-hit-est", "-i", fa, "-o", out_fa,
                         "-c", str(identity), "-n", str(word),
+                        "-s", str(identity), "-aS", str(identity),
                         "-T", "0", "-M", "0", "-d", "0"],
                        capture_output=True, text=True)
     if r.returncode != 0:
-        return {sid: sid for sid, _ in seqs}
+        # was: silently "no clustering", which changes every count downstream
+        raise RuntimeError(f"cd-hit-est failed: {r.stderr.strip()[:500]}")
     mapping = {}
     rep = None
     with open(out_fa + ".clstr") as f:
@@ -100,7 +106,13 @@ def cluster_variants(seqs, identity, work_dir):
 
 
 def pairwise_minimap2(seqs, work_dir, threads):
-    """All-vs-all minimap2. Return dict (q,t) -> {cov_of_q, ident}."""
+    """All-vs-all minimap2. Return dict (q,t) -> {cov_of_q, ident}.
+
+    cov_of_q is the UNION of q's aligned intervals (summing alignment lengths
+    let overlapping/repeated hits exceed 100% and fake a containment).
+    -N is raised to the number of sequences: with the default (5 secondary
+    targets per query) a site with more than six variants lost pairs at
+    random, and a missing pair breaks the chain."""
     if len(seqs) < 2:
         return {}
     fa = os.path.join(work_dir, "all.fa")
@@ -110,30 +122,35 @@ def pairwise_minimap2(seqs, work_dir, threads):
                     "-f", "0",  # keep ALL minimizers: the default drops the most frequent
                     # ones, which in a self-alignment are exactly the repeats sought
                     # (fna project: 0 of 60 IS1 copies found without it, 57 with)
+                    "-N", str(max(50, len(seqs) + 5)), "-p", "0.2",
                     "-t", str(threads), fa, fa, "-o", paf],
                    check=True, capture_output=True)
     seq_lens = {sid: len(s) for sid, s in seqs}
-    match_bp = defaultdict(int)
-    ident_sum = defaultdict(float)
-    ident_count = defaultdict(int)
+    ivs = defaultdict(list)
+    matches_bp = defaultdict(int)
+    block_bp = defaultdict(int)
     with open(paf) as f:
         for line in f:
             c = line.split("\t")
             if len(c) < 12: continue
             q, t = c[0], c[5]
             if q == t: continue
-            qs, qe = int(c[2]), int(c[3])
-            matches, block = int(c[9]), int(c[10])
-            ident = matches / block * 100 if block > 0 else 0
-            match_bp[(q, t)] += qe - qs
-            ident_sum[(q, t)] += ident * (qe - qs)
-            ident_count[(q, t)] += qe - qs
+            ivs[(q, t)].append((int(c[2]), int(c[3])))
+            matches_bp[(q, t)] += int(c[9])
+            block_bp[(q, t)] += int(c[10])
     out = {}
-    for (q, t), m in match_bp.items():
-        qlen = seq_lens.get(q, 1)
-        cov_q_in_t = m / qlen * 100
-        avg_id = ident_sum[(q, t)] / ident_count[(q, t)] if ident_count[(q, t)] > 0 else 0
-        out[(q, t)] = {"cov_of_q": cov_q_in_t, "ident": avg_id}
+    for (q, t), iv in ivs.items():
+        covered, cur_s, cur_e = 0, None, None
+        for s0, e0 in sorted(iv):
+            if cur_e is None or s0 > cur_e:
+                if cur_e is not None:
+                    covered += cur_e - cur_s
+                cur_s, cur_e = s0, e0
+            else:
+                cur_e = max(cur_e, e0)
+        covered += cur_e - cur_s
+        out[(q, t)] = {"cov_of_q": covered / max(1, seq_lens.get(q, 1)) * 100,
+                       "ident": matches_bp[(q, t)] / max(1, block_bp[(q, t)]) * 100}
     return out
 
 
@@ -145,28 +162,47 @@ def build_chains(variant_list, pair_metrics, step_identity, step_coverage):
     """
     n = len(variant_list)
     if n == 0: return []
+
+    def contains(i_small, i_big):
+        m = pair_metrics.get((variant_list[i_small]["vid"], variant_list[i_big]["vid"]))
+        return bool(m and m["cov_of_q"] >= step_coverage and m["ident"] >= step_identity)
+
     chains = [[0]]  # start one chain with smallest
     for i in range(1, n):
-        cur = variant_list[i]
-        # Try to extend any existing chain whose last element is contained in cur
-        extended_any = False
+        new, seen = [], set()
         for chain in chains:
-            prev = variant_list[chain[-1]]
-            metrics = pair_metrics.get((prev["vid"], cur["vid"]))
-            if metrics and metrics["cov_of_q"] >= step_coverage \
-                       and metrics["ident"] >= step_identity:
+            # deepest element of this chain that `i` contains. Only the TIP
+            # was tested, so with A < B and a variant C that contains A but
+            # not B, the relation A < C was lost and C started from nothing.
+            j = next((k for k in range(len(chain) - 1, -1, -1)
+                      if contains(chain[k], i)), None)
+            if j is None:
+                continue
+            if j == len(chain) - 1:
                 chain.append(i)
-                extended_any = True
-        if not extended_any:
-            # Start a new chain (this variant isn't a child of any existing chain)
-            chains.append([i])
-    return chains
+                seen.add(tuple(chain))
+            else:
+                branch = tuple(chain[:j + 1] + [i])
+                if branch not in seen:
+                    seen.add(branch)
+                    new.append(list(branch))
+        if not seen:
+            new.append([i])   # not a child of anything seen so far
+        chains.extend(new)
+    # drop chains that are a prefix of another (left behind by branching)
+    uniq = []
+    for c in sorted(set(map(tuple, chains)), key=lambda c: (-len(c), c)):
+        if not any(u[:len(c)] == c for u in uniq):
+            uniq.append(c)
+    return [list(c) for c in sorted(uniq)]
 
 
 def main():
     args = parse_args()
     os.makedirs(args.out, exist_ok=True)
     work_root = tempfile.mkdtemp(prefix="lineage_v3_")
+    import atexit, shutil
+    atexit.register(shutil.rmtree, work_root, ignore_errors=True)
     print(f"Loading {args.obs}...", file=sys.stderr, flush=True)
     with open(args.obs) as f:
         obs = json.load(f)
@@ -278,9 +314,12 @@ def main():
                         continue
                     rep = mapping.get(vid, vid)
                     if rep not in aggregated:
-                        aggregated[rep] = v.copy()
+                        # the REPRESENTATIVE's own record (was: whichever
+                        # member came first, filed under the rep's key)
+                        aggregated[rep] = variants_raw.get(rep, v).copy()
                         aggregated[rep]["cluster_members"] = []
                         aggregated[rep]["n_observations"] = 0
+                        aggregated[rep]["nested_event_keys"] = set()
                     aggregated[rep]["cluster_members"].append(vid)
                     aggregated[rep]["nested_event_keys"] = (
                         set(aggregated[rep].get("nested_event_keys", ()))
@@ -289,31 +328,9 @@ def main():
                 variants_raw = aggregated
 
         # Sort variants shortest to longest
-        variants_sorted = sorted(variants_raw.values(), key=lambda v: v["len"])
+        variants_sorted = sorted(variants_raw.values(), key=lambda v: (v["len"], v["vid"]))
 
-        # Length-bucket: collapse variants within --min-step-bp of each other into
-        # a single representative (the one with the most observations)
-        if args.min_step_bp > 0 and len(variants_sorted) > 1:
-            buckets = []
-            for v in variants_sorted:
-                if buckets and v["len"] - buckets[-1][-1]["len"] < args.min_step_bp:
-                    buckets[-1].append(v)
-                else:
-                    buckets.append([v])
-            collapsed = []
-            for bucket in buckets:
-                # Pick the representative with most observations, or longest
-                bucket.sort(key=lambda v: (-v["n_observations"], -v["len"]))
-                rep = bucket[0].copy()
-                rep["n_observations"] = sum(v["n_observations"] for v in bucket)
-                rep["nested_event_keys"] = set().union(
-                    *(v.get("nested_event_keys", set()) for v in bucket))
-                rep["bucket_size"] = len(bucket)
-                rep["bucket_lengths"] = [v["len"] for v in bucket]
-                collapsed.append(rep)
-            variants_sorted = collapsed
-
-        # Pairwise minimap2 to validate containment
+        # Pairwise minimap2 (containment + similarity), before any merging
         seqs_for_align = [(v["vid"], v["seq"]) for v in variants_sorted if v["seq"]]
         if len(seqs_for_align) >= 2:
             work_dir = os.path.join(work_root, v1_id.replace("|", "_").replace(".", "_"))
@@ -321,6 +338,39 @@ def main():
             pair_metrics = pairwise_minimap2(seqs_for_align, work_dir, args.threads)
         else:
             pair_metrics = {}
+
+        # Length-bucket: collapse variants within --min-step-bp of each other
+        # into one representative (most observations) -- but only if they are
+        # also the same sequence. Length alone merged unrelated variants that
+        # happen to be equally long (two different cargos of the same size)
+        # and added their observation counts together.
+        def same_seq(a, b):
+            m1 = pair_metrics.get((a["vid"], b["vid"]))
+            m2 = pair_metrics.get((b["vid"], a["vid"]))
+            return bool(m1 and m2 and min(m1["cov_of_q"], m2["cov_of_q"]) >= args.step_coverage
+                        and min(m1["ident"], m2["ident"]) >= args.step_identity)
+
+        if args.min_step_bp > 0 and len(variants_sorted) > 1:
+            buckets = []
+            for v in variants_sorted:
+                home = next((bk for bk in reversed(buckets)
+                             if v["len"] - bk[0]["len"] < args.min_step_bp
+                             and same_seq(bk[0], v)), None)
+                if home is not None:
+                    home.append(v)
+                else:
+                    buckets.append([v])
+            collapsed = []
+            for bucket in buckets:
+                bucket.sort(key=lambda v: (-v["n_observations"], -v["len"], v["vid"]))
+                rep = bucket[0].copy()
+                rep["n_observations"] = sum(v["n_observations"] for v in bucket)
+                rep["nested_event_keys"] = set().union(
+                    *(v.get("nested_event_keys", set()) for v in bucket))
+                rep["bucket_size"] = len(bucket)
+                rep["bucket_lengths"] = [v["len"] for v in bucket]
+                collapsed.append(rep)
+            variants_sorted = sorted(collapsed, key=lambda v: (v["len"], v["vid"]))
 
         # Build chains
         chains = build_chains(variants_sorted, pair_metrics,

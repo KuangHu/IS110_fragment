@@ -60,16 +60,38 @@ def parse_args():
     p.add_argument("--threads", type=int, default=16,
                    help="Threads for ULTRA (TRF is single-threaded)")
     p.add_argument("--n-permute", type=int, default=10000)
+    p.add_argument("--keep-duplicates", action="store_true",
+                   help="Test every record, even identical element sequences "
+                        "(pseudo-replicated; default: one per distinct sequence)")
+    p.add_argument("--all-records", action="store_true",
+                   help="Also test records without a called boundary "
+                        "(transposase-only / symmetric fallback)")
     return p.parse_args()
 
 
 # ----------------------------- sequence sets --------------------------------
-def load_is_sequences(records_path, min_len):
-    """Return (seqs dict {id: seq}, is_loci {contig: [(s,e)]})."""
+def load_is_sequences(records_path, min_len, called_only=True, dedup=True):
+    """Return (seqs dict {id: seq}, is_loci {contig: [(s,e)]}, stats).
+
+    called_only  keep only records whose boundaries were CALLED
+                 (method empty_vs_filled_decomposition). For the others the
+                 "element" is the bare transposase ORF or a symmetric guess,
+                 so its ends -- where IS tandem repeats sit -- are not in the
+                 sequence at all. Ignored for records without that label
+                 (older record files).
+    dedup        one sequence per distinct element. A catalogue holds the
+                 same IS copy from thousands of genomes; treated as
+                 independent observations they made every p-value
+                 meaningless (pseudo-replication), while each control window
+                 is a genuinely independent draw."""
     with open(records_path) as f:
         records = json.load(f)
     seqs = {}
     is_loci = defaultdict(list)
+    stats_ = defaultdict(int)
+    seen_seq = set()
+    labelled = any((r.get("boundary_evidence") or {}).get("method")
+                   == "empty_vs_filled_decomposition" for r in records)
     for r in records:
         rid = r.get("ref_id") or r.get("is110_id")
         ie = r.get("is_element") or (r.get("source", {}) or {}).get("is_element") or {}
@@ -81,9 +103,23 @@ def load_is_sequences(records_path, min_len):
         e = ie.get("source_end")
         if contig and s and e:
             is_loci[contig].append((min(s, e), max(s, e)))
-        if rid and seq and len(seq) >= min_len:
-            seqs[rid] = seq.upper()
-    return seqs, is_loci
+        if not (rid and seq and len(seq) >= min_len):
+            stats_["too_short_or_missing"] += 1
+            continue
+        if (called_only and labelled and (r.get("boundary_evidence") or {}).get("method")
+                != "empty_vs_filled_decomposition"):
+            stats_["boundary_not_called"] += 1
+            continue
+        seq = seq.upper()
+        if dedup:
+            if seq in seen_seq:
+                stats_["duplicate_sequence"] += 1
+                continue
+            seen_seq.add(seq)
+        seqs[rid] = seq
+    stats_["kept"] = len(seqs)
+    stats_["records"] = len(records)
+    return seqs, is_loci, dict(stats_)
 
 
 def sample_controls(fa, is_seqs, is_loci, ratio, min_len, rng):
@@ -306,8 +342,11 @@ def main():
     rng = np.random.default_rng(args.seed)
 
     print("Loading IS sequences ...", file=sys.stderr, flush=True)
-    is_seqs, is_loci = load_is_sequences(args.records, args.min_seq_len)
-    print(f"  IS sequences (>= {args.min_seq_len} bp): {len(is_seqs):,}", file=sys.stderr)
+    is_seqs, is_loci, load_stats = load_is_sequences(
+        args.records, args.min_seq_len, called_only=not args.all_records,
+        dedup=not args.keep_duplicates)
+    print(f"  IS sequences (>= {args.min_seq_len} bp): {len(is_seqs):,}  {load_stats}",
+          file=sys.stderr)
     if not is_seqs:
         sys.exit("No IS sequences to test.")
 
@@ -401,7 +440,12 @@ def main():
     pres_flags = [("both_present_all", "any period"),
                   ("both_present_large", f"period>={mlp}bp")]
 
-    report = {"n_IS": len(test_rows), "min_large_period": mlp,
+    report = {"n_IS": len(test_rows), "input_filter": load_stats,
+              "deduplicated": not args.keep_duplicates,
+              "called_boundaries_only": not args.all_records,
+              "note": "p-values are per test, not corrected for the "
+                      "12 comparisons reported",
+              "min_large_period": mlp,
               "control_ratio": args.control_ratio, "comparisons": {}}
 
     # IS vs each control set

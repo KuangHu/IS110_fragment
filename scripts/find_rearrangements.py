@@ -20,7 +20,7 @@ import sys
 from collections import defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from lib_alleles import representative_asm  # noqa: E402
+from lib_alleles import representative_asm, split_target  # noqa: E402
 
 
 ANCHOR_RE = re.compile(r"^(.+)__(up|down)(\d+)$")
@@ -76,13 +76,19 @@ def main():
                 continue
             n_kept += 1
 
+            # same assembly parsing as stages 4-6. Names without "<asm>|"
+            # were all filed under one assembly "unknown", so anchors from
+            # unrelated genomes were paired with each other.
+            assembly, contig = split_target(tname)
             if "|" in tname:
-                assembly, contig = tname.split("|", 1)
-            else:
-                assembly, contig = "unknown", tname
+                contig = tname.split("|", 1)[1]
 
             obs[(ref_id, assembly)][side][contig].append({
                 "strand": strand, "ts": ts, "te": te, "ident": ident, "contig": contig,
+                # where query base 0 lands on the target: identical for a
+                # full-length and a clipped report of the same placement
+                "p0": ts - qs if strand == "+" else te + qs,
+                "alen": qe - qs, "tname": tname,
             })
 
     print(f"PAF: {n_total:,} lines, {n_kept:,} kept (D={args.anchor_D})", file=sys.stderr)
@@ -124,15 +130,15 @@ def main():
         # contig redundancy in the DB, not a real biological duplication.
         for side in ("up", "down"):
             for contig, hs in sides[side].items():
-                seen = set()
-                uniq = []
+                # One hit per physical placement. Keying on the exact (ts, te)
+                # left a clipped and a full-length alignment of the SAME
+                # placement as two hits -> counted as a duplication.
+                best = {}
                 for h in hs:
-                    key = (h["ts"], h["te"], h["strand"])
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    uniq.append(h)
-                sides[side][contig] = uniq
+                    key = (h["strand"], h["p0"])
+                    if key not in best or (h["alen"], h["ident"]) > (best[key]["alen"], best[key]["ident"]):
+                        best[key] = h
+                sides[side][contig] = [best[k] for k in sorted(best)]
         up_hits = sides["up"]
         down_hits = sides["down"]
         if not up_hits or not down_hits:
@@ -193,6 +199,11 @@ def main():
             # .fai is keyed by full "<assembly>|<contig>"; the up/down dicts are
             # keyed by stripped contig name. Look up the full key, fall back to bare.
             def _len(contig):
+                # the hit keeps its full target name; rebuilding it from the
+                # (possibly GCA/GCF-collapsed) assembly could miss the .fai key
+                for hs in list(up_hits.get(contig, [])) + list(down_hits.get(contig, [])):
+                    if hs["tname"] in contig_lens:
+                        return contig_lens[hs["tname"]]
                 full = f"{assembly}|{contig}"
                 return contig_lens.get(full) or contig_lens.get(contig) or 0
             for u_contig, u_hits in up_hits.items():

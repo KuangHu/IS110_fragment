@@ -13,7 +13,7 @@ Outputs:
   tandem_findings.json — per-sequence summary of tandem regions
   tandem_findings.tsv  — flat table: seq_id, repeat_unit_bp, n_copies, ...
 """
-import argparse, json, os, subprocess, sys, tempfile
+import argparse, json, os, shutil, subprocess, sys, tempfile
 from collections import defaultdict
 
 
@@ -32,6 +32,9 @@ def parse_args():
                    help="Min alignment identity (default 95)")
     p.add_argument("--min-copies", type=int, default=2,
                    help="Min number of tandem copies to report (default 2 — 1 extra beyond original)")
+    p.add_argument("--include-dispersed", action="store_true",
+                   help="Also report dispersed direct repeats (two copies with "
+                        "other sequence between them). Default: tandem arrays only")
     p.add_argument("--threads", type=int, default=8)
     return p.parse_args()
 
@@ -63,74 +66,82 @@ def self_minimap2(seq, work_dir, threads):
     return hits
 
 
-def find_tandem_unit(hits, min_repeat_len, min_identity):
-    """Group non-diagonal hits by offset to find tandem repeats.
+def find_tandem_unit(hits, min_repeat_len, min_identity, adjacency=0.8):
+    """Group off-diagonal self-hits by offset; classify each repeat.
 
-    Returns list of {repeat_unit_bp, n_copies, span_start, span_end, offset}
+    A self-hit q[qs,qe) ~ t[ts,te) with offset = ts - qs says the sequence
+    repeats itself `offset` bp further on. Whether that is a TANDEM array
+    depends on how long the repeated stretch is relative to the offset:
+
+      tandem     the copies are adjacent, so the hit runs for (n-1) units:
+                 aligned span >= adjacency * offset. unit = offset,
+                 n_copies = round(array_span / offset) with
+                 array_span = max_te - min_qs  (n units long, so NO "+1":
+                 the old formula reported 3 copies for 2 and so on).
+      dispersed  a short repeat (aligned span < adjacency * offset) with
+                 unrelated sequence in between: two copies `offset` apart.
+                 These were reported as 2-copy tandems with unit = offset
+                 (E. coli: 217 of 350 findings).
+
+    Offsets are grouped by closeness (10% or 25 bp), not by rounding to 50:
+    the reported unit is the median true offset, not a multiple of 50.
+
+    Returns list of {repeat_class, repeat_unit_bp, n_copies, span_start,
+    span_end, total_span_bp, repeat_len_bp, n_hits}.
     """
-    # Only forward-strand hits with offset > 0
-    fwd_hits = [(qs, qe, ts, te, ident) for (qs, qe, ts, te, strand, ident) in hits
-                if strand == "+" and ident >= min_identity
-                and ts > qs and qe - qs >= min_repeat_len]
-    if not fwd_hits:
-        return []
-
-    # Group by offset (rounded to nearest 50)
-    by_offset = defaultdict(list)
-    for h in fwd_hits:
-        qs, qe, ts, te, ident = h
-        offset = ts - qs
-        bucket = round(offset / 50) * 50
-        by_offset[bucket].append(h)
+    fwd = sorted((ts - qs, qs, qe, ts, te) for (qs, qe, ts, te, strand, ident) in hits
+                 if strand == "+" and ident >= min_identity
+                 and ts > qs and qe - qs >= min_repeat_len)
+    groups = []
+    for h in fwd:
+        if groups and h[0] - groups[-1][-1][0] <= max(25, 0.1 * groups[-1][0][0]):
+            groups[-1].append(h)
+        else:
+            groups.append([h])
 
     results = []
-    for offset, group in by_offset.items():
-        if offset < min_repeat_len: continue
-        # Combined query span
-        q_starts = [h[0] for h in group]
-        q_ends = [h[1] for h in group]
-        span_s = min(q_starts)
-        span_e = max(q_ends)
-        # Number of tandem copies = n_hits + 1 (each hit shows pair of copies)
-        # But hits can chain — better: compute total hit span / offset (= number of repeats)
-        # Simpler heuristic: # tandem copies ≈ (max_te - min_qs) / offset + 1
-        max_te = max(h[3] for h in group)
-        min_qs = min(h[0] for h in group)
-        n_copies_est = round((max_te - min_qs) / offset) + 1
-        if n_copies_est < 2: continue
+    for g in groups:
+        offs = sorted(h[0] for h in g)
+        offset = offs[len(offs) // 2]
+        if offset < min_repeat_len:
+            continue
+        min_qs, max_qe = min(h[1] for h in g), max(h[2] for h in g)
+        max_te = max(h[4] for h in g)
+        aligned = max_qe - min_qs              # length of the repeated stretch
+        if aligned >= adjacency * offset:
+            cls, n = "tandem", max(2, round((max_te - min_qs) / offset))
+        else:
+            cls, n = "dispersed", 2
         results.append({
-            "repeat_unit_bp": offset,
-            "n_copies": n_copies_est,
-            "span_start": min_qs,
-            "span_end": max_te,
+            "repeat_class": cls,
+            "repeat_unit_bp": offset if cls == "tandem" else aligned,
+            "n_copies": n,
+            "span_start": min_qs, "span_end": max_te,
             "total_span_bp": max_te - min_qs,
-            "n_hits": len(group),
+            "repeat_len_bp": aligned,
+            "copy_spacing_bp": offset,
+            "n_hits": len(g),
         })
-    # Sort: most repeats first, larger unit first
-    results.sort(key=lambda r: (-r["n_copies"], -r["repeat_unit_bp"]))
 
-    # Deduplicate: if a larger offset finding's span is contained in a smaller
-    # offset finding's span AND the larger is a near-multiple of the smaller,
-    # drop the larger (it's just a derivative within the same tandem).
-    # Smallest unit = true repeat.
-    by_unit = sorted(results, key=lambda r: r["repeat_unit_bp"])
+    # A tandem array of unit U also self-aligns at offsets 2U, 3U, ...: drop
+    # those derivatives (smallest unit = true repeat).
     kept = []
-    for r in by_unit:
-        is_derivative = False
+    for r in sorted(results, key=lambda r: r["copy_spacing_bp"]):
+        derivative = False
         for k in kept:
-            # is r's offset a multiple of k's offset (within tolerance)?
-            ratio = r["repeat_unit_bp"] / k["repeat_unit_bp"]
-            if abs(ratio - round(ratio)) > 0.1: continue
-            if round(ratio) < 2: continue
-            # And r's span overlaps k's span substantially
-            ov_s = max(r["span_start"], k["span_start"])
-            ov_e = min(r["span_end"], k["span_end"])
-            if ov_e - ov_s > 0.5 * (r["span_end"] - r["span_start"]):
-                is_derivative = True
+            if k["repeat_class"] != "tandem":
+                continue
+            ratio = r["copy_spacing_bp"] / k["copy_spacing_bp"]
+            if round(ratio) < 2 or abs(ratio - round(ratio)) > 0.1:
+                continue
+            ov = min(r["span_end"], k["span_end"]) - max(r["span_start"], k["span_start"])
+            if ov > 0.5 * (r["span_end"] - r["span_start"]):
+                derivative = True
                 break
-        if not is_derivative:
+        if not derivative:
             kept.append(r)
-    kept.sort(key=lambda r: (-r["n_copies"], -r["repeat_unit_bp"]))
+    kept.sort(key=lambda r: (r["repeat_class"] != "tandem", -r["n_copies"],
+                             -r["repeat_unit_bp"], r["span_start"]))
     return kept
 
 
@@ -214,6 +225,7 @@ def main():
 
     # Self-align each sequence
     findings = []
+    n_failed = 0
     work_root = tempfile.mkdtemp(prefix="self_align_")
     for i, (name, info) in enumerate(seq_set.items()):
         if i % 2000 == 0:
@@ -222,11 +234,20 @@ def main():
         os.makedirs(wd, exist_ok=True)
         try:
             hits = self_minimap2(info["seq"], wd, args.threads)
-        except Exception as e:
+        except subprocess.CalledProcessError as e:
+            # counted and reported; these used to vanish without a trace
+            n_failed += 1
+            if n_failed <= 5:
+                print(f"  WARNING: self-alignment failed for {name}: "
+                      f"{(e.stderr or b'')[-200:]!r}", file=sys.stderr)
             continue
+        finally:
+            shutil.rmtree(wd, ignore_errors=True)
         repeats = find_tandem_unit(hits, args.min_repeat_len, args.min_identity)
         # Filter to require >= min_copies
         repeats = [r for r in repeats if r["n_copies"] >= args.min_copies]
+        if not args.include_dispersed:
+            repeats = [r for r in repeats if r["repeat_class"] == "tandem"]
         if repeats:
             findings.append({
                 "seq_id": name,
@@ -240,19 +261,24 @@ def main():
 
     subprocess.run(["rm", "-rf", work_root])
 
+    if n_failed:
+        print(f"  WARNING: {n_failed:,} sequences could not be self-aligned",
+              file=sys.stderr)
     print(f"\nSequences with tandem repeats: {len(findings):,}", file=sys.stderr)
 
     with open(os.path.join(args.out, "tandem_findings.json"), "w") as f:
         json.dump(findings, f, indent=2)
     with open(os.path.join(args.out, "tandem_findings.tsv"), "w") as f:
         f.write("seq_id\tkind\tv1_parent\tsource_target\tseq_len\t"
-                "repeat_unit_bp\tn_copies\ttotal_span_bp\tspan_start\tspan_end\n")
+                "repeat_unit_bp\tn_copies\ttotal_span_bp\tspan_start\tspan_end\t"
+                "repeat_class\tcopy_spacing_bp\n")
         for x in findings:
             for r in x["tandem_repeats"]:
                 f.write(f"{x['seq_id']}\t{x['kind']}\t{x['v1_parent']}\t"
                         f"{x['source_target']}\t{x['seq_len']}\t"
                         f"{r['repeat_unit_bp']}\t{r['n_copies']}\t"
-                        f"{r['total_span_bp']}\t{r['span_start']}\t{r['span_end']}\n")
+                        f"{r['total_span_bp']}\t{r['span_start']}\t{r['span_end']}\t"
+                        f"{r['repeat_class']}\t{r['copy_spacing_bp']}\n")
 
     # Summary stats
     n_v_ref = sum(1 for x in findings if x["kind"] == "v_ref")

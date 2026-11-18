@@ -141,14 +141,15 @@ def main():
                     continue
                 # Compute total V_ref-coverage within tnp region
                 # Each block has 'v1_pos': [start, end]
-                covered_bp = 0
-                for b in blocks:
-                    bs, be = b["v1_pos"]
-                    # Intersect with [t_s, t_e]
-                    ov_s = max(bs, t_s)
-                    ov_e = min(be, t_e)
+                # union of the block overlaps with [t_s, t_e]: overlapping
+                # blocks were added up, so a half-deleted CDS covered twice
+                # by repeated alignments could read as 100%
+                covered_bp, cur_e = 0, t_s
+                for bs, be in sorted(tuple(b["v1_pos"]) for b in blocks):
+                    ov_s, ov_e = max(bs, t_s, cur_e), min(be, t_e)
                     if ov_e > ov_s:
                         covered_bp += ov_e - ov_s
+                        cur_e = ov_e
                 cds_covered_pct = covered_bp / tnp_total * 100
                 passed = cds_covered_pct >= args.min_cds_coverage
 
@@ -167,6 +168,11 @@ def main():
                     filtered[v1_id] = {
                         "v1_id": v1_id,
                         "v_ref_length": info["v_ref_length"],
+                        # carried over: without it the validated file read
+                        # as an ordered (time) series
+                        "direction": info.get("direction", "unpolarized"),
+                        "direction_note": info.get("direction_note", ""),
+                        "counts_are": info.get("counts_are", ""),
                         "lineages": [],
                     }
                 filtered[v1_id]["lineages"].append(chain)

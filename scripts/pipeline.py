@@ -270,8 +270,11 @@ def find_is_boundaries(
                "--out", rearr_prefix,
                "--min-identity", str(min_identity),
                "--min-coverage", str(min_coverage),
-               "--anchor-D", str(anchor_d_rearrangements)],
-              [rearr_prefix + "_examples.tsv"])
+               "--anchor-D", str(anchor_d_rearrangements),
+               # contig lengths: without them every translocation candidate
+               # got anchor depth 0 and could not be told from a contig break
+               "--fai", genome_db + ".fai"],
+              [rearr_prefix + "_examples.tsv"], inputs=[anchors_paf])
 
     return records_json
 

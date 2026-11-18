@@ -18,12 +18,14 @@ Iterative: a downstream becomes the next-round "V1" query.
 Usage:
   downstream_finder.py --records V1_records.json --db target.fa --out OUT_DIR
 """
-import argparse, json, os, re, subprocess, sys, hashlib
+import argparse, json, os, re, shutil, subprocess, sys, hashlib, tempfile
+from multiprocessing.pool import ThreadPool
 from collections import defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from lib_alleles import (parse_paf_line, place_per_assembly,  # noqa: E402
-                         decompose_alleles, canonical_insert_key, canon_key)
+                         decompose_alleles, canonical_insert_key, canon_key,
+                         revcomp)
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -70,8 +72,59 @@ def parse_args():
     return p.parse_args()
 
 
-def revcomp(seq):
-    return seq.translate(str.maketrans("ACGTNacgtn", "TGCANtgcan"))[::-1]
+def union_len(intervals):
+    """Total length covered by a set of [start, end) intervals."""
+    total, cur_s, cur_e = 0, None, None
+    for s, e in sorted(intervals):
+        if cur_e is None or s > cur_e:
+            if cur_e is not None:
+                total += cur_e - cur_s
+            cur_s, cur_e = s, e
+        else:
+            cur_e = max(cur_e, e)
+    if cur_e is not None:
+        total += cur_e - cur_s
+    return total
+
+
+def align_to_own_v1(job):
+    """minimap2 of one V1's between-anchor sequences against THAT V1 only.
+
+    All between-sequences used to be mapped in one run against a FASTA of
+    every V1 element. A database holds thousands of near-identical copies of
+    the same IS, minimap2 reports the best few targets per query, and only
+    hits to the query's own V1 were kept -- so whether a perfectly clonal
+    site got any block was a lottery (E. coli: 41,204 between-sequences that
+    cover a V1 element at >=95% identity had no hit to their own V1 and
+    were classed 'unrelated'/'partial'). One target per run removes the
+    competition."""
+    rid, v1_seq, queries, work_dir = job
+    d = tempfile.mkdtemp(prefix="v1_", dir=work_dir)
+    try:
+        ref, qry = os.path.join(d, "v1.fa"), os.path.join(d, "q.fa")
+        write_fasta([("v1", v1_seq)], ref)
+        write_fasta(queries, qry)
+        res = subprocess.run(["minimap2", "-x", "asm10", "-c", "--eqx", "-t", "1",
+                              ref, qry], capture_output=True, text=True)
+        if res.returncode != 0:
+            return rid, None
+        out = defaultdict(list)
+        for line in res.stdout.splitlines():
+            c = line.split("\t")
+            if len(c) < 12:
+                continue
+            matches, block = int(c[9]), int(c[10])
+            ident = matches / block * 100 if block > 0 else 0
+            if ident < 95:
+                continue
+            qs, qe = int(c[2]), int(c[3])
+            out[c[0]].append({
+                "v1_id": rid, "v1_start": int(c[7]), "v1_end": int(c[8]),
+                "between_start": qs, "between_end": qe,
+                "strand": c[4], "ident": ident, "block_len": qe - qs})
+        return rid, dict(out)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
 
 
 def extract_target(db, contig, start, end):
@@ -84,45 +137,29 @@ def extract_target(db, contig, start, end):
 
 
 def extract_target_batch(db, regions, batch_size=1000):
-    """Batch samtools faidx - takes many regions at once.
+    """Batch samtools faidx. regions: iterable of (contig, start, end), 1-based
+    inclusive. Returns dict (contig, start, end) -> sequence.
 
-    regions: list of (contig, start, end) tuples.
-    Returns dict: (contig, start, end) -> sequence string.
-    """
+    A failed samtools call raises: it used to `continue`, silently dropping
+    up to `batch_size` observations per failure."""
+    regions = sorted(set(regions))
     results = {}
     for i in range(0, len(regions), batch_size):
         batch = regions[i:i+batch_size]
-        region_strs = [f"{c}:{max(1,s)}-{e}" for c, s, e in batch]
-        res = subprocess.run(["samtools", "faidx", db] + region_strs,
+        by_name = {f"{c}:{max(1, s)}-{e}": (c, s, e) for c, s, e in batch}
+        res = subprocess.run(["samtools", "faidx", db] + list(by_name),
                              capture_output=True, text=True)
         if res.returncode != 0:
-            continue
-        # Parse multi-FASTA output
-        cur_header, cur_seq = None, []
-        for line in res.stdout.split("\n"):
+            raise RuntimeError(f"samtools faidx failed on a batch of {len(batch)} "
+                               f"regions: {res.stderr.strip()[:500]}")
+        cur, buf = None, []
+        for line in res.stdout.split("\n") + [">"]:
             if line.startswith(">"):
-                if cur_header:
-                    # Parse "CONTIG:S-E" back to tuple
-                    m = re.match(r"(.+):(\d+)-(\d+)", cur_header)
-                    if m:
-                        key = (m.group(1), int(m.group(2)), int(m.group(3)))
-                        # Match to original key (start may be max(1,start))
-                        for c, s, e in batch:
-                            if c == key[0] and max(1, s) == key[1] and e == key[2]:
-                                results[(c, s, e)] = "".join(cur_seq).upper()
-                                break
-                cur_header = line[1:].strip()
-                cur_seq = []
+                if cur in by_name:
+                    results[by_name[cur]] = "".join(buf).upper()
+                cur, buf = line[1:].strip(), []
             else:
-                cur_seq.append(line.strip())
-        if cur_header:
-            m = re.match(r"(.+):(\d+)-(\d+)", cur_header)
-            if m:
-                key = (m.group(1), int(m.group(2)), int(m.group(3)))
-                for c, s, e in batch:
-                    if c == key[0] and max(1, s) == key[1] and e == key[2]:
-                        results[(c, s, e)] = "".join(cur_seq).upper()
-                        break
+                buf.append(line.strip())
     return results
 
 
@@ -157,6 +194,7 @@ def main():
     anchors_list = []
     is110_list = []
     ref_meta = {}  # v1_id -> metadata
+    n_skip = defaultdict(int)
     for r in records:
         # Field name compatibility: records_final uses "is110_id"; build_records.py
         # (Cross_reference_IS Stage 6) uses "ref_id". Accept either.
@@ -174,8 +212,11 @@ def main():
         down = down_obj.get("sequence", "")
         is110_seq = is_obj.get("sequence", "")
         if not (up and down and is110_seq):
+            n_skip["missing flank or element sequence"] += 1
             continue
         if len(up) < args.anchor_len or len(down) < args.anchor_len:
+            # element within anchor_len of a contig end: no variant search
+            n_skip[f"flank shorter than --anchor-len {args.anchor_len}"] += 1
             continue
         # Anchor = innermost 5 kb (closest to IS)
         up_anchor = up[-args.anchor_len:]      # 5 kb immediately upstream of IS
@@ -192,18 +233,32 @@ def main():
                        if k in ("assembly", "contig")},
         }
     print(f"  Built {len(anchors_list)//2:,} anchor pairs", file=sys.stderr)
+    for why, n in sorted(n_skip.items()):
+        print(f"  NOT searched: {n:,} records ({why})", file=sys.stderr)
     write_fasta(anchors_list, anchor_fa)
     write_fasta(is110_list, is110_fa)
 
     # === Step 2: minimap2 anchors against DB ===
     anchor_paf = f"{args.out}/anchors_vs_db.paf"
-    if not os.path.exists(anchor_paf) or os.path.getsize(anchor_paf) == 0:
+    # The cached PAF is only valid for THESE anchors, database and -N. It was
+    # reused on mere existence: after records.json changed (a Stage 6 rerun)
+    # the new anchors were paired from the old alignments.
+    with open(anchor_fa, "rb") as fh:
+        paf_key = (f"{hashlib.md5(fh.read()).hexdigest()} {os.path.abspath(args.db)} "
+                   f"{os.path.getsize(args.db)} N={args.max_secondary}")
+    key_file = anchor_paf + ".key"
+    cached = (os.path.exists(anchor_paf) and os.path.getsize(anchor_paf) > 0
+              and os.path.exists(key_file) and open(key_file).read().strip() == paf_key)
+    if not cached:
         print(f"Running minimap2 anchors vs DB ...", file=sys.stderr, flush=True)
         subprocess.run([
             "minimap2", "-x", "asm10", "-c", "--eqx",
             "--secondary=yes", "-N", str(args.max_secondary), "-p", "0.5",
-            "-t", str(args.threads), args.db, anchor_fa, "-o", anchor_paf
+            "-t", str(args.threads), args.db, anchor_fa, "-o", anchor_paf + ".tmp"
         ], check=True)
+        os.replace(anchor_paf + ".tmp", anchor_paf)
+        with open(key_file, "w") as fh:
+            fh.write(paf_key + "\n")
     print(f"  anchor PAF: {anchor_paf} ({os.path.getsize(anchor_paf)/1e6:.1f} MB)",
           file=sys.stderr)
 
@@ -261,7 +316,10 @@ def main():
 
     # Build region list
     all_regions = []  # (contig, start, end)
-    region_to_pair = {}  # (contig, start, end) -> (rid, i, p)
+    # Different V1s (the same insertion seen from different source genomes)
+    # routinely place on the SAME target interval. A dict keyed by region kept
+    # only the last of them; every other V1 silently lost that observation.
+    region_to_pair = defaultdict(list)  # (contig, start, end) -> [(rid, i, p)]
     for rid, pairs in v1_pairs.items():
         for i, p in enumerate(pairs):
             p["pair_id"] = f"{rid}__pair{i}__{p['target']}_{p['between_start']}_{p['between_end']}"
@@ -270,7 +328,7 @@ def main():
                 continue
             region = (p["target"], p["between_start"] + 1, p["between_end"])
             all_regions.append(region)
-            region_to_pair[region] = (rid, i, p)
+            region_to_pair[region].append((rid, i, p))
     print(f"  Total regions to extract: {len(all_regions):,}",
           file=sys.stderr, flush=True)
 
@@ -279,48 +337,40 @@ def main():
     print(f"  Fetched {len(seqs):,} sequences", file=sys.stderr, flush=True)
 
     extracted = []
+    n_wrong_len = 0
     for region, seq in seqs.items():
-        if region not in region_to_pair: continue
-        rid, i, p = region_to_pair[region]
-        if p["strand"] == "-": seq = revcomp(seq)
-        p["between_seq"] = seq
-        extracted.append((p["pair_id"], seq))
+        for rid, i, p in region_to_pair.get(region, ()):
+            if len(seq) != p["between_len"]:
+                n_wrong_len += 1          # interval runs off the contig
+                continue
+            sq = revcomp(seq) if p["strand"] == "-" else seq
+            p["between_seq"] = sq
+            extracted.append((p["pair_id"], sq))
     write_fasta(extracted, between_fa)
-    print(f"  Wrote {len(extracted):,} between-anchor sequences",
-          file=sys.stderr)
+    n_lost = sum(1 for ps in v1_pairs.values() for p in ps if "between_seq" not in p)
+    print(f"  Wrote {len(extracted):,} between-anchor sequences; "
+          f"{n_lost:,} placements without a sequence "
+          f"({n_wrong_len:,} of them: fetched length != interval)", file=sys.stderr)
 
-    # === Step 6: Compare each between-seq to its V1 IS110 using minimap2 ===
-    print(f"Aligning between-seqs to V1 IS110 sequences ...", file=sys.stderr, flush=True)
-    compare_paf = f"{args.out}/between_vs_v1.paf"
-    # Build query (each between seq) vs target (each V1 IS110)
-    # Use minimap2 with high sensitivity
-    subprocess.run([
-        "minimap2", "-x", "asm10", "-c", "--eqx",
-        "-t", str(args.threads), is110_fa, between_fa, "-o", compare_paf
-    ], check=True, capture_output=True)
-    print(f"  comparison PAF: {os.path.getsize(compare_paf)/1e6:.1f} MB",
+    # === Step 6: Compare each between-seq to ITS OWN V1 (see align_to_own_v1) ===
+    print(f"Aligning between-seqs to their own V1 ...", file=sys.stderr, flush=True)
+    jobs = []
+    for rid, pairs in v1_pairs.items():
+        q = [(p["pair_id"], p["between_seq"]) for p in pairs if p.get("between_seq")]
+        if q:
+            jobs.append((rid, ref_meta[rid]["is110_seq"], q, args.out))
+    between_aligns = {}
+    n_failed = 0
+    with ThreadPool(max(1, args.threads)) as pool:
+        for rid, res in pool.imap_unordered(align_to_own_v1, jobs, chunksize=4):
+            if res is None:
+                n_failed += 1
+                continue
+            between_aligns.update(res)
+    if n_failed:
+        raise RuntimeError(f"minimap2 failed for {n_failed} of {len(jobs)} V1s")
+    print(f"  {len(between_aligns):,} between-seqs with >=95% blocks to their V1",
           file=sys.stderr)
-
-    # Parse: for each between seq, list of alignments to V1
-    between_aligns = defaultdict(list)
-    with open(compare_paf) as f:
-        for line in f:
-            c = line.split("\t")
-            if len(c) < 12: continue
-            qname, qlen = c[0], int(c[1])
-            qs, qe = int(c[2]), int(c[3])
-            strand = c[4]
-            tname = c[5]
-            ts, te = int(c[7]), int(c[8])
-            matches, block = int(c[9]), int(c[10])
-            ident = matches / block * 100 if block > 0 else 0
-            if ident < 95: continue
-            between_aligns[qname].append({
-                "v1_id": tname, "v1_start": ts, "v1_end": te,
-                "between_start": qs, "between_end": qe,
-                "strand": strand, "ident": ident,
-                "block_len": qe - qs,
-            })
 
     # === Step 7: Classify each observation ===
     print(f"Classifying observations ...", file=sys.stderr, flush=True)
@@ -335,7 +385,10 @@ def main():
             blocks = [b for b in blocks if b["v1_id"] == rid]
 
             between_len = p["between_len"]
-            total_matched = sum(b["block_len"] for b in blocks)
+            # bp of V1 covered, as a UNION on V1 coordinates. Summing block
+            # lengths counted overlapping alignments twice and a variant with
+            # two copies of the element as 200% of V1.
+            total_matched = union_len([(b["v1_start"], b["v1_end"]) for b in blocks])
 
             v1_cov_frac = total_matched / v1_len if v1_len > 0 else 0
             min_cov_frac = args.min_v1_coverage / 100.0
@@ -476,6 +529,8 @@ def main():
         "n_v1_records": len(records),
         "n_anchor_pairs": n_pairs,
         "n_ambiguous_placements": n_ambiguous,
+        "n_records_not_searched": dict(n_skip),
+        "n_placements_without_sequence": n_lost,
         "counts_are": "distinct assemblies (GCA/GCF twins collapsed)",
         "n_observations": len(obs_records),
         "counts": dict(counts),
