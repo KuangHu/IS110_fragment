@@ -8,7 +8,7 @@ import random
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts"))
-from lib_alleles import (Hit, assembly_core, canonical_insert_key,  # noqa: E402
+from lib_alleles import (Hit, hamming_split, assembly_core, canonical_insert_key,  # noqa: E402
                          classify_gap, decompose_alleles, find_tsd, gap_tolerance,
                          place_pair, representative_asm, revcomp)
 
@@ -98,6 +98,55 @@ def test_place_pair_no_cross_copy():
     assert pl["gap"] == 3200, pl                          # a same-locus pair
     assert pl["status"] == "ambiguous"                    # two loci, same score
     assert pl["n_pairs"] == 2
+
+
+def test_place_pair_interleaved_copies_ambiguous():
+    # codex round 2 #1: up1 up2 down1 down2, outer partners clipped. The inner
+    # pair (up2, down1) is mutual-nearest but joins two neighbouring copies.
+    ups = [qhit("c", "+", 1100, 1500, 100, 500), qhit("c", "+", 3000, 3500, 0, 500)]
+    downs = [qhit("c", "+", 4700, 5200, 0, 500), qhit("c", "+", 6700, 7100, 0, 400)]
+    pl = place_pair(ups, downs)
+    assert pl["status"] == "ambiguous", pl
+    # two well separated loci are NOT interleaved: still decided by score/margin
+    ups = [qhit("c", "+", 1000, 1500, 0, 500), qhit("c", "+", 50000, 50500, 0, 500)]
+    downs = [qhit("c", "+", 4700, 5200, 0, 500), qhit("c", "+", 53700, 54200, 0, 500)]
+    assert place_pair(ups, downs)["status"] == "ambiguous"   # two equal loci
+
+
+def test_place_pair_hidden_rival_pair():
+    # codex round 2 #4: contig y has an inner clipped locus AND two full outer
+    # anchors that form an equally good placement as contig x.
+    ups = [qhit("x", "+", 1000, 1500, 0, 500),
+           qhit("y", "+", 1000, 1500, 0, 500), qhit("y", "+", 3100, 3500, 100, 500)]
+    downs = [qhit("x", "+", 4700, 5200, 0, 500),
+             qhit("y", "+", 4700, 5100, 0, 400), qhit("y", "+", 6700, 7200, 0, 500)]
+    pl = place_pair(ups, downs)
+    assert pl["status"] == "ambiguous", pl
+
+
+def test_place_pair_duplicate_rows_and_order():
+    # codex round 2 #10/#11: repeated PAF rows and clipped/full versions of
+    # one placement are one hit; the result must not depend on row order.
+    u, d = qhit("c", "+", 1000, 1500, 0, 500), qhit("c", "+", 4700, 5200, 0, 500)
+    assert place_pair([u, u], [d])["status"] == "unique"
+    assert place_pair([u, u], [d, d])["n_pairs"] == 1
+    d_clip = qhit("c", "+", 4700, 5100, 0, 400)            # same placement, clipped
+    a, b = place_pair([u], [d_clip, d]), place_pair([u], [d, d_clip])
+    assert a["status"] == b["status"] == "unique" and a["score"] == b["score"] == 2.0
+    # equal placements on two contigs: same winner whatever the order
+    u2, d2 = qhit("b", "+", 1000, 1500, 0, 500), qhit("b", "+", 4700, 5200, 0, 500)
+    assert place_pair([u, u2], [d, d2])["tname"] == place_pair([u2, u], [d2, d])["tname"]
+
+
+def test_hamming_split_refuses_cluster_past_repeat():
+    # codex round 2 #3: a flank indel hidden by a homopolymer next to the
+    # junction leaves a mismatch cluster just beyond it
+    left, right, ins = rseq(600), rseq(600), rseq(1500)
+    left = left[:555] + "A" * 45                            # homopolymer before junction
+    long_ = left + ins + right
+    short = left[:540] + left[543:] + right                 # 3-bp deletion 60 bp upstream
+    hs = hamming_split(short, long_)
+    assert hs is None or hs["insert_len"] == 1500, hs
 
 
 def test_place_per_assembly_twin_fallback():

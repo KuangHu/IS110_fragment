@@ -65,6 +65,11 @@ def _run_stage(output_dir, name, title, cmd, outputs, trust_existing=False,
     """
     import json
     marker = os.path.join(output_dir, f".stage_{name}.done")
+    # Written when an EARLIER stage re-runs; survives a crash/restart, so a
+    # later `--trust-existing` cannot adopt outputs that the previous
+    # process had already invalidated (that state used to live only in
+    # memory).
+    invalid = os.path.join(output_dir, f".stage_{name}.invalid")
     sig = json.dumps([os.path.basename(cmd[0])] + list(cmd[1:]))
     have = all(os.path.exists(o) for o in outputs)
     if have and os.path.exists(marker):
@@ -78,6 +83,7 @@ def _run_stage(output_dir, name, title, cmd, outputs, trust_existing=False,
                else "parameters changed since the cached run")
         print(f"=== {title}: {why} -- re-running ===", flush=True)
     elif (have and trust_existing and output_dir not in _RAN
+          and not os.path.exists(invalid)
           and all(os.path.getsize(o) > 0 for o in outputs)):
         # Adoption is only for an untouched legacy directory. Once any stage
         # has run in this invocation its downstream outputs are stale and
@@ -96,6 +102,7 @@ def _run_stage(output_dir, name, title, cmd, outputs, trust_existing=False,
         m = os.path.join(output_dir, f".stage_{later}.done")
         if os.path.exists(m):
             os.remove(m)
+        open(os.path.join(output_dir, f".stage_{later}.invalid"), "w").close()
     _RAN.add(output_dir)
     print(f"=== {title} ===", flush=True)
     if atomic_o is not None:
@@ -111,6 +118,8 @@ def _run_stage(output_dir, name, title, cmd, outputs, trust_existing=False,
         raise RuntimeError(f"{title}: finished without writing {missing}")
     with open(marker, "w") as f:
         f.write(sig + "\n")
+    if os.path.exists(invalid):
+        os.remove(invalid)
 
 
 def find_is_boundaries(
@@ -184,7 +193,8 @@ def find_is_boundaries(
           [anchors_fa, refs_fa, ref_table_tsv],
           # Stage 1 is cached on existence; a regenerated or hand-replaced
           # is_hits.tsv must still invalidate everything built from it
-          inputs=[is_hits_tsv])
+          # ... and so must a rebuilt database (its .fai is rewritten)
+          inputs=[is_hits_tsv, src_db + ".fai"])
 
     # Stage 3
     # Use 'sr' preset for short anchor queries (500 bp).
@@ -199,7 +209,7 @@ def find_is_boundaries(
            "-t", str(threads),
            genome_db, anchors_fa, "-o", anchors_paf]
     stage("3_minimap2", "Stage 3: anchors vs DB (minimap2)", cmd, [anchors_paf],
-          atomic_o=len(cmd) - 1)
+          atomic_o=len(cmd) - 1, inputs=[anchors_fa, genome_db + ".fai"])
 
     # Stage 4
     stage("4_pairs", "Stage 4: anchor pair finder",
@@ -209,7 +219,8 @@ def find_is_boundaries(
            "--out", pairs_prefix,
            "--min-identity", str(min_identity),
            "--min-coverage", str(min_coverage)],
-          [pairs_prefix + "_pairs.tsv", pairs_prefix + "_summary.tsv"])
+          [pairs_prefix + "_pairs.tsv", pairs_prefix + "_summary.tsv"],
+          inputs=[anchors_paf, ref_table_tsv])
 
     # Stage 5
     stage("5_boundaries", "Stage 5: boundary peak caller",
@@ -223,7 +234,8 @@ def find_is_boundaries(
            "--min-is-size", str(expected_is_size_range[0]),
            "--max-is-size", str(expected_is_size_range[1]),
            "--max-secondary", str(max_secondary)],
-          [boundaries_prefix + "_pairs.tsv", boundaries_prefix + "_summary.tsv"])
+          [boundaries_prefix + "_pairs.tsv", boundaries_prefix + "_summary.tsv"],
+          inputs=[anchors_paf, ref_table_tsv])
 
     # Stage 6
     records_json = os.path.join(records_dir, "records.json")
@@ -245,7 +257,9 @@ def find_is_boundaries(
            "--threads", str(threads)],
           [records_json] + [os.path.join(records_dir, f) for f in (
               "summary.tsv", "is_elements.fa", "transposase_cds.fa",
-              "upstream_flanks.fa", "downstream_flanks.fa", "empty_junctions.fa")])
+              "upstream_flanks.fa", "downstream_flanks.fa", "empty_junctions.fa")],
+          inputs=[anchors_paf, ref_table_tsv, is_hits_tsv,
+                  genome_db + ".fai", src_db + ".fai"])
 
     # Stage 7 (optional): rearrangement detection from the same anchor PAF
     if detect_rearrangements:

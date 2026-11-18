@@ -216,6 +216,24 @@ def place_pair(ups, downs, min_gap=-50, max_gap=200000, margin_ratio=0.05):
         # anchors swap sides on the minus strand
         return d.te + d.qs, u.ts - (u.qlen - u.qe)
 
+    def collapse(hs):
+        # One Hit per physical placement. minimap2 can report the same
+        # alignment twice (secondary/supplementary rows, split index parts)
+        # or as a full-length and a clipped version; kept as separate list
+        # entries they looked like two competing copies and turned a unique
+        # placement 'ambiguous' -- or, depending on PAF row order, changed
+        # which one was the "nearest" partner. Key = where query base 0
+        # projects on the target; keep the best-scoring representation.
+        best = {}
+        for h in hs:
+            p0 = h.ts - h.qs if h.strand == "+" else h.te + h.qs
+            k = (h.tname, h.strand, p0)
+            rank = (h.nmatch / max(1, h.qlen), h.qe - h.qs, -h.ts, -h.te)
+            if k not in best or rank > best[k][0]:
+                best[k] = (rank, h)
+        return [best[k][1] for k in sorted(best)]
+
+    ups, downs = collapse(ups), collapse(downs)
     pairs = []
     for ui, u in enumerate(ups):
         for di, d in enumerate(downs):
@@ -234,38 +252,49 @@ def place_pair(ups, downs, min_gap=-50, max_gap=200000, margin_ratio=0.05):
     # alone let a full-length up hit at copy 1 pair with a full-length down
     # hit at copy 2 and outscore both true (partly clipped) same-locus pairs:
     # a 'resolved' 12 kb allele that exists in no genome.
+    # Ties in distance are broken by score, then position -- never by the
+    # order of the PAF rows.
     near_u, near_d = {}, {}
     for c in pairs:
-        _, gap, ui, di = c[:4]
-        if ui not in near_u or gap < near_u[ui][0]:
-            near_u[ui] = (gap, di)
-        if di not in near_d or gap < near_d[di][0]:
-            near_d[di] = (gap, ui)
+        score, gap, ui, di = c[:4]
+        k = (gap, -score, c[6], c[7])
+        if ui not in near_u or k < near_u[ui][0]:
+            near_u[ui] = (k, di)
+        if di not in near_d or k < near_d[di][0]:
+            near_d[di] = (k, ui)
     loci = [c for c in pairs
             if near_u[c[2]][1] == c[3] and near_d[c[3]][1] == c[2]]
     if not loci:
         return None
     in_locus_u = {c[2] for c in loci}
     in_locus_d = {c[3] for c in loci}
-    # A stray extra copy of ONE anchor (not part of any locus of its own) is
-    # still a rival for the anchor it could pair with: one up hit with two
-    # equally good down hits must stay ambiguous, not be settled by distance.
-    strays = [c for c in pairs
-              if (c[2] in in_locus_u) != (c[3] in in_locus_d)]
-    cands = [(c[0], c[4], c[5], c[6], c[7]) for c in loci + strays]
-    # deterministic order: score, then target position
-    cands.sort(key=lambda x: (-x[0], x[3], x[4]))
-    # the placement itself is always a locus; strays only compete as runner-up
-    best_locus = min(loci, key=lambda c: (-c[0], c[6], c[7]))
+    # Rivals that are not loci themselves:
+    #  * a stray extra copy of ONE anchor: one up hit with two equally good
+    #    down hits must stay ambiguous, not be settled by distance;
+    #  * a pair of TWO unmatched anchors: a complete placement in its own
+    #    right (it was dropped, hiding an equally good placement elsewhere).
+    rivals = [c for c in pairs
+              if not (c[2] in in_locus_u and c[3] in in_locus_d)]
+    # the placement itself is always a locus; rivals only compete as runner-up
+    best_locus = min(loci, key=lambda c: (-c[0], c[4].tname, c[6], c[7]))
     score, u, d, s, e = best_locus[0], best_locus[4], best_locus[5], best_locus[6], best_locus[7]
-    cands = [(score, u, d, s, e)] + [c for c in cands
-                                      if not (c[1] is u and c[2] is d)]
+    others = [c for c in loci + rivals if c is not best_locus]
+    others.sort(key=lambda c: (-c[0], c[4].tname, c[6], c[7]))
+    cands = [best_locus] + others
+    # Interleaved copies (up1 up2 down1 down2 on one contig and strand):
+    # mutual-nearest picks the INNER pair (up2, down1), which joins two
+    # neighbouring copies and reads as an empty site. The outer anchors then
+    # form a pair that encloses the chosen one. Distance cannot tell which
+    # pairing is real, so this is ambiguous whatever the scores are.
+    nested = any(c[4].tname == u.tname and c[4].strand == u.strand
+                 and c[2] not in in_locus_u and c[3] not in in_locus_d
+                 and c[6] <= s and c[7] >= e for c in others)
     if len(cands) == 1:
         margin, status, second = 1.0, "unique", None
     else:
-        second = cands[1][0]
+        second = others[0][0]
         margin = (score - second) / abs(score) if score else 0.0
-        status = "ambiguous" if margin < margin_ratio else "resolved"
+        status = "ambiguous" if (margin < margin_ratio or nested) else "resolved"
     return {"tname": u.tname, "strand": u.strand, "up": u, "down": d,
             "start": s, "end": e, "gap": e - s,
             "n_pairs": len(cands), "score": score, "second_score": second,
@@ -394,7 +423,8 @@ def tolerant_decompose(short, long_, min_cov, min_ident, min_insert, dominance):
 
 
 def hamming_split(short, long_, min_ident=0.95, min_insert=50,
-                  window=20, max_window_mm=8, clean_junction=30):
+                  window=20, max_window_mm=8, clean_junction=30,
+                  near_junction=100, max_near_mm=1):
     """SNP-tolerant, indel-free decomposition in O(len): find the offset where
     long = short[:off] + insert + short[off:] with the fewest mismatches.
 
@@ -420,6 +450,14 @@ def hamming_split(short, long_, min_ident=0.95, min_insert=50,
       * any `window`-bp stretch holds more than `max_window_mm` mismatches
         (compensating indels leave a shifted run that does not reach the
         junction).
+      * more than `max_near_mm` mismatches lie within `near_junction` bp of
+        the junction on one side. A homopolymer or short tandem repeat next
+        to the junction hides the shift inside the clean window (a 3-bp
+        flank deletion 45 bp from the junction, followed by a 40-bp
+        homopolymer, again gave 1,503 for 1,500); the shifted bases just
+        beyond the repeat then show up as a small mismatch cluster.
+    This is a heuristic, not a proof: an indel inside a repeat longer than
+    `near_junction` is invisible to any gap-free comparison.
     A real SNP next to the junction also refuses; another empty will vote.
     Ties take the rightmost split, the same convention as decompose().
     """
@@ -443,6 +481,9 @@ def hamming_split(short, long_, min_ident=0.95, min_insert=50,
     mm = [i for i in range(off) if short[i] != long_[i]]
     mm += [i for i in range(off, n) if short[i] != long_[i + ilen]]
     if any(off - clean_junction <= i < off + clean_junction for i in mm):
+        return None
+    if (sum(1 for i in mm if off - near_junction <= i < off) > max_near_mm
+            or sum(1 for i in mm if off <= i < off + near_junction) > max_near_mm):
         return None
     for k in range(len(mm) - max_window_mm):
         if mm[k + max_window_mm] - mm[k] < window:

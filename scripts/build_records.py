@@ -169,7 +169,19 @@ def _build_one_record(packed):
     n_rejected = 0
     if dec and dec.get("rejected_assemblies"):
         rej = set(dec["rejected_assemblies"])
-        kept = [e for e in best["empty_obs"] if e.get("assembly") not in rej]
+        # Only the top-N empties are decomposed. The others were left in the
+        # evidence untested: six genomes with the same 1,500-bp flank
+        # deletion gave 5 rejected + 1 "empty" and a 1,500-bp element. An
+        # unexamined empty with the same gap as a rejected one (and unlike
+        # every accepted one) is the same deletion.
+        acc = set(dec.get("accepted_assemblies", ()))
+        rej_gaps = [e["distance"] for e in best["empty_obs"] if e.get("assembly") in rej]
+        acc_gaps = [e["distance"] for e in best["empty_obs"] if e.get("assembly") in acc]
+        near = lambda g, gs: any(abs(g - x) <= 2 for x in gs)   # noqa: E731
+        kept = [e for e in best["empty_obs"]
+                if e.get("assembly") not in rej
+                and (e.get("assembly") in acc or near(e["distance"], acc_gaps)
+                     or not near(e["distance"], rej_gaps))]
         n_rejected = len(best["empty_obs"]) - len(kept)
         best = dict(best, empty_obs=kept,
                     empty_peak=length_mode([e["distance"] for e in kept]))
@@ -276,6 +288,7 @@ def _build_one_record(packed):
             "n_empty_rejected_flank_deletion": n_rejected,
             "n_v1plus_observations": len(best["v1plus_obs"]),
             "n_ambiguous_placements": best.get("n_ambiguous", 0),
+            "n_empty_anchor_overlap": best.get("n_anchor_overlap_all_d", 0),
             "counts_are": "distinct assemblies (GCA/GCF twins collapsed)",
             "n_top_empty_kept": len(top_empty),
         },
@@ -343,6 +356,7 @@ def categorize_pairs(pairs, expected_v0, tnp_len, opts):
     tolerance; peaks are summaries of the classified sets."""
     tol = gap_tolerance(expected_v0, opts["tol_bp"], opts["tol_frac"])
     v0_obs, empty_obs, v1plus_obs = [], [], []
+    n_overlap = 0
     for p in pairs:
         cat = classify_gap(p["distance"], expected_v0, tnp_len, tol,
                            max_removed=opts.get("max_is_size") or None,
@@ -350,12 +364,22 @@ def categorize_pairs(pairs, expected_v0, tnp_len, opts):
         if cat == "v0_filled":
             v0_obs.append(p)
         elif cat == "empty":
-            empty_obs.append(p)
+            # A NEGATIVE projected gap means the two anchors overlap on the
+            # target: the element reaches into the anchors at this D. The
+            # interval between the anchors then holds only part of the
+            # element, and decomposing it against an empty junction of ""
+            # returned that part as an exact call (3,200 bp for a 3,240-bp
+            # element, consensus_support 1.0). Not usable at this D -- a
+            # larger D, whose anchors lie outside the element, is.
+            if p["distance"] < 0:
+                n_overlap += 1
+            else:
+                empty_obs.append(p)
         elif cat == "v1plus_filled":
             v1plus_obs.append(p)
     v0_peak = length_mode([p["distance"] for p in v0_obs])
     empty_peak = length_mode([p["distance"] for p in empty_obs])
-    return v0_peak, empty_peak, v0_obs, empty_obs, v1plus_obs
+    return v0_peak, empty_peak, v0_obs, empty_obs, v1plus_obs, n_overlap
 
 
 def pick_best_d(hits, ref_id, info, distances, opts):
@@ -368,11 +392,11 @@ def pick_best_d(hits, ref_id, info, distances, opts):
         pairs, expected_v0, n_amb = pair_anchors(hits, ref_id, D, info, opts)
         if not pairs:
             continue
-        v0_peak, empty_peak, v0_obs, empty_obs, v1plus_obs = categorize_pairs(
+        v0_peak, empty_peak, v0_obs, empty_obs, v1plus_obs, n_overlap = categorize_pairs(
             pairs, expected_v0, info["tnp_len"], opts)
         candidates.append({
             "D": D, "pairs": pairs, "expected_v0": expected_v0,
-            "n_ambiguous": n_amb,
+            "n_ambiguous": n_amb, "n_anchor_overlap": n_overlap,
             "v0_peak": v0_peak, "empty_peak": empty_peak,
             "v0_obs": v0_obs, "empty_obs": empty_obs, "v1plus_obs": v1plus_obs,
         })
@@ -397,6 +421,8 @@ def pick_best_d(hits, ref_id, info, distances, opts):
         best = candidates[0]
 
     best = dict(best)
+    # empties seen only with overlapping anchors, at any D (see categorize_pairs)
+    best["n_anchor_overlap_all_d"] = sum(c["n_anchor_overlap"] for c in candidates)
     best["decompose"] = None
     for c in sorted(candidates, key=lambda x: x["D"]):
         if c["D"] <= opts["decompose_max_d"] and c["empty_obs"]:
@@ -476,7 +502,8 @@ def decompose_boundary(src, info, dec, top_n, max_align_cells):
         calls.append((off5, off3, st, ln, r, eo.get("assembly", "")))
     if not votes:
         return {"ok": False, "D": D, "n_attempted": n_try,
-                "method_counts": dict(methods), "rejected_assemblies": rejected}
+                "method_counts": dict(methods), "rejected_assemblies": rejected,
+                "accepted_assemblies": []}
     # most votes; ties -> the call that keeps the whole ORF, then the shorter
     # element, then the offsets themselves (fully deterministic)
     (off5, off3), n_cons = min(
@@ -501,6 +528,7 @@ def decompose_boundary(src, info, dec, top_n, max_align_cells):
             "consensus_tied": n_tied > 1,
             "orf_clipped_5p": max(0, off5), "orf_clipped_3p": max(0, -off3),
             "rejected_assemblies": rejected,
+            "accepted_assemblies": [c[5] for c in calls],
             "method_counts": dict(methods),
             "consensus_method": r["method"], "event_class": r["event_class"],
             "empty_offset": r["offset"] + (st - r["insert_start"]),

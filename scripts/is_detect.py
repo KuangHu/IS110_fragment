@@ -240,14 +240,19 @@ def main():
     hmm_files = args.hmm.split(",")
     hmm_hits = []  # list of (hmm_name, set_of_protein_ids)
     base_names = [os.path.basename(h).replace(".hmm", "") for h in hmm_files]
+    import hashlib
     for i, hmm in enumerate(hmm_files):
         hmm_name = base_names[i]
-        # Two profiles with the same file name (/a/model.hmm, /b/model.hmm)
-        # shared one cached domtbl, so "ALL domains" checked the first profile
-        # twice. Disambiguate by position when names collide.
+        # The cached search is keyed by the profile's CONTENT and the
+        # E-value, not its file name: /a/model.hmm and /b/model.hmm shared
+        # one domtbl ("ALL domains" tested the first profile twice), a
+        # positional suffix collided with a profile really named model.1,
+        # and editing a profile in place reused the old search.
+        with open(hmm, "rb") as fh:
+            digest = hashlib.md5(fh.read()).hexdigest()[:10]
         if base_names.count(hmm_name) > 1:
-            hmm_name = f"{hmm_name}.{i + 1}"
-        domtbl = os.path.join(work_dir, f"{hmm_name}.domtbl")
+            hmm_name = f"{hmm_name}#{i + 1}"          # display name only
+        domtbl = os.path.join(work_dir, f"{base_names[i]}.{digest}.E{args.e_value:g}.domtbl")
         if not os.path.exists(domtbl):
             print(f"Step 2: hmmsearch {hmm_name} ...", file=sys.stderr)
             # write-then-rename: a killed hmmsearch must not leave a partial

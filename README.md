@@ -169,6 +169,14 @@ of the *predicted* ORF (`orf_clipped_5p/3p`; ORF start codons are often called a
 bp too far out); `event_key` is an exact element + 100-bp-context hash, so one flank
 SNP gives a new key — it is an upper bound on insertion events, not a count; circular
 contigs are not unrolled, so an IS near a plasmid's linearisation point loses flank.
+Anchor edges are projected through clipped (unaligned) anchor bases assuming that
+sequence is present in the target; if it is deleted there the gap is off by the clipped
+length (such sites normally fail decomposition and fall back). `hamming_split` is
+gap-free, so a flank indel hidden inside a repeat longer than 100 bp next to the
+junction cannot be seen (2 of 200 simulated hidden indels still passed). Interleaved
+anchor copies (up, up, down, down on one contig) are reported `ambiguous`, never paired.
+Stage markers track the command line and input modification times, not file contents or
+the code version: after changing scripts, delete `.stage_*.done` to force a rerun.
 
 Tests: `sbatch tests/run_tests.sh [WORK_DIR]` runs unit tests and a synthetic
 end-to-end run with known boundaries (both strands, a GCA/GCF twin, a SNP-divergent

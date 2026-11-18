@@ -67,6 +67,20 @@ for rid in ("IS1", "IS2"):
     check(ie["source_start"] <= src["transposase_start"] and src["transposase_end"] <= ie["source_end"],
           f"{rid}: element contains the transposase")
     check(be["n_empty_observations"] == 2, f"{rid}: 2 empty assemblies in record")
+    # the sequence itself, not just its length (an all-A string of the right
+    # length used to pass)
+    fa, name = {}, None
+    for line in open(os.path.join(run, "records", "is_elements.fa")):
+        if line.startswith(">"):
+            name = line[1:].split()[0]; fa[name] = ""
+        else:
+            fa[name] += line.strip()
+    check(fa.get(rid) == ie["sequence"], f"{rid}: JSON element sequence equals is_elements.fa")
+    check(r["transposase_cds"]["sequence"] in ie["sequence"],
+          f"{rid}: element sequence contains the transposase CDS")
+    check(ie["sequence"][-ie["end_offset_3p"] - 20:len(ie["sequence"]) - ie["end_offset_3p"]]
+          == r["transposase_cds"]["sequence"][-20:] if ie["end_offset_3p"] > 0 else True,
+          f"{rid}: 3' offset places the CDS end inside the sequence")
 
 # --- Stage 8: abutting-anchor empties are kept; twins collapsed; nested insert keyed
 obs = json.load(open(os.path.join(run, "variants", "observations.json")))
