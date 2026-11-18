@@ -153,40 +153,64 @@ def write_vcf_header(fh, contigs, species):
     fh.write("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n")
 
 
+def _twin_contig(contig):
+    """RefSeq names a GenBank contig 'NZ_<accession>'; treat the two alike.
+    (NC_ chromosomes carry an unrelated accession and are not matched.)"""
+    return contig[3:] if contig.startswith("NZ_") else contig
+
+
+def _same_target_event(a, b, slack):
+    """Do two rows' target anchors describe the same event?
+
+    a, b: lists of (contig, start, end, strand), one per anchor placement.
+    Every placement of one row must coincide (same contig, positions within
+    `slack`) with a placement of the other, and the strands must agree --
+    all equal, or all opposite when the two reference copies are in opposite
+    orientation. The outer ENVELOPE of the anchors was compared before: an
+    inversion with anchors at 10 kb and 100 kb swallowed a different one at
+    40 kb and 70 kb, although no anchor of the two coincides."""
+    def partner(h, others):
+        return [o for o in others
+                if o[0] == h[0] and o[1] - slack <= h[2] and h[1] - slack <= o[2]]
+    rel = set()
+    for x, ys in ((a, b), (b, a)):
+        for h in x:
+            ps = partner(h, ys)
+            if not ps:
+                return False
+            rel.add(frozenset("same" if h[3] == o[3] else "opp" for o in ps))
+    # one orientation relation must explain every placement
+    return any(all(k in r for r in rel) for k in ("same", "opp"))
+
+
 def group_target_events(flat, sp, slack=1000):
     """Mark records that describe the SAME event in the target genome.
 
     One row is one (category, reference element, target assembly). Copies of
     the same IS family at different reference loci can all point at one and
     the same rearranged place in the target, which then appears as several
-    confirmed events. Rows of one category and one target assembly whose
-    target anchors lie on the same contigs at overlapping positions (within
-    `slack` bp) get one `target_event` id; count events with that column.
-    Nothing is removed."""
-    parent = list(range(len(flat)))
-
-    def find(x):
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    by = defaultdict(list)
-    for i, r in enumerate(flat):
-        by[(r["category"], r["tgt_asm"], tuple(sorted(r["_anchors"])))].append(i)
-    for idx in by.values():
-        for x in range(len(idx)):
-            for y in range(x + 1, len(idx)):
-                a, b = flat[idx[x]]["_anchors"], flat[idx[y]]["_anchors"]
-                if all(a[c][0] - slack <= b[c][1] and b[c][0] - slack <= a[c][1] for c in a):
-                    parent[find(idx[x])] = find(idx[y])
-    members = defaultdict(list)
-    for i in range(len(flat)):
-        members[find(i)].append(i)
-    for n, root in enumerate(sorted(members, key=lambda r: min(members[r])), 1):
-        for i in members[root]:
+    confirmed events. Rows of one category and one target genome (GCA/GCF
+    twins are one genome) whose target anchor placements coincide pairwise
+    (_same_target_event) get one `target_event` id; count events with that
+    column. A row joins a group only if it matches the group's FIRST row, so
+    a chain of near-misses cannot merge distinct events. Nothing is removed."""
+    from lib_alleles import assembly_core
+    groups = []                                   # [(key, first hits, [row idx])]
+    order = sorted(range(len(flat)), key=lambda i: flat[i]["event_id"])
+    for i in order:
+        r = flat[i]
+        hits = [(_twin_contig(c), s0, e0, st) for c, s0, e0, st in r["_hits"]]
+        key = (r["category"], assembly_core(r["tgt_asm"]))
+        for gkey, ghits, members in groups:
+            if gkey == key and _same_target_event(hits, ghits, slack):
+                members.append(i)
+                break
+        else:
+            groups.append((key, hits, [i]))
+    for n, (_, _, members) in enumerate(groups, 1):
+        for i in members:
             flat[i]["target_event"] = f"{sp}_T{n:04d}"
-            flat[i]["n_records_same_target_event"] = len(members[root])
+            flat[i]["n_records_same_target_event"] = len(members)
 
 
 def collect_for_species(sp, args, out_root):
@@ -434,8 +458,9 @@ def collect_for_species(sp, args, out_root):
             "verdict": r["verdict"],
             "confirmed_by_software": confirmed_by_str,
             "evidence_dir": os.path.relpath(ev, sp_out),
-            "_anchors": {a["contig"]: (a["anchor_start"], a["anchor_end"])
-                         for a in anchor_records},
+            # every anchor placement with its strand (not the per-contig envelope)
+            "_hits": [h for side in ("up", "down")
+                      for h in lr.parse_details(details)[side]],
         })
 
     group_target_events(flat, sp)
