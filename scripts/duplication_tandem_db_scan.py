@@ -121,6 +121,11 @@ def main():
     # one of each GCA/GCF pair: the same contig under both accessions gave
     # two rows. NOTE this changes the assembly indices used for chunking.
     asm_list = sorted(set(representative_asm(contigs_by_asm.keys()).values()))
+    from lib_alleles import assembly_core
+    _by_core = defaultdict(list)
+    for a_ in set(contigs_by_asm) | set(is_hits):
+        _by_core[assembly_core(a_)].append(a_)
+    twins_of = {a_: [b_ for b_ in v if b_ != a_] for v in _by_core.values() for a_ in v}
     start = args.assembly_chunk_start
     end = min(args.assembly_chunk_end, len(asm_list))
     print(f"processing assemblies [{start}:{end}] of {len(asm_list)}")
@@ -169,6 +174,16 @@ def main():
                     continue
                 shutil.rmtree(work, ignore_errors=True)
                 tgt_hits = is_hits.get(asm, {}).get(local_contig, [])
+                if not tgt_hits:
+                    # is_hits.tsv keeps ONE of a GCA/GCF pair, not necessarily
+                    # the one selected here: look the contig up under the twin
+                    bare = local_contig[3:] if local_contig.startswith("NZ_") else local_contig
+                    for twin in twins_of.get(asm, ()):
+                        th = is_hits.get(twin, {})
+                        tgt_hits = (th.get(local_contig) or th.get(bare)
+                                    or th.get("NZ_" + bare) or [])
+                        if tgt_hits:
+                            break
                 # Arrays by OFFSET (detect_tandem.find_tandem_unit): unit =
                 # offset, copies = array span / unit. The old filter looked at
                 # one self-hit at a time and required a small gap between its
@@ -198,7 +213,7 @@ def main():
                     else:           verdict = "REPEAT_NO_IS"; n_no_is += 1
                     out.write(f"{asm}\t{local_contig}\t{a0}\t{a0 + unit}\t"
                               f"{a0 + unit}\t{min(a1, a0 + 2 * unit)}\t{unit}\t0\t"
-                              f"{args.min_identity:.1f}\t"
+                              f"{arr.get('identity', float('nan')):.1f}\t"
                               f"{is_left}\t{is_middle}\t{is_right}\t{n_is}\t{verdict}\t"
                               f"{n}\t{a0}\t{a1}\n")
     db.close()

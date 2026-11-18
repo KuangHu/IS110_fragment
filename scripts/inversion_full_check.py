@@ -200,6 +200,7 @@ def main():
     n_pass = 0
     n_skipped = 0
     n_assessed = 0
+    n_too_small = 0
     with open(out_path, "w") as out:
         out.write("ref_id\ttgt_asm\ttgt_flipped\tspan\t"
                   "A_ref_len\tA_tgt_len\tA_fwd_bp\tA_fwd_ident\tA_cov\tA_pass\t"
@@ -290,6 +291,11 @@ def main():
             A_ref_len = A_tgt_len = regA[1] - regA[0]
             B_ref_len = B_tgt_len = regB[1] - regB[0]
             M_ref_len = M_tgt_len = max(0, regM[1] - regM[0])
+            if M_ref_len < 1000:
+                # inverted interval too short to test once the IS copies are
+                # set aside: not assessable (it used to be written as a FAIL)
+                n_skipped += 1; n_too_small += 1
+                continue
             A_bp, B_bp = cover(want_flank, *regA), cover(want_flank, *regB)
             M_bp = cover(want_mid, *regM) if M_ref_len > 0 else 0
             A_id = B_id = M_id = max((x["ident"] for x in blocks), default=0.0)
@@ -322,7 +328,8 @@ def main():
         if fa: fa.close()
     shutil.rmtree(work_root, ignore_errors=True)
     print(f"\nDONE: {n_pass}/{n_assessed} assessed candidates pass the FULL 3-way check + "
-          f"IS-at-transitions. {n_skipped} of {len(rows)} could not be assessed (no row).")
+          f"IS-at-transitions. {n_skipped} of {len(rows)} could not be assessed (no row; "
+          f"{n_too_small} of them: inverted interval too short to test).")
     print(f"Wrote {out_path}")
 
 

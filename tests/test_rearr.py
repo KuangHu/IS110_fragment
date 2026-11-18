@@ -252,6 +252,18 @@ def test_duplication_check():
                   f"{crow['canonical_pass']}")
 
 
+def test_duplication_needs_a_gain():
+    # the reference ALREADY has the segment twice; the target is identical
+    S = B[:12000]
+    ref = A + IS + S + X[:5000] + IS + S + B[12000:]
+    row = run_dup(ref, len(A), "+", ref)
+    assert row["passes"] != "True", row
+    crow = run_dup(ref, len(A), "+", ref, canonical=True)
+    assert crow["canonical_pass"] != "True", crow
+    print("PASS duplication: a segment already repeated in the reference is not a new "
+          f"duplication ({row['passes']} / {crow['canonical_pass']})")
+
+
 def run_inv_full(ref, s0, strand, tgt):
     with tempfile.TemporaryDirectory() as wd:
         src = os.path.join(wd, "src"); os.makedirs(src)
@@ -435,5 +447,6 @@ if __name__ == "__main__":
     test_inversion_flank_check()
     test_inversion_full_check()
     test_duplication_check()
+    test_duplication_needs_a_gain()
     test_tandem_db_scan()
     test_gold_validator()

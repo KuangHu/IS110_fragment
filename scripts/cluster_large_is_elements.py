@@ -43,8 +43,10 @@ def main():
     # the "element" is a length guess split evenly around the ORF (or the ORF
     # itself): not an element whose movement can be asked about. Records
     # without a method label (older files) are all kept.
-    labelled = any((r.get("boundary_evidence") or {}).get("method")
-                   == "empty_vs_filled_decomposition" for r in recs)
+    # labelled = the file uses the method vocabulary at all (a file holding
+    # only fallback records must not be taken for an unlabelled old one)
+    VOCAB = {"empty_vs_filled_decomposition", "peak_symmetric_fallback", "no_empty_tnp_only"}
+    labelled = any((r.get("boundary_evidence") or {}).get("method") in VOCAB for r in recs)
     n_uncalled = 0
     for r in recs:
         ie = r.get("is_element", {})

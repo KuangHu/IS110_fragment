@@ -101,7 +101,7 @@ def find_tandem_unit(hits, min_repeat_len, min_identity, adjacency=0.8):
             continue
         if ts < qs:
             qs, qe, ts, te = ts, te, qs, qe
-        norm.add((ts - qs, qs, qe, ts, te))
+        norm.add((ts - qs, qs, qe, ts, te, round(ident, 2)))
     fwd = sorted(norm)
     groups = []
     for h in fwd:
@@ -148,6 +148,7 @@ def find_tandem_unit(hits, min_repeat_len, min_identity, adjacency=0.8):
             "total_span_bp": max_te - min_qs,
             "repeat_len_bp": aligned,
             "copy_spacing_bp": offset,
+            "identity": sum(h[5] * (h[2] - h[1]) for h in g) / max(1, sum(h[2] - h[1] for h in g)),
             "n_hits": len(g),
         })
 

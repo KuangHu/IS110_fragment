@@ -226,20 +226,25 @@ def main():
         for a in anchors:
             bycontig[a[0]].append(a)
         anchors_dup = []
-        for c, hs in bycontig.items():
-            positions = list({(h[1], h[2], h[3]) for h in hs})
-            # need 2+ distinct same-contig positions separated by >= min-copy-sep
-            sorted_pos = sorted(positions, key=lambda x: x[0])
-            distinct = [sorted_pos[0]]
-            for p in sorted_pos[1:]:
-                if abs(p[0] - distinct[-1][0]) >= args.min_copy_sep:
-                    distinct.append(p)
-            if len(distinct) >= 2:
-                for s, e, strand in distinct:
-                    anchors_dup.append((c, s, e, strand))
-        if len(anchors_dup) < 2:
-            continue
-        r["_anchors"] = anchors_dup
+        for c, hs in sorted(bycontig.items()):
+            # thin positions PER STRAND and with a total order. A set sorted
+            # by start alone kept an arbitrary strand when an anchor hit both
+            # strands at one position, so the verdict changed with
+            # PYTHONHASHSEED (True / False / NA for the same input).
+            for st in "+-":
+                sorted_pos = sorted({(h[1], h[2]) for h in hs if h[3] == st})
+                if not sorted_pos:
+                    continue
+                distinct = [sorted_pos[0]]
+                for p in sorted_pos[1:]:
+                    if abs(p[0] - distinct[-1][0]) >= args.min_copy_sep:
+                        distinct.append(p)
+                if len(distinct) >= 2:
+                    for s, e in distinct:
+                        anchors_dup.append((c, s, e, st))
+        # no two same-strand hits far enough apart: kept, and written below
+        # as a not-assessable row (it used to vanish from the output)
+        r["_anchors"] = anchors_dup if len(anchors_dup) >= 2 else []
         r["_best_side"] = side
         rows.append(r)
     if args.sample > 0 and len(rows) > args.sample:
@@ -293,6 +298,20 @@ def main():
             if len(mid_seq) < args.min_block_bp:
                 skip(ref_id, tgt_asm, side, "reference flank too short (contig end)"); continue
 
+            # How many copies of this flank does the REFERENCE itself have
+            # near the element? The target must have MORE: a genome that
+            # already carries the segment twice (A-E-D-X-E-D-B, unchanged in
+            # the target) passed as a new duplication.
+            work0 = tempfile.mkdtemp(prefix="dupref_", dir=work_root)
+            clen_r = ref_fa.get_reference_length(ref_contig)
+            r_lo = max(0, is_s0 - args.middle_window - args.tgt_context)
+            r_hi = min(clen_r, is_e + args.middle_window + args.tgt_context)
+            ref_win = ref_fa.fetch(ref_contig, r_lo, r_hi).upper()
+            ref_copies = max(
+                lr.copy_depth([b for b in lr.align(mid_seq, ref_win, work0, args.threads)],
+                              args.min_block_bp, args.min_identity, strand=st_)[1]
+                for st_ in "+-")
+            shutil.rmtree(work0, ignore_errors=True)
             target_is_idx = is_hits.get(tgt_asm, {})
             # Evaluate ONE contig and ONE strand at a time. Positions on
             # different contigs were pooled: the 'separation' was a difference
@@ -333,9 +352,11 @@ def main():
                         "dup_bp": dup_bp, "copies": copies,
                         "best_bp": max((p["qe"] - p["qs"] for p in places), default=0),
                         "best_id": max((p["ident"] for p in places), default=0.0)}
+                cand["ref_copies"] = ref_copies
                 cand["passes"] = (len(flanked) >= args.min_flanked
                                   and sep >= args.min_copy_sep
                                   and copies >= args.min_fwd_blocks
+                                  and copies > ref_copies          # a GAIN
                                   and dup_bp >= args.min_block_bp)
                 if best is None or (cand["passes"], cand["dup_bp"]) > (best["passes"], best["dup_bp"]):
                     best = cand

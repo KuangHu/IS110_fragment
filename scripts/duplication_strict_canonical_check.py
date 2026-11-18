@@ -279,9 +279,32 @@ def main():
                 lo, hi = x["te"] + toff - args.is_tol, y["ts"] + toff + args.is_tol
                 if any(h[0] >= lo and h[1] <= hi for h in hits):
                     n_is_between += 1
+            # ... and an IS copy at EACH outer end of the array (IS-D-IS-D-IS).
+            # With only the IS between the copies (A-D-E-D-B) this passed.
+            outer = False
+            if len(pl) >= 2:
+                # the flank is only the first --flank bp of the duplicated
+                # unit, so the far end of the array is one unit beyond the
+                # last copy of the flank
+                unit = sorted(y["ts"] - x["ts"] for x, y in zip(pl, pl[1:]))[(len(pl) - 1) // 2]
+                lo_edge, hi_edge = pl[0]["ts"] + toff, pl[-1]["te"] + toff
+                outer = (any(lo_edge - unit - args.is_tol <= h[0] and h[1] <= lo_edge + args.is_tol
+                             for h in hits)
+                         and any(hi_edge - args.is_tol <= h[0]
+                                 and h[1] <= hi_edge + unit + args.is_tol for h in hits))
+            # copies of the duplicated flank in the reference itself
+            workr = tempfile.mkdtemp(prefix="dr_", dir=work_root)
+            clen_r = ref_fa.get_reference_length(ref_contig)
+            ref_win = ref_fa.fetch(ref_contig, max(0, is_s0 - args.flank - 30000),
+                                   min(clen_r, is_e + args.flank + 30000)).upper()
+            dseq = A_seq if dup == "A" else B_seq
+            ref_copies = max(lr.copy_depth(lr.align(dseq, ref_win, workr, args.threads), 1000,
+                                           args.min_identity, strand=x)[1] for x in "+-")
+            shutil.rmtree(workr, ignore_errors=True)
             A_pass = res["A"]["cov"] >= args.min_flank_cov
             B_pass = res["B"]["cov"] >= args.min_flank_cov
-            canonical_pass = (res[dup]["copies"] >= 2
+            canonical_pass = (outer and res[dup]["copies"] > ref_copies
+                              and res[dup]["copies"] >= 2
                               and res[dup]["dup_bp"] >= args.min_dna_cov * min(res[dup]["len"], 5000)
                               and n_is_between >= 1
                               and res[other]["cov"] >= args.min_flank_cov)

@@ -105,6 +105,11 @@ def main():
         # 1. Read input FASTA
         print(f"Reading {args.in_fa} ...", file=sys.stderr, flush=True)
         seqs = list(read_fasta(args.in_fa))
+        ids = [h for h, _ in seqs]
+        if len(set(ids)) != len(ids):
+            dup = sorted({h for h in ids if ids.count(h) > 1})[:5]
+            sys.exit(f"ERROR: duplicate sequence IDs in {args.in_fa} (e.g. {dup}); a "
+                     f"later record would replace an earlier one under the same name")
         print(f"  {len(seqs):,} sequences", file=sys.stderr)
 
         # 2. Predict ORFs
@@ -187,7 +192,8 @@ def main():
             fout.write("is_id\tis_length\ttnp_orf_num\ttnp_start\ttnp_end\ttnp_strand\ttnp_len\tdomains_hit\tn_orfs\n")
             for is_id in sorted(passing_is):
                 info = passing_is[is_id]
-                n_orfs = len(is_domains[is_id])
+                # all predicted ORFs of this sequence, not only those with a hit
+                n_orfs = sum(1 for v in orf_info.values() if v[0] == is_id)
                 doms = ",".join(sorted(info["doms"]))
                 fout.write(f"{is_id}\t{len(seq_by_id[is_id])}\t"
                            f"{info['orf_num']}\t{info['start']}\t{info['end']}\t"

@@ -217,7 +217,7 @@ def main():
                       f"{r['ref_is_b_start']}\t{r['segment_bp']}\t"
                       f"{r['tgt_asm']}\t{r['B_cov']}\t{r['B_ident']}\t"
                       f"{r['tgt_contig']}\t{r['tgt_pos']}\t"
-                      f"{Apos}\t{Bpos}\t{dist}\t{fc['expected_with_DNA']}\t"
+                      f"{Apos}\t{Bpos}\t{dist}\t{fc['expected_with_DNA'] if fc else 'NA'}\t"
                       f"{mechanism}\n")
 
     ref_fa.close()

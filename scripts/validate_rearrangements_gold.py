@@ -330,7 +330,11 @@ def main():
                     rec["verdict"] = "REF_REGION_FAIL"; results.append(rec); continue
             ref_off = max(0, rs - W)                 # region offset in the contig
             det = lr.parse_details(details)
-            if not det["up"] or not det["down"]:
+            # Stage 7 writes only the duplicated side for a duplication
+            # (up=[] down=[a;b]); requiring both sides sent every real
+            # duplication row to NO_ANCHOR_PAIR
+            if (cat == "duplication" and not (det["up"] or det["down"])) or \
+               (cat != "duplication" and not (det["up"] and det["down"])):
                 rec["verdict"] = "NO_ANCHOR_PAIR"; results.append(rec); continue
             # Is each target contig stored in the same orientation as the
             # reference? Anchors are in transposase orientation, so a collinear
@@ -410,9 +414,14 @@ def main():
                     for c_, (s_, e_) in seen_c.items())
                 dup_bp = duplicated_ref_bp(ref_seq, tgt_seq, (rs - ref_off, re_ - ref_off),
                                            work, args.threads)
-                rec["mauve_metric"] = f"dup_bp_outside_IS:{dup_bp}"
+                # the same measure of the reference against ITSELF: sequence
+                # already repeated in the reference is not a new duplication
+                self_bp = duplicated_ref_bp(ref_seq, ref_seq, (rs - ref_off, re_ - ref_off),
+                                            work, args.threads)
+                gain = dup_bp - self_bp
+                rec["mauve_metric"] = f"dup_bp_outside_IS:{dup_bp}|already_in_ref:{self_bp}"
                 rec["mauve"] = "n/a"
-                second_ok = dup_bp >= args.min_dup_bp
+                second_ok = gain >= args.min_dup_bp
             elif cat == "translocation_only":
                 # bilateral flank test (see is_translocation_check.py)
                 pair = next(((u, w) for u in det["up"] for w in det["down"] if u[0] != w[0]), None)
@@ -434,8 +443,26 @@ def main():
             # translocations across 2 contigs are unresolvable when an anchor sits
             # within --bp-window of a contig end (= contig-break artifact, not a
             # confirmable rearrangement in a draft target)
+            # ... and the contig must also run PAST THE ELEMENT on the
+            # element's side of the anchor (anchor 1 kb + element + window).
+            # One genome split in the middle of a 16-kb element (A-E[:8k] /
+            # E[8k:]-B) had deep anchors and was a confirmed translocation.
+            through = True
+            if cat == "translocation_only":
+                need = 1000 + (re_ - rs) + args.bp_window
+                for side, toward_plus in (("up", True), ("down", False)):
+                    for c_, s_, e_, st_ in det[side][:1]:
+                        try:
+                            clen_ = qry_fo.get_reference_length(c_)
+                        except (KeyError, ValueError):
+                            continue
+                        # the element lies downstream of the up anchor and
+                        # upstream of the down anchor, in ANCHOR orientation
+                        room = (clen_ - e_) if (st_ == "+") == toward_plus else s_
+                        through = through and room >= need
             artifact = (cat == "translocation_only" and rec["n_target_contigs"] >= 2
-                        and 0 <= rec.get("min_anchor_end_dist", -1) < args.bp_window)
+                        and (0 <= rec.get("min_anchor_end_dist", -1) < args.bp_window
+                             or not through))
             if artifact:
                 rec["verdict"] = "UNRESOLVABLE_CONTIG_BREAK"
             elif rec["mauve"] == "FAILED":

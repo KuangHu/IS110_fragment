@@ -101,10 +101,24 @@ def main():
     # intervals: a copy reported as two blocks failed the per-block 0.5 / 0.9
     # thresholds. (The thresholds above were applied per block; blocks are
     # re-evaluated here per placement.)
-    by_place = {}
+    by_contig = {}
     for h in all_blocks:
-        by_place.setdefault((h["source_species"], h["ref_id"], h["target_species"],
-                             h["target_assembly"], h["target_contig"], h["strand"]), []).append(h)
+        by_contig.setdefault((h["source_species"], h["ref_id"], h["target_species"],
+                              h["target_assembly"], h["target_contig"], h["strand"]), []).append(h)
+    # one PLACEMENT = blocks close together on the target (within the query
+    # length of each other). Grouping by contig alone merged two 45% fragments
+    # 890 kb apart into one "90% coverage, strict" copy.
+    by_place = {}
+    for key, bl in by_contig.items():
+        bl.sort(key=lambda b: b["ts"])
+        grp, reach = [bl[0]], bl[0]["te"]
+        for b in bl[1:]:
+            if b["ts"] - reach <= b["query_bp"]:
+                grp.append(b); reach = max(reach, b["te"])
+            else:
+                by_place[key + (grp[0]["ts"],)] = grp
+                grp, reach = [b], b["te"]
+        by_place[key + (grp[0]["ts"],)] = grp
     hits = []
     for key, bl in sorted(by_place.items()):
         iv = sorted((b["qs"], b["qe"]) for b in bl)

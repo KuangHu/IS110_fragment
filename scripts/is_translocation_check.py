@@ -158,6 +158,15 @@ def main():
                 skip(ref_id, tgt_asm, "target contig not in FASTA"); continue
             if min(len(A_seq), len(B_seq)) < 1000:
                 skip(ref_id, tgt_asm, "reference flank < 1 kb (contig end)"); continue
+            # each target contig must continue past the element on the
+            # element's side of its anchor; otherwise this is a contig break
+            # inside or next to the element, not a translocation
+            need = 1000 + (is_e - is_s0) + 5000
+            room_u = (tgt_fa.get_reference_length(up_c) - up_e) if up_st == "+" else up_s
+            room_d = dn_s if dn_st == "+" else (tgt_fa.get_reference_length(dn_c) - dn_e)
+            if min(room_u, room_d) < need:
+                skip(ref_id, tgt_asm, "contig ends within the element region (assembly break)")
+                continue
 
             work = tempfile.mkdtemp(prefix="tr_", dir=work_root)
             # the flank must lie on the SAME target strand as its anchor hit;
