@@ -6,9 +6,13 @@ has >= --min-identity AND aligns >= --min-cov % of the fragment (a 300-bp
 shared segment of a 2-kb fragment used to count like a full copy), and if it
 is not the fragment's own locus (query names are <contig>__<start>_<end>).
 
-What this table is NOT: the searches run with `minimap2 -N 5`, so a count
-stops at 6 per organism (shown as "6+"); and "also present in organism X" is
-presence, not origin. Organisms that tie for the best identity are all named.
+What this table is NOT: the searches run with `minimap2 -N 5`, so at most 6
+rows per fragment and organism exist. Whether that limit was reached is
+decided on the RAW rows, before the identity / coverage / own-locus filters:
+a count followed by "+" is a lower bound (self + 5 other copies used to be
+shown as an exact "5" although 20 copies existed). And "also present in
+organism X" is presence, not origin. Organisms that tie for the best identity
+are all named.
 
 Usage: fragment_origin_summary.py <query.fasta> <out.tsv> <org>=<paf> [<org>=<paf> ...]
 """
@@ -20,7 +24,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from paf_utils import aligned_identity, aligned_query_bases  # noqa: E402
 
-CAP = 6     # primary + 5 secondaries
+CAP = 6     # primary + 5 secondaries (default of --cap)
 
 
 def main():
@@ -31,10 +35,14 @@ def main():
     p.add_argument("pafs", nargs="+", help="org=path")
     p.add_argument("--min-identity", type=float, default=90)
     p.add_argument("--min-cov", type=float, default=80)
+    p.add_argument("--cap", type=int, default=CAP,
+                   help="rows per fragment and organism at which the search was "
+                        "cut off: minimap2 -N plus one (default: 6)")
     a = p.parse_args()
 
     queries = [l[1:].split()[0] for l in open(a.query_fasta) if l.startswith(">")]
     orgs, counts, best = [], {q: {} for q in queries}, {q: {} for q in queries}
+    raw = {q: {} for q in queries}          # rows before any filter
     for spec in a.pafs:
         org, path = spec.split("=", 1)
         orgs.append(org)
@@ -50,6 +58,7 @@ def main():
                 c = line.rstrip("\n").split("\t")
                 if len(c) < 12 or c[0] not in counts:
                     continue
+                raw[c[0]][org] = raw[c[0]].get(org, 0) + 1
                 ident = aligned_identity(c)
                 if ident < a.min_identity:
                     continue
@@ -63,8 +72,9 @@ def main():
                 counts[c[0]][org] += 1
                 best[c[0]][org] = max(best[c[0]].get(org, 0.0), ident)
 
-    def show(n):
-        return "NA" if n is None else (f"{CAP}+" if n >= CAP else str(n))
+    def show(q, o):
+        n = counts[q][o]
+        return "NA" if n is None else str(n) + ("+" if raw[q].get(o, 0) >= a.cap else "")
     with open(a.out_tsv, "w") as out:
         out.write("query\t" + "\t".join(f"{o}_hits" for o in orgs)
                   + "\tbest_match_organism\tbest_identity\ttotal_hits\n")
@@ -74,15 +84,16 @@ def main():
             # ties are all named (the first organism read used to win)
             best_org = ",".join(o for o in orgs if o in b and abs(b[o] - top) < 0.05) or "none"
             total = sum(n for n in counts[q].values() if n)
-            capped = any(n is not None and n >= CAP for n in counts[q].values())
-            out.write(q + "\t" + "\t".join(show(counts[q][o]) for o in orgs)
+            capped = any(n >= a.cap for n in raw[q].values())
+            out.write(q + "\t" + "\t".join(show(q, o) for o in orgs)
                       + f"\t{best_org}\t{top:.1f}\t{total}{'+' if capped else ''}\n")
     n_hit = sum(1 for q in queries if best[q])
     print(f"Summary written: {a.out_tsv}")
     print(f"  {len(queries)} fragments; {n_hit} with a hit outside their own locus "
           f"(identity >= {a.min_identity:g}%, >= {a.min_cov:g}% of the fragment aligned); "
           f"{len(queries) - n_hit} without")
-    print(f"  counts stop at {CAP} per organism (minimap2 -N 5)")
+    print(f"  'N+' = the search returned {a.cap} or more rows for that fragment and organism "
+          "(minimap2 -N reached): N is a lower bound")
 
 
 if __name__ == "__main__":

@@ -100,13 +100,12 @@ def main():
     print(f"Accessions to process: {len(by_accession):,}")
 
     written = 0
-    seen_loci = {}
     n_dup = 0
     failed_files = 0
     failed_contigs = 0
 
     with open(args.output_fasta, "w") as out:
-        for i, (acc, frags) in enumerate(by_accession.items()):
+        for i, (acc, frags) in enumerate(sorted(by_accession.items())):
             if i % 500 == 0:
                 print(f"  Progress: {i}/{len(by_accession)} accessions, {written} fragments written",
                       flush=True)
@@ -142,30 +141,37 @@ def main():
             if current_name in wanted and current_seq:
                 contigs[current_name] = "".join(current_seq)
 
+            # clamp (a padded interval can run past the contig end); the
+            # stored coordinates are the clamped ones (the header said
+            # __1000_3600 for 2000 bases of a 3000-bp contig)
+            usable = []
             for f in frags:
                 seq = contigs.get(f["target"])
                 if seq is None:
                     failed_contigs += 1
                     continue
-                # clamp (a padded interval can run past the contig end) and
-                # write each locus ONCE: the same insert was written once per
-                # reference IS that matched it, which inflated cluster sizes
-                # the stored coordinates are the clamped ones (the header said
-                # __1000_3600 for 2000 bases of a 3000-bp contig)
                 f["ins_start"] = max(0, f["ins_start"])
                 f["ins_end"] = min(len(seq), f["ins_end"])
-                frag = seq[f["ins_start"]:f["ins_end"]]
-                if len(frag) < args.min_len:
-                    continue
-                # same locus = both ends within LOCUS_TOL bp of a locus already
-                # written (floor bins split 1019 / 1020 into two "loci")
-                near = seen_loci.setdefault(f["target"], [])
+                if f["ins_end"] - f["ins_start"] >= args.min_len:
+                    usable.append(f)
+            # write each locus ONCE (the same insert was listed once per
+            # reference IS that matched it). Loci are resolved BEFORE writing,
+            # in coordinate order and with the rule of
+            # detect_is110_variants.deduplicate: an interval belongs to the
+            # first locus whose first interval has both ends within LOCUS_TOL.
+            # Comparing with what had been written so far made the result
+            # depend on the order of the table (offsets 0, 20, 21 gave two
+            # fragments, 20, 0, 21 gave one).
+            usable.sort(key=lambda f: (f["target"], f["ins_start"], f["ins_end"], f["query"]))
+            loci = defaultdict(list)
+            for f in usable:
+                near = loci[f["target"]]
                 if any(abs(a - f["ins_start"]) <= LOCUS_TOL and abs(b - f["ins_end"]) <= LOCUS_TOL
                        for a, b in near):
                     n_dup += 1
                     continue
                 near.append((f["ins_start"], f["ins_end"]))
-
+                frag = contigs[f["target"]][f["ins_start"]:f["ins_end"]]
                 hdr = (f">{f['target']}__{f['ins_start']}_{f['ins_end']}"
                        f" query={f['query']}"
                        f" len={len(frag)}")

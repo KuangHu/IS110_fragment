@@ -281,9 +281,59 @@ def test_ref_core_and_origin():
         rows = {r["query"]: r for r in csv.DictReader(open(o2), delimiter="\t")}
         r = rows["c1__100_2100"]
         check("origin summary: capped count, short hit and own locus not counted, no-hit row kept",
-              r["ecoli_hits"] == "6+" and r["kp_hits"] == "0" and r["gone_hits"] == "NA"
+              r["ecoli_hits"] == "20+" and r["kp_hits"] == "0" and r["gone_hits"] == "NA"
               and r["best_match_organism"] == "ecoli" and rows["lonely__0_500"]["best_match_organism"] == "none",
               str(rows))
+
+def test_final_review_tables():
+    import csv
+    with tempfile.TemporaryDirectory() as d:
+        # 11. identity over the core, not over the row
+        refs = os.path.join(d, "r.fa")
+        open(refs, "w").write(">lowcore core=2000-3200\n" + "A" * 5200 + "\n>goodcore core=2000-3200\n" + "A" * 5200 + "\n")
+        paf = os.path.join(d, "r.paf")
+        open(paf, "w").write("\n".join([
+            row("lowcore", 5200, 0, 5200, "+", "t", 90000, 0, 5200, "2000=180X3020="),
+            row("goodcore", 5200, 0, 5200, "+", "t", 90000, 9000, 14200, "1800=180X3220=")]) + "\n")
+        out = os.path.join(d, "o.tsv")
+        run("ref_core_coverage.py", paf, refs, out)
+        st = {r["reference"]: (r["status"], r["best_core_identity"]) for r in csv.DictReader(open(out), delimiter="\t")}
+        check("a core at 85% identity inside a 96.5% row is not core_detected",
+              st == {"lowcore": ("core_low_identity", "NA"), "goodcore": ("core_detected", "100.0")}, str(st))
+        # 15. cap decided on raw rows
+        q = os.path.join(d, "q.fa")
+        open(q, "w").write(">c1__100_2100\nA\n")
+        rows = [row("c1__100_2100", 2000, 0, 2000, "+", "c1", 9000, 100, 2100, "2000=")]
+        rows += [row("c1__100_2100", 2000, 0, 2000, "+", f"x{i}", 9000, 0, 2000, "1980=20X") for i in range(5)]
+        p1, p2 = os.path.join(d, "a.paf"), os.path.join(d, "b.paf")
+        open(p1, "w").write("\n".join(rows) + "\n")
+        open(p2, "w").write("\n".join(rows[:4]) + "\n")
+        o2 = os.path.join(d, "s.tsv")
+        run("fragment_origin_summary.py", q, o2, f"capped={p1}", f"open={p2}")
+        r = next(csv.DictReader(open(o2), delimiter="\t"))
+        check("self + 5 external rows at -N 5 is '5+', 4 rows is an exact 3",
+              (r["capped_hits"], r["open_hits"], r["total_hits"]) == ("5+", "3", "8+"), str(r))
+        # 14. extractor dedup does not depend on the order of the table
+        rnd = random.Random(3)
+        logan = os.path.join(d, "logan"); os.mkdir(logan)
+        fa = os.path.join(d, "S1.contigs.fa")
+        open(fa, "w").write(">S1_1\n" + "".join(rnd.choice("ACGT") for _ in range(5000)) + "\n")
+        subprocess.run(["zstd", "-q", fa, "-o", os.path.join(logan, "S1.contigs.fa.zst")], check=True)
+        hdr = ("type query qlen target_contig tlen part1_qs part1_qe part1_ts part1_te part1_strand part1_ident "
+               "part2_qs part2_qe part2_ts part2_te part2_strand part2_ident target_gap query_gap cds_coverage").split()
+        def n_frag(offsets):
+            t = os.path.join(d, "ins.tsv")
+            with open(t, "w") as f:
+                f.write("\t".join(hdr) + "\n")
+                for k, off in enumerate(offsets):
+                    f.write("\t".join(map(str, ["insertion", f"q{k}", 2000, "S1_1", 5000, 0, 1000, 0, 1000 + off, "+", 100,
+                                                1000, 2000, 2000 + off, 3000, "+", 100, 1000, 0, 100])) + "\n")
+            o = os.path.join(d, "f.fa")
+            run("extract_insertion_fragments.py", t, logan, o)
+            return sorted(l.split()[0] for l in open(o) if l.startswith(">"))
+        res = [n_frag(o) for o in ((0, 20, 21), (20, 0, 21), (21, 20, 0))]
+        check("extractor: offsets 0/20/21 give the same two loci in any order",
+              res[0] == res[1] == res[2] == [">S1_1__1000_2000", ">S1_1__1021_2021"], str(res))
 
 def test_stage_lib():
     with tempfile.TemporaryDirectory() as d:
@@ -333,7 +383,7 @@ def test_minimap2_round_trip():
                     ("two", "insertion"), ("two", "insertion")]
             check(f"minimap2 {preset} round trip: events on the right contigs only", got == want, str(got))
 
-for t in (test_identity, test_eqx_is_required, test_output_independent_of_hash_seed, test_detector, test_final_review_detector, test_multisplit, test_lineage, test_ref_core_and_origin, test_stage_lib,
+for t in (test_identity, test_eqx_is_required, test_output_independent_of_hash_seed, test_detector, test_final_review_detector, test_multisplit, test_lineage, test_ref_core_and_origin, test_final_review_tables, test_stage_lib,
           test_minimap2_round_trip):
 
 
