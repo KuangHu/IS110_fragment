@@ -17,9 +17,13 @@ For each contig in the species DB (independent of HMM IS detection):
        - CANDIDATE           : 1/3
        - REPEAT_NO_IS        : 0/3 (tandem repeat with no detected IS boundary)
 """
-import argparse, csv, os, re, shutil, subprocess, tempfile
+import argparse, csv, os, re, shutil, subprocess, tempfile, sys
 from collections import defaultdict
 import pysam
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from detect_tandem import find_tandem_unit  # noqa: E402
+from lib_alleles import representative_asm  # noqa: E402
 
 
 def parse_args():
@@ -114,7 +118,9 @@ def main():
         if "|" not in name: continue
         asm, _ = name.split("|", 1)
         contigs_by_asm[asm].append(name)
-    asm_list = sorted(contigs_by_asm.keys())
+    # one of each GCA/GCF pair: the same contig under both accessions gave
+    # two rows. NOTE this changes the assembly indices used for chunking.
+    asm_list = sorted(set(representative_asm(contigs_by_asm.keys()).values()))
     start = args.assembly_chunk_start
     end = min(args.assembly_chunk_end, len(asm_list))
     print(f"processing assemblies [{start}:{end}] of {len(asm_list)}")
@@ -127,10 +133,12 @@ def main():
     n_likely   = 0  # 2/3
     n_candidate = 0  # 1/3
     n_no_is = 0
+    n_align_failed = 0
 
     with open(out_path, "w") as out:
         out.write("assembly\tcontig\tqs\tqe\tts\tte\tcopy_bp\tgap_bp\t"
-                  "identity\tIS_left\tIS_middle\tIS_right\tn_is\tverdict\n")
+                  "identity\tIS_left\tIS_middle\tIS_right\tn_is\tverdict\t"
+                  "n_copies\tarray_start\tarray_end\n")
         for ai in range(start, end):
             asm = asm_list[ai]
             if ai % 200 == 0 and ai > start:
@@ -153,46 +161,46 @@ def main():
                 write_fasta(local_contig, seq, cfp)
                 try:
                     blocks = self_align(cfp, work, args.threads)
-                except Exception:
+                except subprocess.CalledProcessError:
+                    # counted, and the run fails at the end: a table from a
+                    # run where minimap2 kept failing read as "no tandems"
+                    n_align_failed += 1
                     shutil.rmtree(work, ignore_errors=True)
                     continue
                 shutil.rmtree(work, ignore_errors=True)
-                # Filter for tandem signature
                 tgt_hits = is_hits.get(asm, {}).get(local_contig, [])
-                seen = set()
-                for b in blocks:
-                    if b["strand"] != "+": continue
-                    if not (b["qs"] < b["ts"]): continue   # canonical order
-                    gap = b["ts"] - b["qe"]
-                    # gap >= 0   : two copies separated by IS_size of intervening sequence
-                    # gap <  0   : alignment extends through the central IS into both copies,
-                    #              creating apparent overlap; this is the canonical signature
-                    #              when the three ISes are highly similar to each other.
-                    if gap > args.adjacency: continue
-                    if gap < -args.max_overlap: continue
-                    cb = b["qe"] - b["qs"]
-                    if cb < args.min_dna_bp or cb > args.max_dna_bp: continue
-                    ident = b["matches"] / b["block"] * 100 if b["block"] > 0 else 0
-                    if ident < args.min_identity: continue
-                    # Dedup: minimap2 may emit overlapping reciprocal blocks
-                    key = (b["qs"], b["qe"], b["ts"], b["te"])
-                    rev_key = (b["ts"], b["te"], b["qs"], b["qe"])
-                    if key in seen or rev_key in seen: continue
-                    seen.add(key)
+                # Arrays by OFFSET (detect_tandem.find_tandem_unit): unit =
+                # offset, copies = array span / unit. The old filter looked at
+                # one self-hit at a time and required a small gap between its
+                # two halves: for 3 copies the hit overlaps itself by a whole
+                # unit (dropped), for 4 the surviving hit covered two units
+                # (reported as one copy twice as long), and two copies with
+                # 4 kb of unrelated sequence between them were "canonical".
+                hits = [(b["qs"], b["qe"], b["ts"], b["te"], b["strand"],
+                         b["matches"] / b["block"] * 100 if b["block"] else 0.0) for b in blocks]
+                for arr in find_tandem_unit(hits, args.min_dna_bp, args.min_identity):
+                    if arr["repeat_class"] != "tandem":
+                        continue
+                    unit = arr["repeat_unit_bp"]
+                    if unit < args.min_dna_bp or unit > args.max_dna_bp + 5000:
+                        continue
                     n_repeat_found += 1
-                    # IS-flanking check (cross-reference)
-                    middle_pos = (b["qe"] + b["ts"]) // 2
-                    is_left   = is_within(tgt_hits, b["qs"], args.is_tol)
-                    is_middle = is_within(tgt_hits, middle_pos, args.is_tol)
-                    is_right  = is_within(tgt_hits, b["te"], args.is_tol)
+                    a0, a1, n = arr["span_start"], arr["span_end"], arr["n_copies"]
+                    is_left = is_within(tgt_hits, a0, args.is_tol)
+                    is_right = is_within(tgt_hits, a1, args.is_tol)
+                    # an IS at EVERY internal copy boundary
+                    is_middle = all(is_within(tgt_hits, a0 + k * unit, args.is_tol)
+                                    for k in range(1, n))
                     n_is = int(is_left) + int(is_middle) + int(is_right)
                     if   n_is == 3: verdict = "VERIFIED_CANONICAL"; n_verified += 1
                     elif n_is == 2: verdict = "LIKELY_CANONICAL"; n_likely += 1
                     elif n_is == 1: verdict = "CANDIDATE"; n_candidate += 1
                     else:           verdict = "REPEAT_NO_IS"; n_no_is += 1
-                    out.write(f"{asm}\t{local_contig}\t{b['qs']}\t{b['qe']}\t"
-                              f"{b['ts']}\t{b['te']}\t{cb}\t{gap}\t{ident:.1f}\t"
-                              f"{is_left}\t{is_middle}\t{is_right}\t{n_is}\t{verdict}\n")
+                    out.write(f"{asm}\t{local_contig}\t{a0}\t{a0 + unit}\t"
+                              f"{a0 + unit}\t{min(a1, a0 + 2 * unit)}\t{unit}\t0\t"
+                              f"{args.min_identity:.1f}\t"
+                              f"{is_left}\t{is_middle}\t{is_right}\t{n_is}\t{verdict}\t"
+                              f"{n}\t{a0}\t{a1}\n")
     db.close()
     shutil.rmtree(work_root, ignore_errors=True)
     print(f"\nDONE.")
@@ -203,6 +211,9 @@ def main():
     print(f"  CANDIDATE         (1/3):  {n_candidate}")
     print(f"  REPEAT_NO_IS      (0/3):  {n_no_is}")
     print(f"Wrote {out_path}")
+    if n_align_failed:
+        sys.exit(f"ERROR: self-alignment failed for {n_align_failed} contigs; "
+                 f"the table is incomplete")
 
 
 if __name__ == "__main__":

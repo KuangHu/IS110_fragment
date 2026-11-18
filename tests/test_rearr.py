@@ -311,6 +311,39 @@ def test_inversion_full_check():
     print(f"PASS full inversion check: partial 3 kb inversion -> {row['all_pass']}")
 
 
+def test_tandem_db_scan():
+    S = B[:12000]
+    genomes = {"GCA_000000021.1": A + (IS + S) * 2 + IS + C,       # 2 copies
+               "GCA_000000022.1": A + (IS + S) * 3 + IS + C,       # 3 (was: no row)
+               "GCA_000000023.1": A + (IS + S) * 4 + IS + C,       # 4 (was: unit doubled)
+               "GCF_000000023.1": A + (IS + S) * 4 + IS + C,       # twin of the above
+               "GCA_000000024.1": A + IS + S + IS + X[:4000] + S + IS + C,  # not adjacent
+               "GCA_000000025.1": A + IS + S + IS + C}             # no duplication
+    with tempfile.TemporaryDirectory() as wd:
+        db = os.path.join(wd, "db.fa"); ih = os.path.join(wd, "is_hits.tsv")
+        with open(db, "w") as f, open(ih, "w") as g:
+            g.write("is_id\tassembly\tcontig\ttnp_start\ttnp_end\ttnp_strand\n")
+            for asm, sq in genomes.items():
+                f.write(f">{asm}|c1\n{sq}\n")
+                for k, (a_, b_, st) in enumerate(is_positions(sq)):
+                    g.write(f"{asm}_{k}\t{asm}\t{asm}|c1\t{a_}\t{b_}\t{st}\n")
+        subprocess.run(["samtools", "faidx", db], check=True)
+        out = os.path.join(wd, "out")
+        subprocess.run([sys.executable, os.path.join(SCRIPTS, "duplication_tandem_db_scan.py"),
+                        "--species-db", db, "--is-hits", ih, "--out", out, "--threads", "2"],
+                       check=True, stdout=subprocess.DEVNULL)
+        f = [x for x in os.listdir(out) if x.endswith(".tsv")][0]
+        rows = list(csv.DictReader(open(os.path.join(out, f)), delimiter="\t"))
+    got = {(r_["assembly"][4:], int(r_["n_copies"]), r_["verdict"]) for r_ in rows}
+    cores = sorted(r_["assembly"][4:] for r_ in rows)
+    assert cores == ["000000021.1", "000000022.1", "000000023.1"], rows
+    for core, n in (("000000021.1", 2), ("000000022.1", 3), ("000000023.1", 4)):
+        assert (core, n, "VERIFIED_CANONICAL") in got, (core, n, got)
+    assert all(abs(int(r_["copy_bp"]) - 13500) <= 20 for r_ in rows), rows
+    print("PASS tandem DB scan: 2/3/4-copy arrays exact, twin collapsed, "
+          "separated copies and single copy not reported")
+
+
 MAUVE = os.path.expanduser("~/.conda/envs/mauve-env/bin/progressiveMauve")
 
 
@@ -402,4 +435,5 @@ if __name__ == "__main__":
     test_inversion_flank_check()
     test_inversion_full_check()
     test_duplication_check()
+    test_tandem_db_scan()
     test_gold_validator()
