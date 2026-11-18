@@ -243,13 +243,65 @@ def test_lineage():
     check("unrelated insertions give no edge", fl.nesting_parent([B, C], [[A]]) is None)
     check("same cluster elsewhere in the IS gives no edge", fl.nesting_parent([(0, 1500), B], [[A]]) is None)
     rnd = random.Random(5)
-    big = "".join(rnd.choice("ACGT") for _ in range(2500))
+    dna = lambda n: "".join(rnd.choice("ACGT") for _ in range(n))
+    big = dna(2500)
+    near = "".join(c if rnd.random() > 0.01 else "A" for c in big)
     small = big[700:1700]
-    other = "".join(rnd.choice("ACGT") for _ in range(1500))
-    c1, _ = fl.cluster_sequences([small, big, other], 95, 1)
-    c2, _ = fl.cluster_sequences([big, small, other], 95, 1)
-    check("clustering does not depend on input order",
-          c1[0] == c1[1] != c1[2] and c2[0] == c2[1] != c2[2], f"{c1} {c2}")
+    other = dna(1500)
+    c1, _ = fl.cluster_sequences([small, big, other, near], 95, 1)
+    c2, _ = fl.cluster_sequences([near, other, big, small], 95, 1)
+    check("clustering: same insert = both sequences covered, in any input order",
+          c1[1] == c1[3] and len(set(c1)) == 3 and c2[0] == c2[2] and len(set(c2)) == 3, f"{c1} {c2}")
+    # final review 5: a shared internal segment is not the same insert
+    core = dna(1100)
+    s1, s2 = dna(200) + core + dna(200), dna(200) + core + dna(200)
+    pairs = fl.matching_pairs([s1, s2, dna(1000)], 95, 1)
+    check("two 1500-bp inserts sharing 1100 bp are not the same insert", pairs == set(), str(pairs))
+    same = lambda x, y: x == y or (min(x, y), max(x, y)) in pairs
+    check("... and give no nesting edge", fl.nesting_parents([(1, 600), (2, 1200)], [[(0, 600)]], same) == [])
+    # final review 6: depth over all compatible parents, whatever the order
+    a, b, c = ("a", 300), ("b", 800), ("c", 1300)
+    depths = []
+    for v2 in ([[b, c], [a, b]], [[a, b], [b, c]]):
+        par, reach = fl.nesting_graph({1: [[a]], 2: v2, 3: [[a, b, c]]})
+        depths.append((max(reach.values()), len(par[(3, 0)])))
+    check("lineage depth 3 through A -> AB -> ABC in either order, both parents kept",
+          depths == [(3, 2), (3, 2)], str(depths))
+    # transitive cluster membership is not a direct match
+    check("A~B and B~C do not make A the parent insert of C",
+          fl.nesting_parents([(2, 500), (9, 900)], [[(0, 500)]], lambda x, y: x == y or (min(x, y), max(x, y)) in {(0, 1), (1, 2)}) == [])
+
+def test_lineage_cli():
+    """find_lineage.py end to end: A -> AB -> ABC with BC listed first (final review 6)."""
+    import csv
+    rnd = random.Random(8)
+    dna = lambda n: "".join(rnd.choice("ACGT") for _ in range(n))
+    IS = dna(2000); A, B, C = dna(600), dna(700), dna(800)
+    cuts = {"a": (500, A), "b": (1000, B), "c": (1500, C)}
+    def build(names):
+        seq, segs, q = dna(300), [], 0
+        for n in names:
+            pos, ins = cuts[n]
+            segs.append((q, pos, len(seq), len(seq) + pos - q)); seq += IS[q:pos] + ins; q = pos
+        segs.append((q, 2000, len(seq), len(seq) + 2000 - q)); seq += IS[q:] + dna(300)
+        return seq, segs
+    obs = [("S1_1", ""), ("S2_1", "a"), ("S3_1", "bc"), ("S4_1", "ab"), ("S5_1", "abc")]
+    with tempfile.TemporaryDirectory() as d:
+        logan = os.path.join(d, "logan"); os.mkdir(logan)
+        with open(os.path.join(d, "chains.tsv"), "w") as f:
+            f.write("query\tqlen\ttarget\ttlen\tstrand\tn_segments\tn_splits\tevent_types\tquery_coverage\tsegments\tstatus\n")
+            for name, ins in obs:
+                seq, segs = build(ins)
+                fa = os.path.join(d, name[:2] + ".fa"); open(fa, "w").write(f">{name}\n{seq}\n")
+                subprocess.run(["zstd", "-q", fa, "-o", os.path.join(logan, name[:2] + ".contigs.fa.zst")], check=True)
+                f.write("\t".join(["IS", "2000", name, str(len(seq)), "+", str(len(segs)), str(len(ins)),
+                                    ",".join(["insertion"] * len(ins)) or "intact", "100.0",
+                                    ";".join(f"Q[{a}-{b}]->T[{c}-{e}](100%)" for a, b, c, e in segs),
+                                    "variant" if ins else "intact"]) + "\n")
+        run("find_lineage.py", os.path.join(d, "chains.tsv"), logan, os.path.join(d, "o"), "--threads", "1")
+        r = next(csv.DictReader(open(os.path.join(d, "o_ladders_summary.tsv")), delimiter="\t"))
+        check("find_lineage CLI: supported depth 4 (intact, A, AB, ABC) with BC listed before AB",
+              (r["supported_depth"], r["supported_edges"]) == ("4", "4"), str(r))
 
 def run(script, *args):
     r = subprocess.run([sys.executable, os.path.join(SCR, script), *args], capture_output=True, text=True)
@@ -479,7 +531,7 @@ def test_minimap2_round_trip():
                     ("two", "insertion"), ("two", "insertion")]
             check(f"minimap2 {preset} round trip: events on the right contigs only", got == want, str(got))
 
-for t in (test_identity, test_eqx_is_required, test_output_independent_of_hash_seed, test_detector, test_final_review_detector, test_multisplit, test_lineage, test_ref_core_and_origin, test_final_review_tables, test_stage_lib, test_final_review_shell,
+for t in (test_identity, test_eqx_is_required, test_output_independent_of_hash_seed, test_detector, test_final_review_detector, test_multisplit, test_lineage, test_lineage_cli, test_ref_core_and_origin, test_final_review_tables, test_stage_lib, test_final_review_shell,
           test_minimap2_round_trip):
 
 
