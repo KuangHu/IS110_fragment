@@ -314,6 +314,7 @@ def _build_one_record(packed):
                             (mode_ties([p["distance"] for p in best["empty_obs"]])
                              if has_empty else 0)),
             "is_element_length_inferred": is_length,
+            "call_confidence": None,       # filled in below from the two fields above
             "n_v0_observations": len(best["v0_obs"]),
             "n_empty_observations": len(best["empty_obs"]),
             "n_empty_rejected_flank_deletion": n_rejected,
@@ -333,6 +334,8 @@ def _build_one_record(packed):
             {k: v for k, v in p.items() if k != "tname"} for p in best["v1plus_obs"][:50]
         ],
     }
+    _be = record["boundary_evidence"]
+    _be["call_confidence"] = call_confidence(method, _be["call_support"], _be["call_n_tied"])
     return (record, is_seq, tnp_seq, up_seq, down_seq, empties_out)
 
 
@@ -346,6 +349,20 @@ def length_mode(values, bin_size=50):
     best = max(bins.values(), key=len)
     best.sort()
     return (best[len(best) // 2], len(best))
+
+
+def call_confidence(method, support, n_tied):
+    """One flag from call_support / call_n_tied (reporting only):
+         tied      another candidate had as much support as the chosen one
+         support1  the chosen call rests on a single observation
+         ok        support >= 2 and no tie
+         no_call   no boundary or length was called (transposase-only records)
+    'tied' wins when both apply."""
+    if method not in ("empty_vs_filled_decomposition", "peak_symmetric_fallback"):
+        return "no_call"
+    if n_tied > 1:
+        return "tied"
+    return "support1" if support <= 1 else "ok"
 
 
 def mode_ties(values, bin_size=50):
@@ -738,7 +755,7 @@ def main():
                 "boundary_method\toffset_5p\toffset_3p\tdecomp_D\tdecomp_support\t"
                 "junction_microhomology_bp\ttsd_len\tevent_key\t"
                 "call_support\tcall_n_tied\tv0_peak_count\tv0_peak_n_tied\t"
-                "empty_peak_count\tempty_peak_n_tied\n")
+                "empty_peak_count\tempty_peak_n_tied\tcall_confidence\n")
         for r in all_records:
             be = r["boundary_evidence"]
             dc = be.get("decomposition") or {}
@@ -757,7 +774,8 @@ def main():
                     f"{(dc.get('tsd') or {}).get('length', '')}\t{r['event_key']}\t"
                     f"{be['call_support']}\t{be['call_n_tied']}\t"
                     f"{be['v0_peak_count']}\t{be['v0_peak_n_tied']}\t"
-                    f"{be['empty_peak_count']}\t{be['empty_peak_n_tied']}\n")
+                    f"{be['empty_peak_count']}\t{be['empty_peak_n_tied']}\t"
+                    f"{be['call_confidence']}\n")
 
     print(f"\n=== Build summary ===", file=sys.stderr)
     print(f"  Records built:       {len(all_records):,} of {n_done:,} refs with "
