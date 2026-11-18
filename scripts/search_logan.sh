@@ -39,6 +39,7 @@ SCRIPTS="/global/home/users/kh36969/IS110_ecology/IS110_fragment/repo/scripts"
 CPUS=${SLURM_CPUS_PER_TASK:-32}
 
 mkdir -p "$RESULTS_DIR"
+source "${SCRIPTS}/stage_lib.sh"
 
 echo "============================================"
 echo "IS110 vs Logan: ${ORG}"
@@ -67,7 +68,9 @@ echo ""
 # ── Step 1: Decompress and concatenate contigs ──
 CONCAT="${RESULTS_DIR}/all_contigs.fa"
 
-if [ -f "$CONCAT" ] && [ "$(stat -c%s "$CONCAT" 2>/dev/null || echo 0)" -gt 1000 ]; then
+# done = marker with the signature of the current file list (names, sizes, dates)
+SIG1=$(stage_sig "concat" "$(find "$LOGAN_DIR" -name "*.contigs.fa.zst" -printf '%p:%s:%T@\n' | sort | md5sum)")
+if stage_done "$CONCAT.done" "$SIG1"; then
     echo "Step 1: Concatenated file exists, skipping decompression."
     echo "  Size: $(du -h "$CONCAT" | cut -f1)"
 else
@@ -83,6 +86,7 @@ else
     find "$LOGAN_DIR" -name "*.contigs.fa.zst" -print0 | sort -z \
         | xargs -0 "$ZSTD_BIN" -dcq > "$CONCAT.tmp"
     mv "$CONCAT.tmp" "$CONCAT"
+    stage_mark "$CONCAT.done" "$SIG1"
 
     echo "  Size: $(du -h "$CONCAT" | cut -f1)"
 fi
@@ -92,7 +96,10 @@ echo ""
 # ── Step 2: minimap2 search ──
 PAF="${RESULTS_DIR}/is110_vs_${ORG}.paf"
 
-if [ -f "$PAF" ] && [ "$(stat -c%s "$PAF" 2>/dev/null || echo 0)" -gt 0 ]; then
+MM2_OPTS="-x asm10 -c --eqx --secondary=yes -N 1000000 -p 0.05 -g 200 -r 200,200"
+SIG2=$(stage_sig "minimap2" "$MM2_OPTS" "$(md5sum < "$QUERY")" "$SIG1")
+# (a killed minimap2 leaves a non-empty partial PAF: size > 0 skipped it)
+if stage_done "$PAF.done" "$SIG2"; then
     echo "Step 2: PAF file exists, skipping minimap2."
 else
     echo "Step 2: Running minimap2 (asm10, sensitive)..."
@@ -100,11 +107,13 @@ else
 # half of an interrupted copy is a low-scoring secondary of any intact copy and
 # was never reported (0 of 18 test configurations with an intact copy present).
 # -g/-r 200: do not chain the two halves across the insert into one alignment.
-    minimap2 -x asm10 -c --eqx \
-        --secondary=yes -N 1000000 -p 0.05 -g 200 -r 200,200 \
+    # shellcheck disable=SC2086
+    minimap2 $MM2_OPTS \
         -t "$CPUS" \
         "$CONCAT" "$QUERY" \
-        -o "$PAF"
+        -o "$PAF.tmp"
+    mv "$PAF.tmp" "$PAF"
+    stage_mark "$PAF.done" "$SIG2"
 fi
 
 echo "  Total hits: $(wc -l < "$PAF")"
@@ -112,10 +121,13 @@ echo "Step 2 done: $(date)"
 echo ""
 
 # ── Step 3: Detect variants (both insertion and deletion) ──
+# Prefix is110_<org>_95: the name the next steps read (find_fragment_origin.sh,
+# run_find_source.sh). It was is110_<org>, so those steps failed or read an
+# older detect_95.sh result unless detect_95.sh was run in between.
 echo "Step 3: Detecting IS110 structural variants..."
 python3 "${SCRIPTS}/detect_is110_variants.py" \
     "$PAF" \
-    "${RESULTS_DIR}/is110_${ORG}" \
+    "${RESULTS_DIR}/is110_${ORG}_95" \
     --min-identity 95 \
     --min-query-cov 50 \
     --ins-min-target-gap 500 \

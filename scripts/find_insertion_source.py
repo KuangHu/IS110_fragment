@@ -23,7 +23,7 @@ import tempfile
 from collections import defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from paf_utils import aligned_identity  # noqa: E402
+from paf_utils import aligned_identity, aligned_query_bases  # noqa: E402
 
 
 def parse_args():
@@ -137,6 +137,9 @@ def run_minimap2(query_fa, target_fa, threads):
             "ts": int(c[7]),
             "te": int(c[8]),
             "ident": ident,
+            # query bases really aligned: the span qe-qs also contains the
+            # parts of the insert that are MISSING from the candidate source
+            "qaln": aligned_query_bases(c),
         })
     return hits
 
@@ -196,19 +199,21 @@ def main():
         queries = {}
         ins_id_map = {}
         for j, ins in enumerate(sample_inss):
+            # every input locus gets an output row (these two cases used to
+            # vanish from the table and from the percentages)
             src_contig = contigs.get(ins["tname"])
             if not src_contig:
+                results.append({**ins, "n_src_hits": 0, "src_hits": "no_contig"})
                 continue
             ins_seq = src_contig[ins["ins_start"]:ins["ins_end"]]
             if len(ins_seq) < args.min_ins_len:
+                results.append({**ins, "n_src_hits": 0, "src_hits": "no_seq"})
                 continue
             qid = f"ins_{j}"
             queries[qid] = ins_seq
             ins_id_map[qid] = ins
 
         if not queries:
-            for ins in sample_inss:
-                results.append({**ins, "n_src_hits": 0, "src_hits": "no_seq"})
             continue
 
         write_fasta(query_fa, queries)
@@ -221,7 +226,9 @@ def main():
         for h in hits:
             if h["ident"] < args.min_identity:
                 continue
-            cov = (h["qe"] - h["qs"]) / h["qlen"] * 100 if h["qlen"] > 0 else 0
+            # coverage from aligned bases (a source with only 70% of the
+            # insert, bridged in one gapped row, was "100% coverage")
+            cov = h["qaln"] / h["qlen"] * 100 if h["qlen"] > 0 else 0
             if cov < args.min_coverage:
                 continue
             by_query[h["qname"]].append(h)
@@ -284,15 +291,18 @@ def main():
     n_total = len(results)
     n_with_src = sum(1 for r in results if r["n_src_hits"] > 0)
     n_none = sum(1 for r in results if r["src_hits"] == "none")
-    n_errors = sum(1 for r in results if r["src_hits"] in ("no_sample_file", "empty_sample", "no_seq"))
+    n_errors = sum(1 for r in results
+                   if r["src_hits"] in ("no_sample_file", "empty_sample", "no_seq", "no_contig"))
+    assert n_total == len(insertions), (n_total, len(insertions))
 
     print()
     print("=" * 60)
     print("Summary")
     print("=" * 60)
     print(f"Total insertions processed: {n_total:,}")
-    print(f"With autologous source:     {n_with_src:,} ({n_with_src/n_total*100:.1f}%)")
-    print(f"No source found:            {n_none:,} ({n_none/n_total*100:.1f}%)")
+    denom = max(1, n_total - n_errors)      # percentages over assessable loci
+    print(f"With autologous source:     {n_with_src:,} ({n_with_src/denom*100:.1f}% of assessable)")
+    print(f"No source found:            {n_none:,} ({n_none/denom*100:.1f}% of assessable)")
     print(f"Errors/missing:             {n_errors:,}")
     print(f"\nOutput: {args.output_tsv}")
 

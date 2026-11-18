@@ -32,7 +32,9 @@ echo "Start: $(date)"
 echo ""
 
 # ── Step 1: Extract inserted fragments from Logan contigs ──
-if [ ! -f "$FRAG_FASTA" ] || [ "$(stat -c%s "$FRAG_FASTA" 2>/dev/null || echo 0)" -eq 0 ]; then
+# redo when the insertion table is newer than the fragments (a FASTA from an
+# earlier detection run was otherwise kept)
+if [ ! -s "$FRAG_FASTA" ] || [ "$INS_TSV" -nt "$FRAG_FASTA" ]; then
     echo "Step 1: Extracting inserted fragment sequences..."
     python3 "${SCRIPTS}/extract_insertion_fragments.py" \
         "$INS_TSV" \
@@ -43,7 +45,7 @@ if [ ! -f "$FRAG_FASTA" ] || [ "$(stat -c%s "$FRAG_FASTA" 2>/dev/null || echo 0)
 else
     echo "Step 1: Fragment FASTA exists, skipping."
 fi
-echo "  Fragments: $(grep -c '^>' "$FRAG_FASTA" 2>/dev/null || echo 0)"
+echo "  Fragments: $(grep -c '^>' "$FRAG_FASTA" 2>/dev/null || true)"
 echo "  Size: $(du -h "$FRAG_FASTA" | cut -f1)"
 echo "Step 1 done: $(date)"
 echo ""
@@ -67,7 +69,7 @@ else
     echo "Step 2: Representatives exist, skipping clustering."
 fi
 
-N_REPS=$(grep -c '^>' "$REP_FASTA" 2>/dev/null || echo 0)
+N_REPS=$(grep -c '^>' "$REP_FASTA" 2>/dev/null || true)
 echo "  Representative clusters: $N_REPS"
 echo "Step 2 done: $(date)"
 echo ""

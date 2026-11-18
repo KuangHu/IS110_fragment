@@ -14,6 +14,9 @@ import sys
 from collections import defaultdict
 
 
+LOCUS_TOL = 20   # as detect_is110_variants.py --locus-tol
+
+
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("insertions_tsv",
@@ -97,7 +100,7 @@ def main():
     print(f"Accessions to process: {len(by_accession):,}")
 
     written = 0
-    seen_loci = set()
+    seen_loci = {}
     n_dup = 0
     failed_files = 0
     failed_contigs = 0
@@ -147,14 +150,21 @@ def main():
                 # clamp (a padded interval can run past the contig end) and
                 # write each locus ONCE: the same insert was written once per
                 # reference IS that matched it, which inflated cluster sizes
-                frag = seq[max(0, f["ins_start"]):min(len(seq), f["ins_end"])]
+                # the stored coordinates are the clamped ones (the header said
+                # __1000_3600 for 2000 bases of a 3000-bp contig)
+                f["ins_start"] = max(0, f["ins_start"])
+                f["ins_end"] = min(len(seq), f["ins_end"])
+                frag = seq[f["ins_start"]:f["ins_end"]]
                 if len(frag) < args.min_len:
                     continue
-                key = (f["target"], f["ins_start"] // 20, f["ins_end"] // 20)
-                if key in seen_loci:
+                # same locus = both ends within LOCUS_TOL bp of a locus already
+                # written (floor bins split 1019 / 1020 into two "loci")
+                near = seen_loci.setdefault(f["target"], [])
+                if any(abs(a - f["ins_start"]) <= LOCUS_TOL and abs(b - f["ins_end"]) <= LOCUS_TOL
+                       for a, b in near):
                     n_dup += 1
                     continue
-                seen_loci.add(key)
+                near.append((f["ins_start"], f["ins_end"]))
 
                 hdr = (f">{f['target']}__{f['ins_start']}_{f['ins_end']}"
                        f" query={f['query']}"

@@ -201,6 +201,8 @@ def main():
                         help="Output prefix for PNG/PDF (default: synteny)")
     parser.add_argument("--fig-width", type=float, default=20,
                         help="Figure width in inches (default: 20)")
+    parser.add_argument("--query", default=None,
+                        help="Query name to plot (default: the record id of the GBK file)")
     parser.add_argument("--no-flip", action="store_true",
                         help="Disable auto-flip of target track")
 
@@ -219,6 +221,20 @@ def main():
     # Parse GBK for query length and CDS annotations
     query_len, cds_features = parse_gbk(args.gbk_file)
     print(f"Loaded {len(cds_features)} CDS features from {args.gbk_file}")
+
+    # One query per figure: hits of another query have coordinates on another
+    # sequence (a 3000-bp query's hits on a 2000-bp track raised LinkRangeError)
+    if args.query is None:
+        from Bio import SeqIO
+        args.query = SeqIO.read(args.gbk_file, "genbank").id
+    names = sorted({h.query_name for h in hits})
+    hits = [h for h in hits if h.query_name == args.query]
+    if not hits:
+        print(f"No hits of query '{args.query}' on {args.target}; queries in the PAF "
+              f"for this target: {', '.join(names)}", file=sys.stderr)
+        sys.exit(1)
+    if len(names) > 1:
+        print(f"Plotting query {args.query} only ({len(names)} queries hit this target)")
 
     plot(
         hits=hits,

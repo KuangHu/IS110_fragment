@@ -15,11 +15,13 @@
 
 set -euo pipefail
 
-GTDB_FNA="/groups/rubin/databases/GTDB/gtdb_genomes_v2024latest/gtdb_genomes_reps_r220/allfilestogether"
-GTDB_FAA="/groups/rubin/projects/kuang/out/embedding_project/protein_collection/GTDB/GTDB_faa"
-HMM_DIR="/home/kuangh/tools/IS110_fragment/hmm"
-OUTDIR="/groups/rubin/projects/kuang/out/IS110_fragment/hmm_search"
+GTDB_FNA="${GTDB_FNA:-/groups/rubin/databases/GTDB/gtdb_genomes_v2024latest/gtdb_genomes_reps_r220/allfilestogether}"
+GTDB_FAA="${GTDB_FAA:-/groups/rubin/projects/kuang/out/embedding_project/protein_collection/GTDB/GTDB_faa}"
+HMM_DIR="${HMM_DIR:-/home/kuangh/tools/IS110_fragment/hmm}"
+OUTDIR="${OUTDIR:-/groups/rubin/projects/kuang/out/IS110_fragment/hmm_search}"
 CPUS=48
+SCRIPTS="${IS110_FRAGMENT_SCRIPTS:-/global/home/users/kh36969/IS110_ecology/IS110_fragment/repo/scripts}"
+# paths above are those of the cluster this was first run on; override by environment
 
 mkdir -p "$OUTDIR"
 
@@ -222,7 +224,7 @@ cd-hit-est -i "$OUTDIR/is110_cds_nuc.fna" \
     -c 0.95 -n 10 -T "$CPUS" -M 0 -d 0 \
     > "$OUTDIR/cdhit.log" 2>&1
 
-NR=$(grep -c '^>' "$OUTDIR/is110_cds_nr95.fna")
+NR=$(grep -c '^>' "$OUTDIR/is110_cds_nr95.fna" || true)
 echo "  Non-redundant IS110 CDS (95%): $NR sequences"
 
 echo "Step 5 done: $(date)"
@@ -239,6 +241,16 @@ SEARCH_OUT="$OUTDIR/is110_vs_gtdb.paf"
 # half of an interrupted copy is a low-scoring secondary of any intact copy and
 # was never reported (0 of 18 test configurations with an intact copy present).
 # -g/-r 200: do not chain the two halves across the insert into one alignment.
+# Sequence names must be unique across the files that are concatenated:
+# two genomes that both have a contig "ctg" become one target, and halves of
+# an IS in two different genomes were joined into one "insertion".
+DUP=$(find "$GTDB_FNA" -name "*.fna" -print0 | xargs -0 grep -h '^>' | awk '{print $1}' | sort | uniq -d | head -3 || true)
+if [ -n "$DUP" ]; then
+    echo "ERROR: sequence names occur in more than one genome file, e.g.:" >&2
+    echo "$DUP" >&2
+    echo "Give the records unique names (prefix the assembly) before searching." >&2
+    exit 1
+fi
 find "$GTDB_FNA" -name "*.fna" -print0 | xargs -0 cat \
     | minimap2 -x asm10 -c --eqx --secondary=yes -N 1000000 -p 0.05 -g 200 -r 200,200 \
         -t "$CPUS" \
@@ -254,68 +266,10 @@ echo ""
 # ──────────────────────────────────────────────
 echo "Step 7: Detecting split IS110 transposases..."
 
-python3 - << 'PYEOF'
-import os
-from collections import defaultdict
-
-paf = "/groups/rubin/projects/kuang/out/IS110_fragment/hmm_search/is110_vs_gtdb.paf"
-MIN_GAP = 6000
-MIN_IDENT = 80
-
-hits = defaultdict(list)
-with open(paf) as fh:
-    for line in fh:
-        c = line.strip().split("\t")
-        if len(c) < 12: continue
-        matches, block = int(c[9]), int(c[10])
-        # identity over aligned columns: PAF column 11 counts gap columns, so a
-        # copy with an indel fell below the threshold and was dropped
-        _cg = next((t[5:] for t in c[12:] if t.startswith('cg:Z:')), '')
-        _gaps = sum(int(n) for n, op in __import__('re').findall(r'(\d+)([IDN])', _cg))
-        ident = matches / (block - _gaps) * 100 if block - _gaps > 0 else 0
-        if ident < MIN_IDENT: continue
-        hits[(c[0], c[5])].append({
-            "qs": int(c[2]), "qe": int(c[3]), "qlen": int(c[1]),
-            "ts": int(c[7]), "te": int(c[8]), "tlen": int(c[6]),
-            "strand": c[4], "ident": ident,
-        })
-
-count = 0
-results = []
-for (qname, tname), hlist in hits.items():
-    if len(hlist) < 2: continue
-    hlist.sort(key=lambda x: x["ts"])
-    for i in range(len(hlist)):
-        for j in range(i+1, len(hlist)):
-            hi, hj = hlist[i], hlist[j]
-            tgap = hj["ts"] - hi["te"]
-            if tgap < MIN_GAP: continue
-            qov = max(0, min(hi["qe"], hj["qe"]) - max(hi["qs"], hj["qs"]))
-            min_span = min(hi["qe"]-hi["qs"], hj["qe"]-hj["qs"])
-            if qov > min_span * 0.5: continue
-            total_cov = len(set(range(hi["qs"], hi["qe"])) | set(range(hj["qs"], hj["qe"])))
-            cov_pct = total_cov / hi["qlen"] * 100
-            count += 1
-            results.append((qname, tname, hi, hj, tgap, cov_pct))
-            break
-        else: continue
-        break
-
-print(f"\nTotal split IS110 transposase cases: {count}")
-print("")
-for qname, tname, hi, hj, tgap, cov_pct in sorted(results, key=lambda x: -x[5])[:100]:
-    print(f"  {qname} on {tname} ({hj['tlen']:,}bp)")
-    print(f"    Part1: Q[{hi['qs']}-{hi['qe']}]/{hi['qlen']} -> T[{hi['ts']:,}-{hi['te']:,}] {hi['strand']} {hi['ident']:.0f}%")
-    print(f"    Part2: Q[{hj['qs']}-{hj['qe']}]/{hj['qlen']} -> T[{hj['ts']:,}-{hj['te']:,}] {hj['strand']} {hj['ident']:.0f}%")
-    print(f"    Gap: {tgap:,}bp | CDS covered: {cov_pct:.0f}%")
-
-outdir = "/groups/rubin/projects/kuang/out/IS110_fragment/hmm_search"
-with open(os.path.join(outdir, "split_is110_results.tsv"), "w") as f:
-    f.write("query\ttarget\ttlen\tpart1_qs\tpart1_qe\tpart1_ts\tpart1_te\tpart1_strand\tpart1_ident\tpart2_qs\tpart2_qe\tpart2_ts\tpart2_te\tpart2_strand\tpart2_ident\tgap\tcds_coverage\n")
-    for qname, tname, hi, hj, tgap, cov_pct in results:
-        f.write(f"{qname}\t{tname}\t{hj['tlen']}\t{hi['qs']}\t{hi['qe']}\t{hi['ts']}\t{hi['te']}\t{hi['strand']}\t{hi['ident']:.1f}\t{hj['qs']}\t{hj['qe']}\t{hj['ts']}\t{hj['te']}\t{hj['strand']}\t{hj['ident']:.1f}\t{tgap}\t{cov_pct:.1f}\n")
-
-PYEOF
+# one tested implementation (strand, order, junction, one row per locus);
+# the copy that stood here also called an inverted second half "split"
+python3 "$SCRIPTS/detect_split_all.py" "$SEARCH_OUT" "$OUTDIR/split_is110_results.tsv" \
+    --min-gap 6000 --max-gap 1000000000 --min-identity 80 --min-cov 0 --top 100
 
 echo ""
 echo "=== Pipeline complete ==="

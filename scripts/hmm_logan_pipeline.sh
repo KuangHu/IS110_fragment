@@ -32,6 +32,13 @@ OUTDIR="${SCRATCH}/logan_hmm/${ORG}"
 HMM_DIR="/global/home/users/kh36969/IS110_ecology/IS110_fragment/repo/hmm"
 CPUS=${SLURM_CPUS_PER_TASK:-32}
 
+source "${IS110_FRAGMENT_SCRIPTS:-/global/home/users/kh36969/IS110_ecology/IS110_fragment/repo/scripts}/stage_lib.sh"
+# 1 = collapse contigs at 99% identity before gene prediction (the old default).
+# Members of a contig cluster are then NOT counted: two samples with the same
+# contig gave one position row for one sample. Default 0: every contig is
+# searched; identical proteins are still searched once (step 3) and expanded.
+DEREP_CONTIGS=${DEREP_CONTIGS:-0}
+
 mkdir -p "$OUTDIR"
 cd "$OUTDIR"
 
@@ -62,7 +69,8 @@ echo ""
 MIN_LEN=1000
 FILTERED="${OUTDIR}/contigs_gte${MIN_LEN}.fa"
 
-if [ -s "$FILTERED" ]; then
+SIG0=$(stage_sig "filter" "$MIN_LEN" "$(file_fp "$CONCAT")")
+if stage_done "$FILTERED.done" "$SIG0"; then
     echo "Step 0: length-filtered contigs already exist, skipping."
 else
     echo "Step 0: Filtering contigs to >= ${MIN_LEN} bp..."
@@ -83,10 +91,17 @@ else
                 print seq
             }
         }
-    ' "$CONCAT" > "$FILTERED"
+    ' "$CONCAT" > "$FILTERED.tmp"
+    mv "$FILTERED.tmp" "$FILTERED"
+    stage_mark "$FILTERED.done" "$SIG0"
 fi
 
-N_FILT=$(grep -c '^>' "$FILTERED")
+N_FILT=$(count_fasta "$FILTERED")
+if [ "$N_FILT" -eq 0 ]; then
+    echo "No contig >= ${MIN_LEN} bp: nothing to search."
+    printf 'protein_id\tcontig\tsample\tstart\tend\tstrand\n' > "${OUTDIR}/is110_positions.tsv"
+    exit 0
+fi
 echo "  Contigs >= ${MIN_LEN}bp: $N_FILT ($(du -h "$FILTERED" | cut -f1))"
 echo "Step 0 done: $(date)"
 echo ""
@@ -97,9 +112,16 @@ echo ""
 REPS="${OUTDIR}/contig_reps.fa"
 CLUSTER_TSV="${OUTDIR}/contig_cluster.tsv"
 
-if [ -s "$REPS" ]; then
-    echo "Step 1: contig reps already exist, skipping."
+SIG1=$(stage_sig "derep" "$DEREP_CONTIGS" "0.99 0.95 cov1" "$SIG0")
+if stage_done "$REPS.done" "$SIG1"; then
+    echo "Step 1: contig set already exists, skipping."
+elif [ "$DEREP_CONTIGS" != "1" ]; then
+    echo "Step 1: no contig dereplication (every contig is searched)."
+    ln -sfn "$FILTERED" "$REPS"
+    rm -f "$CLUSTER_TSV"
+    stage_mark "$REPS.done" "$SIG1"
 else
+    echo "WARNING: DEREP_CONTIGS=1 -- samples whose contig is a cluster member are not counted."
     echo "Step 1: Dereplicating contigs at 99% identity (mmseqs2 easy-linclust)..."
     mmseqs easy-linclust \
         "$FILTERED" \
@@ -113,9 +135,10 @@ else
     mv "${OUTDIR}/contig_cluster_cluster.tsv" "$CLUSTER_TSV"
     rm -rf "${OUTDIR}/mmseqs_tmp_contigs"
     rm -f "${OUTDIR}/contig_cluster_all_seqs.fasta"
+    stage_mark "$REPS.done" "$SIG1"
 fi
 
-N_REPS=$(grep -c '^>' "$REPS")
+N_REPS=$(count_fasta "$REPS")
 echo "  Contig reps: $N_REPS ($(du -h "$REPS" | cut -f1))"
 echo "Step 1 done: $(date)"
 echo ""
@@ -126,12 +149,15 @@ echo ""
 PROTEINS="${OUTDIR}/proteins.faa"
 GFF="${OUTDIR}/proteins.gff"
 
-if [ -s "$PROTEINS" ]; then
+SIG2=$(stage_sig "prodigal meta" "$SIG1")
+if stage_done "$PROTEINS.done" "$SIG2"; then
     echo "Step 2: proteins already exist, skipping."
 else
     echo "Step 2: Predicting ORFs (prodigal --meta)..."
-    # Split reps into chunks for parallel prodigal
+    # Split reps into chunks for parallel prodigal. A FRESH directory: chunks
+    # left by a failed attempt (other chunk count) were concatenated as well.
     SPLIT_DIR="${OUTDIR}/splits"
+    rm -rf "$SPLIT_DIR"
     mkdir -p "$SPLIT_DIR"
     # Split into $CPUS chunks
     awk -v cpus="$CPUS" -v dir="$SPLIT_DIR" '
@@ -172,12 +198,20 @@ else
     done
 
     # Concatenate
-    cat "$SPLIT_DIR"/chunk_*.faa > "$PROTEINS"
-    cat "$SPLIT_DIR"/chunk_*.gff > "$GFF"
+    cat "$SPLIT_DIR"/chunk_*.faa > "$PROTEINS.tmp"
+    cat "$SPLIT_DIR"/chunk_*.gff > "$GFF.tmp"
+    mv "$PROTEINS.tmp" "$PROTEINS"
+    mv "$GFF.tmp" "$GFF"
     rm -rf "$SPLIT_DIR"
+    stage_mark "$PROTEINS.done" "$SIG2"
 fi
 
-N_PROT=$(grep -c '^>' "$PROTEINS")
+N_PROT=$(count_fasta "$PROTEINS")
+if [ "$N_PROT" -eq 0 ]; then
+    echo "No protein predicted: no IS110."
+    printf 'protein_id\tcontig\tsample\tstart\tend\tstrand\n' > "${OUTDIR}/is110_positions.tsv"
+    exit 0
+fi
 echo "  Predicted proteins: $N_PROT"
 echo "Step 2 done: $(date)"
 echo ""
@@ -188,7 +222,8 @@ echo ""
 PROT_REPS="${OUTDIR}/prot_reps.faa"
 PROT_CLUSTER="${OUTDIR}/prot_cluster.tsv"
 
-if [ -s "$PROT_REPS" ]; then
+SIG3=$(stage_sig "prot derep 1.0 1.0 cov0" "$SIG2")
+if stage_done "$PROT_REPS.done" "$SIG3"; then
     echo "Step 3: protein reps already exist, skipping."
 else
     echo "Step 3: Dereplicating proteins at 100% identity..."
@@ -203,9 +238,10 @@ else
     mv "${OUTDIR}/prot_cluster_cluster.tsv" "$PROT_CLUSTER"
     rm -rf "${OUTDIR}/mmseqs_tmp_prot"
     rm -f "${OUTDIR}/prot_cluster_all_seqs.fasta"
+    stage_mark "$PROT_REPS.done" "$SIG3"
 fi
 
-N_PROT_REPS=$(grep -c '^>' "$PROT_REPS")
+N_PROT_REPS=$(count_fasta "$PROT_REPS")
 echo "  Unique proteins: $N_PROT_REPS"
 echo "Step 3 done: $(date)"
 echo ""
@@ -216,25 +252,32 @@ echo ""
 DEDD_HITS="${OUTDIR}/dedd_hits.domtbl"
 TNP20_HITS="${OUTDIR}/tnp20_hits.domtbl"
 
-if [ -s "$DEDD_HITS" ]; then
+# (an interrupted hmmsearch leaves a non-empty, header-only table: "-s" skipped it)
+SIG4A=$(stage_sig "hmmsearch cut_ga" "$(md5sum < "${HMM_DIR}/PF01548.hmm")" "$SIG3")
+if stage_done "$DEDD_HITS.done" "$SIG4A"; then
     echo "Step 4a: DEDD hits already exist."
 else
     echo "Step 4a: hmmsearch DEDD (PF01548)..."
-    hmmsearch --domtblout "$DEDD_HITS" \
+    hmmsearch --domtblout "$DEDD_HITS.tmp" \
         --cpu "$CPUS" --cut_ga \
         "${HMM_DIR}/PF01548.hmm" "$PROT_REPS" > /dev/null
+    mv "$DEDD_HITS.tmp" "$DEDD_HITS"
+    stage_mark "$DEDD_HITS.done" "$SIG4A"
 fi
-echo "  DEDD hits: $(grep -cv '^#' "$DEDD_HITS")"
+echo "  DEDD hits: $(count_rows "$DEDD_HITS")"
 
-if [ -s "$TNP20_HITS" ]; then
+SIG4B=$(stage_sig "hmmsearch cut_ga" "$(md5sum < "${HMM_DIR}/PF02371.hmm")" "$SIG3")
+if stage_done "$TNP20_HITS.done" "$SIG4B"; then
     echo "Step 4b: Tnp20 hits already exist."
 else
     echo "Step 4b: hmmsearch Tnp20 (PF02371)..."
-    hmmsearch --domtblout "$TNP20_HITS" \
+    hmmsearch --domtblout "$TNP20_HITS.tmp" \
         --cpu "$CPUS" --cut_ga \
         "${HMM_DIR}/PF02371.hmm" "$PROT_REPS" > /dev/null
+    mv "$TNP20_HITS.tmp" "$TNP20_HITS"
+    stage_mark "$TNP20_HITS.done" "$SIG4B"
 fi
-echo "  Tnp20 hits: $(grep -cv '^#' "$TNP20_HITS")"
+echo "  Tnp20 hits: $(count_rows "$TNP20_HITS")"
 
 # ────────────────────────────────────────────────
 # STEP 5: Find proteins with BOTH domains, map back to contigs

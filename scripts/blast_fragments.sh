@@ -68,7 +68,9 @@ with open("$OUT", "w") as out:
             )
             if r.returncode != 0:
                 # a network / remote failure is not "no hits"
-                out.write(f"{name.split()[0]}\tERROR\t{r.stderr.strip()[:200]}\t-\t-\t-\t-\t-\n")
+                # one line, no tabs: a multi-line stderr broke the table
+                msg = " ".join(r.stderr.split())[:200]
+                out.write(f"{name.split()[0]}\tERROR\t{msg}\t-\t-\t-\t-\t-\n")
             elif r.stdout.strip():
                 for ln in r.stdout.strip().split("\n"):
                     out.write(f"{name.split()[0]}\t{ln}\n")
@@ -80,7 +82,7 @@ with open("$OUT", "w") as out:
             out.write(f"{name.split()[0]}\tTIMEOUT\t-\t-\t-\t-\t-\t-\n")
         except Exception as e:
             print(f"    ERROR: {e}")
-            out.write(f"{name.split()[0]}\tERROR\t{e}\t-\t-\t-\t-\t-\n")
+            out.write(f"{name.split()[0]}\tERROR\t{' '.join(str(e).split())}\t-\t-\t-\t-\t-\n")
         finally:
             try:
                 os.remove(query_file)

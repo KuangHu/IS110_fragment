@@ -56,6 +56,7 @@ fi
 
 # ── Setup ──
 mkdir -p "$OUTDIR"
+SCRIPTS="${IS110_FRAGMENT_SCRIPTS:-/global/home/users/kh36969/IS110_ecology/IS110_fragment/repo/scripts}"
 COMBINED_QUERY="${OUTDIR}/combined_query.fna"
 RAW_PAF="${OUTDIR}/all_raw.paf"
 > "$COMBINED_QUERY"
@@ -86,6 +87,16 @@ echo ""
 # ── Run minimap2 (one pass for all queries) ──
 # -c --eqx: CIGAR with =/X for precise identity calculation
 # --secondary=yes -N 1000000 -p 0.05 -g 200 -r 200,200: report multiple/split alignments
+# Sequence names must be unique across the files that are concatenated:
+# two genomes that both have a contig "ctg" become one target, and halves of
+# an IS in two different genomes were joined into one "insertion".
+DUP=$(find "$GTDB_DIR" -name "*.fna" -print0 | xargs -0 grep -h '^>' | awk '{print $1}' | sort | uniq -d | head -3 || true)
+if [ -n "$DUP" ]; then
+    echo "ERROR: sequence names occur in more than one genome file, e.g.:" >&2
+    echo "$DUP" >&2
+    echo "Give the records unique names (prefix the assembly) before searching." >&2
+    exit 1
+fi
 find "$GTDB_DIR" -name "*.fna" -exec cat {} + \
     | minimap2 -x asm5 -c --eqx --secondary=yes -N 1000000 -p 0.05 -g 200 -r 200,200 \
         -t "$CPUS" \
@@ -104,8 +115,10 @@ for gbk in "${GBK_FILES[@]}"; do
     QUERY_ID=$(python -c "from Bio import SeqIO; print(SeqIO.read('${gbk}', 'genbank').id)")
     HITS_PAF="${OUTDIR}/${NAME}_hits.paf"
 
-    awk -F'\t' -v qid="$QUERY_ID" -v min_id="$MIN_IDENT" \
-        '$1 == qid && $10/$11 >= min_id' "$RAW_PAF" > "$HITS_PAF"
+    # aligned identity (gap columns excluded): `$10/$11` dropped a perfect
+    # copy with a 600-bp insert (77%)
+    python3 "$SCRIPTS/paf_utils.py" filter --min-identity "$MIN_IDENT" --query "$QUERY_ID" \
+        < "$RAW_PAF" > "$HITS_PAF"
 
     N=$(wc -l < "$HITS_PAF")
     echo "  ${NAME}: ${N} hits (>= ${MIN_IDENT} identity)"

@@ -9,9 +9,10 @@
 
 set -euo pipefail
 
-OUTDIR="/groups/rubin/projects/kuang/out/IS110_fragment/hmm_search"
-GTDB_FNA="/groups/rubin/databases/GTDB/gtdb_genomes_v2024latest/gtdb_genomes_reps_r220/allfilestogether"
+OUTDIR="${OUTDIR:-/groups/rubin/projects/kuang/out/IS110_fragment/hmm_search}"
+GTDB_FNA="${GTDB_FNA:-/groups/rubin/databases/GTDB/gtdb_genomes_v2024latest/gtdb_genomes_reps_r220/allfilestogether}"
 CPUS=48
+SCRIPTS="${IS110_FRAGMENT_SCRIPTS:-/global/home/users/kh36969/IS110_ecology/IS110_fragment/repo/scripts}"
 
 echo "=== Search 123 split IS110 CDS vs all GTDB ==="
 echo "Start: $(date)"
@@ -56,110 +57,8 @@ echo "Step 2 done: $(date)"
 # Step 3: Detect split cases across all contigs
 echo "Step 3: Detecting split cases..."
 
-python3 - << 'PYEOF'
-import os
-from collections import defaultdict
-
-paf = "/groups/rubin/projects/kuang/out/IS110_fragment/hmm_search/split_123_vs_gtdb.paf"
-outdir = "/groups/rubin/projects/kuang/out/IS110_fragment/hmm_search"
-MAX_GAP = 20000
-MIN_IDENT = 80
-MIN_COV = 50
-
-hits_by_query = defaultdict(list)
-with open(paf) as fh:
-    for line in fh:
-        c = line.strip().split("\t")
-        if len(c) < 12: continue
-        matches, block = int(c[9]), int(c[10])
-        # identity over aligned columns: PAF column 11 counts gap columns, so a
-        # copy with an indel fell below the threshold and was dropped
-        _cg = next((t[5:] for t in c[12:] if t.startswith('cg:Z:')), '')
-        _gaps = sum(int(n) for n, op in __import__('re').findall(r'(\d+)([IDN])', _cg))
-        ident = matches / (block - _gaps) * 100 if block - _gaps > 0 else 0
-        if ident < MIN_IDENT: continue
-        hits_by_query[c[0]].append({
-            "qlen": int(c[1]),
-            "qs": int(c[2]),
-            "qe": int(c[3]),
-            "tname": c[5],
-            "tlen": int(c[6]),
-            "ts": int(c[7]),
-            "te": int(c[8]),
-            "strand": c[4],
-            "ident": ident,
-        })
-
-print(f"Queries with hits: {len(hits_by_query)}")
-
-results = []
-for qname, hlist in hits_by_query.items():
-    qlen = hlist[0]["qlen"]
-    # Group by target contig
-    by_contig = defaultdict(list)
-    for h in hlist:
-        by_contig[h["tname"]].append(h)
-
-    for tname, ths in by_contig.items():
-        if len(ths) < 2: continue
-        ths.sort(key=lambda x: x["ts"])
-        for i in range(len(ths)):
-            for j in range(i+1, len(ths)):
-                hi, hj = ths[i], ths[j]
-                gap = hj["ts"] - hi["te"]
-                if gap < 50 or gap > MAX_GAP: continue
-                qov = max(0, min(hi["qe"], hj["qe"]) - max(hi["qs"], hj["qs"]))
-                min_span = min(hi["qe"]-hi["qs"], hj["qe"]-hj["qs"])
-                if min_span == 0: continue
-                if qov > min_span * 0.5: continue
-                covered = set(range(hi["qs"], hi["qe"])) | set(range(hj["qs"], hj["qe"]))
-                cov_pct = len(covered) / qlen * 100
-                if cov_pct < MIN_COV: continue
-                results.append({
-                    "qname": qname, "qlen": qlen,
-                    "tname": tname, "tlen": hi["tlen"],
-                    "hi": hi, "hj": hj,
-                    "gap": gap, "cov_pct": cov_pct,
-                })
-
-print(f"Total split hits: {len(results)}")
-
-# Deduplicate: unique (query, target_contig)
-seen = set()
-dedup = []
-for r in sorted(results, key=lambda x: -x["cov_pct"]):
-    key = (r["qname"], r["tname"])
-    if key in seen: continue
-    seen.add(key)
-    dedup.append(r)
-
-# Count unique queries and targets
-uq = len(set(r["qname"] for r in dedup))
-ut = len(set(r["tname"] for r in dedup))
-print(f"Unique query-target pairs: {len(dedup)}")
-print(f"Unique queries with splits: {uq}")
-print(f"Unique target contigs: {ut}")
-
-# Write results
-out_tsv = os.path.join(outdir, "split_123_all_hits.tsv")
-with open(out_tsv, "w") as f:
-    f.write("query\tqlen\ttarget_contig\ttlen\tpart1_qs\tpart1_qe\tpart1_ts\tpart1_te\tpart1_strand\tpart1_ident\tpart2_qs\tpart2_qe\tpart2_ts\tpart2_te\tpart2_strand\tpart2_ident\tgap\tcds_coverage\n")
-    for r in dedup:
-        hi, hj = r["hi"], r["hj"]
-        f.write(f"{r['qname']}\t{r['qlen']}\t{r['tname']}\t{r['tlen']}\t"
-                f"{hi['qs']}\t{hi['qe']}\t{hi['ts']}\t{hi['te']}\t{hi['strand']}\t{hi['ident']:.1f}\t"
-                f"{hj['qs']}\t{hj['qe']}\t{hj['ts']}\t{hj['te']}\t{hj['strand']}\t{hj['ident']:.1f}\t"
-                f"{r['gap']}\t{r['cov_pct']:.1f}\n")
-
-print(f"\nResults written to {out_tsv}")
-
-# Summary per query
-print(f"\n=== Hits per query (top 20) ===")
-from collections import Counter
-qcounts = Counter(r["qname"] for r in dedup)
-for q, c in qcounts.most_common(20):
-    print(f"  {q}: {c} split locations")
-PYEOF
+python3 "$SCRIPTS/detect_split_all.py" "$OUTDIR/split_123_vs_gtdb.paf" "$OUTDIR/split_123_all_hits.tsv" \
+    --min-gap 50 --max-gap 20000 --min-identity 80 --min-cov 50
 
 echo ""
 echo "=== Done ==="

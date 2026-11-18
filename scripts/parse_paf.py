@@ -56,6 +56,17 @@ def _compute_identity(num_matches: int, aln_block_len: int, tags: dict) -> tuple
     Prefers de:f: (per-base divergence) over dv:f: (gap-compressed),
     falls back to col10/col11.
     """
+    # With a CIGAR: matches / aligned columns (M, =, X), the definition used by
+    # every detector here (paf_utils.py). The fallbacks below are NOT the same
+    # quantity: de counts each gap as one difference, col10/col11 counts every
+    # gap column (a perfect copy with a 600-bp insert reads 77%).
+    cg = tags.get("cg")
+    if isinstance(cg, str) and cg:
+        import re
+        aligned = sum(int(n) for n, op in re.findall(r"(\d+)([MIDNSHP=X])", cg) if op in "M=X")
+        if aligned > 0:
+            identity = min(1.0, num_matches / aligned)
+            return identity, 1.0 - identity
     if "de" in tags:
         div = tags["de"]
     elif "dv" in tags:
@@ -123,24 +134,33 @@ def filter_hits(
     return filtered
 
 
-def group_by_genome(hits: list[PafHit]) -> dict[str, list[PafHit]]:
-    """Group hits by target genome name."""
+def group_by_genome(hits: list[PafHit]) -> dict[tuple, list[PafHit]]:
+    """Group hits by (target genome, query). Hits of different queries were
+    pooled per genome and divided by the length of the first query: two full
+    copies of two queries read "200% coverage"."""
     groups = defaultdict(list)
     for h in hits:
-        groups[h.target_name].append(h)
+        groups[(h.target_name, h.query_name)].append(h)
     return dict(groups)
 
 
 def summarize_groups(groups: dict[str, list[PafHit]]) -> list[dict]:
     """Summarize grouped hits into a table."""
     rows = []
-    for genome, ghits in groups.items():
+    for (genome, query), ghits in groups.items():
         total_bp = sum(h.query_end - h.query_start for h in ghits)
         mean_ident = sum(h.identity for h in ghits) / len(ghits) if ghits else 0
         query_len = ghits[0].query_len
-        coverage = total_bp / query_len * 100 if query_len > 0 else 0
+        # coverage = part of the query seen at least once (merged intervals);
+        # total_aligned_bp / n_hits carry the copy number
+        merged, end = 0, 0
+        for s, e in sorted((h.query_start, h.query_end) for h in ghits):
+            merged += max(0, e - max(s, end))
+            end = max(end, e)
+        coverage = merged / query_len * 100 if query_len > 0 else 0
         rows.append({
             "genome": genome,
+            "query": query,
             "n_hits": len(ghits),
             "total_aligned_bp": total_bp,
             "mean_identity": round(mean_ident * 100, 1),
@@ -161,10 +181,10 @@ def print_hits_tsv(hits: list[PafHit]):
 
 def print_summary_tsv(rows: list[dict]):
     """Print group summary as TSV."""
-    header = "genome\tn_hits\ttotal_aligned_bp\tmean_identity\tquery_coverage_pct"
+    header = "genome\tquery\tn_hits\ttotal_aligned_bp\tmean_identity\tquery_coverage_pct"
     print(header)
     for r in rows:
-        print(f"{r['genome']}\t{r['n_hits']}\t{r['total_aligned_bp']}\t"
+        print(f"{r['genome']}\t{r['query']}\t{r['n_hits']}\t{r['total_aligned_bp']}\t"
               f"{r['mean_identity']}\t{r['query_coverage_pct']}")
 
 

@@ -34,8 +34,10 @@ echo ""
 # STEP 1: Extract IS110 + flanks per genome
 # ────────────────────────────────────────────────
 EXTRACTED="${OUTDIR}/is110_with_flanks.fa"
+# the transposase gene alone (the "core"), same ids: this is what is clustered
+CORE="${OUTDIR}/is110_core.fa"
 
-if [ -s "$EXTRACTED" ]; then
+if [ -s "$EXTRACTED" ] && [ -s "$CORE" ]; then
     echo "Step 1: extracted sequences exist, skipping."
 else
     echo "Step 1: Extracting IS110 + ${FLANK_BP}bp flanks..."
@@ -46,6 +48,7 @@ from collections import defaultdict
 positions_tsv = "$POSITIONS_TSV"
 genome_dir = "$GENOME_DIR"
 out_path = "$EXTRACTED"
+core_path = "$CORE"
 flank = $FLANK_BP
 
 # Group positions by assembly accession
@@ -72,8 +75,8 @@ def revcomp(seq):
     return seq.translate(comp)[::-1]
 
 n_extracted = 0
-with open(out_path, "w") as out:
-    for assembly, positions in by_asm.items():
+with open(out_path + ".tmp", "w") as out, open(core_path + ".tmp", "w") as core_out:
+    for assembly, positions in sorted(by_asm.items()):
         # Find genome file for this assembly
         asm_dir = os.path.join(genome_dir, assembly)
         if not os.path.isdir(asm_dir):
@@ -114,20 +117,29 @@ with open(out_path, "w") as out:
             # Always orient transposase on + strand
             if p["strand"] == "-":
                 extracted = revcomp(extracted)
+                core_s, core_e = ext_end - p["end"], ext_end - (p["start"] - 1)
+            else:
+                core_s, core_e = (p["start"] - 1) - ext_start, p["end"] - ext_start
 
+            # core=: the transposase gene inside this record (0-based half-open),
+            # read by ref_core_coverage.py
             header = (f">{p['protein_id']} asm={assembly} contig={p['contig']} "
                       f"tnp_pos={p['start']}-{p['end']} strand={p['strand']} "
-                      f"len={len(extracted)} flank={flank}")
+                      f"len={len(extracted)} flank={flank} core={core_s}-{core_e}")
             out.write(header + "\n")
             for i in range(0, len(extracted), 80):
                 out.write(extracted[i:i+80] + "\n")
+            core_out.write(f">{p['protein_id']}\n{extracted[core_s:core_e]}\n")
             n_extracted += 1
+
+os.replace(out_path + ".tmp", out_path)
+os.replace(core_path + ".tmp", core_path)
 
 print(f"  Sequences extracted: {n_extracted:,}")
 PYEOF
 fi
 
-N_EXT=$(grep -c '^>' "$EXTRACTED")
+N_EXT=$(grep -c '^>' "$EXTRACTED" || true)
 echo "  Total: $N_EXT ($(du -h "$EXTRACTED" | cut -f1))"
 echo "Step 1 done: $(date)"
 echo ""
@@ -146,20 +158,29 @@ for IDENT in 0.95; do
         continue
     fi
 
-    echo "Step 2 (${PCT}% id): Clustering with mmseqs2..."
+    # Clustered on the transposase gene, not on gene + 4 kb of flank: with the
+    # flanks, two identical IS in different places were two "families" and two
+    # IS 10% apart in the same place were one.
+    echo "Step 2 (${PCT}% id): Clustering the IS core with mmseqs2..."
     mmseqs easy-linclust \
-        "$EXTRACTED" \
+        "$CORE" \
         "${OUTDIR}/cluster_${PCT}" \
         "${OUTDIR}/mmseqs_tmp_${PCT}" \
         --min-seq-id "$IDENT" -c 0.80 --cov-mode 0 \
         --threads "$CPUS" \
         > "${OUTDIR}/mmseqs_${PCT}.log" 2>&1
-    mv "${OUTDIR}/cluster_${PCT}_rep_seq.fasta" "$REPS"
     mv "${OUTDIR}/cluster_${PCT}_cluster.tsv" "$CLUSTER"
+    # representatives = the flanked records of the representative cores
+    cut -f1 "$CLUSTER" | sort -u > "${OUTDIR}/cluster_${PCT}_rep_ids.txt"
+    awk 'NR==FNR { keep[$1]=1; next }
+         /^>/ { on = (substr($1,2) in keep) } on' \
+        "${OUTDIR}/cluster_${PCT}_rep_ids.txt" "$EXTRACTED" > "$REPS.tmp"
+    mv "$REPS.tmp" "$REPS"
+    rm -f "${OUTDIR}/cluster_${PCT}_rep_seq.fasta"
     rm -rf "${OUTDIR}/mmseqs_tmp_${PCT}"
     rm -f "${OUTDIR}/cluster_${PCT}_all_seqs.fasta"
 
-    N_REPS=$(grep -c '^>' "$REPS")
+    N_REPS=$(grep -c '^>' "$REPS" || true)
     echo "  ${PCT}% id reps: $N_REPS"
 done
 

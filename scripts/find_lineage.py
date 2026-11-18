@@ -10,7 +10,10 @@ Steps:
   2. Group observations per IS110 query
   3. Within each query, bucket target contigs by split count (0, 1, 2, ...)
   4. For each non-zero split group, extract inserted sequences from Logan contigs
-  5. Check nesting: do N-split insertions include (N-1)-split insertions?
+  5. Check nesting: an observation with N insertions is "supported" by one
+     with N-1 when it carries all of that one's insertions (same sequence
+     cluster, same place in the IS). Insertions of all levels are clustered
+     together. A different number of insertions alone is NOT a lineage.
 
 Usage:
     python find_lineage.py <chains_tsv> <logan_dir> <output_prefix>
@@ -26,7 +29,7 @@ import tempfile
 from collections import defaultdict, Counter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from paf_utils import aligned_identity  # noqa: E402
+from paf_utils import aligned_identity, aligned_query_bases  # noqa: E402
 
 
 def parse_args():
@@ -131,6 +134,9 @@ def cluster_sequences(seqs, identity_thresh, threads):
              "-t", str(threads), fa_path, fa_path],
             capture_output=True, text=True
         )
+        if result.returncode != 0:
+            # a failed run gave "every sequence its own cluster"
+            raise RuntimeError(f"minimap2 failed ({result.returncode}): {result.stderr[-500:]}")
         # Union-find clustering
         parent = list(range(len(seqs)))
 
@@ -157,10 +163,11 @@ def cluster_sequences(seqs, identity_thresh, threads):
                 continue
             qi = int(qname[1:])
             ti = int(tname[1:])
-            # require substantial overlap of the smaller sequence
-            qs, qe = int(c[2]), int(c[3])
-            qlen = int(c[1])
-            if (qe - qs) / qlen < 0.7:
+            # 70% of the SMALLER sequence aligned. ava-ont prints each pair in
+            # one direction only; testing the query alone made the result
+            # depend on the order of the input ([1000, 2500] one cluster,
+            # [2500, 1000] two).
+            if aligned_query_bases(c) / min(int(c[1]), int(c[6])) < 0.7:
                 continue
             union(qi, ti)
 
@@ -184,28 +191,58 @@ def cluster_sequences(seqs, identity_thresh, threads):
         os.remove(fa_path)
 
 
+JUNCTION_TOL = 30      # bp on the IS: same insertion point
+
+
+def nesting_parent(child, parents):
+    """Index of an observation in `parents` whose insertions are ALL present
+    in `child` (same sequence cluster at the same place in the IS), child
+    having exactly one more; None if there is none."""
+    for k, par in enumerate(parents):
+        if len(child) != len(par) + 1:
+            continue
+        left = list(child)
+        ok = True
+        for cid, pos in par:
+            hit = next((x for x in left if x[0] == cid and abs(x[1] - pos) <= JUNCTION_TOL), None)
+            if hit is None:
+                ok = False
+                break
+            left.remove(hit)
+        if ok:
+            return k
+    return None
+
+
 def main():
     args = parse_args()
 
     print(f"Loading chains from {args.chains_tsv}")
-    # Parse chains TSV
     rows_by_query = defaultdict(list)
-    total_rows = 0
+    total_rows = skipped = 0
     with open(args.chains_tsv) as f:
         for r in csv.DictReader(f, delimiter="\t"):
             total_rows += 1
-            n_splits = int(r["n_splits"])
-            # Skip zero-split for now (load them separately if needed)
+            status = r.get("status") or ("intact" if int(r["n_splits"]) == 0 else "variant")
+            types = [t for t in r["event_types"].split(",") if t]
+            # A ladder is a series of INSERTIONS. Rows with a deletion or an
+            # unresolved junction, and partial copies, are not rungs of it
+            # (their split count used to be put in the same buckets).
+            if status == "partial" or any(t not in ("insertion", "intact") for t in types):
+                skipped += 1
+                continue
             rows_by_query[r["query"]].append({
                 "tname": r["target"],
                 "tlen": int(r["tlen"]),
                 "strand": r["strand"],
-                "n_splits": n_splits,
+                "n_splits": sum(t == "insertion" for t in types),
                 "segments": parse_segments(r["segments"]),
             })
-    print(f"  Loaded {total_rows:,} rows, {len(rows_by_query):,} unique queries")
+    print(f"  Loaded {total_rows:,} rows ({skipped:,} partial / deletion rows not used), "
+          f"{len(rows_by_query):,} unique queries")
 
-    # Filter to queries with a "ladder": observations at >= min_ladder_depth different split counts
+    # Candidate ladders: observations at >= min_ladder_depth different insertion counts.
+    # This is only a candidate: different counts say nothing about inheritance.
     ladders = {}
     for qname, obs in rows_by_query.items():
         counts = Counter(o["n_splits"] for o in obs)
@@ -213,98 +250,119 @@ def main():
             ladders[qname] = {k: [o for o in obs if o["n_splits"] == k]
                               for k in sorted(counts.keys())}
 
-    print(f"  Queries with ladder depth >= {args.min_ladder_depth}: {len(ladders)}")
+    print(f"  Queries with >= {args.min_ladder_depth} different insertion counts "
+          f"(candidate ladders): {len(ladders)}")
     print()
 
-    # Write a summary of ladders
-    ladder_path = f"{args.output_prefix}_ladders_summary.tsv"
-    with open(ladder_path, "w") as f:
-        f.write("query\tmax_splits\tn_split_levels\tobs_per_level\ttotal_observations\n")
-        for qname, levels in sorted(ladders.items(), key=lambda x: -max(x[1].keys())):
-            obs_counts = ",".join(f"V{k}:{len(v)}" for k, v in levels.items())
-            total = sum(len(v) for v in levels.values())
-            f.write(f"{qname}\t{max(levels.keys())}\t{len(levels)}\t{obs_counts}\t{total}\n")
-    print(f"Ladder summary: {ladder_path}")
+    order = sorted(ladders.items(),
+                   key=lambda x: (-max(x[1].keys()), -sum(len(v) for v in x[1].values()), x[0]))
+    support = {}        # qname -> (supported depth, n supported edges) for examined ladders
 
-    # For each ladder, extract insertions and check for nesting
-    # Process the deepest ladders first
     nesting_path = f"{args.output_prefix}_nesting.tsv"
     with open(nesting_path, "w") as out:
         out.write("query\tmax_splits\tlevel\tn_example\texample_target\tstrand\t"
-                  "insertion_lengths\tinsertion_clusters\tinsertion_sequences\n")
+                  "insertion_lengths\tinsertion_clusters\tinsertion_positions\t"
+                  "parent_example\tinsertion_sequences\n")
 
-        for qname, levels in sorted(ladders.items(),
-                                    key=lambda x: (-max(x[1].keys()), -sum(len(v) for v in x[1].values())))[:30]:
-            print(f"\n=== {qname[:20]}... (max splits: {max(levels.keys())}, levels: {len(levels)}) ===")
-            for n_split in sorted(levels.keys()):
-                if n_split == 0:
-                    # Intact: no insertions; skip but record
-                    obs = levels[n_split][:args.max_ins_examples]
-                    for i, o in enumerate(obs):
-                        out.write(f"{qname}\t{max(levels.keys())}\t{n_split}\t{i}\t{o['tname']}\t"
-                                  f"{o['strand']}\tintact\tintact\t\n")
-                    continue
-
-                obs = levels[n_split][:args.max_ins_examples]
-                # Extract inserted sequences from each observation
-                all_ins_seqs = []
-                all_ins_meta = []
-                for i, o in enumerate(obs):
-                    sample = accession_from_contig(o["tname"])
-                    zst = os.path.join(args.logan_dir, f"{sample}.contigs.fa.zst")
-                    if not os.path.exists(zst):
+        for qname, levels in order[:30]:
+            print(f"\n=== {qname[:20]}... (max insertions: {max(levels.keys())}, levels: {len(levels)}) ===")
+            # 1. collect the insertions of the examined observations of ALL levels
+            examined = {}                      # level -> [obs dict with 'ins']
+            flat_seqs, flat_ref = [], []       # sequences to cluster, (level, obs idx, ins idx)
+            for n_split in sorted(levels):
+                examined[n_split] = []
+                for o in levels[n_split][:args.max_ins_examples]:
+                    rec = {"o": o, "ins": [], "ok": n_split == 0}
+                    if n_split > 0:
+                        sample = accession_from_contig(o["tname"])
+                        zst = os.path.join(args.logan_dir, f"{sample}.contigs.fa.zst")
+                        contig_seq = load_contig_sequence(zst, o["tname"]) if os.path.exists(zst) else None
+                        if contig_seq:
+                            rec["ok"] = True
+                            for ins in extract_insertions(o["segments"], o["strand"]):
+                                seq = contig_seq[ins["ts"]:ins["te"]]
+                                if o["strand"] == "-":
+                                    seq = seq.translate(str.maketrans("ACGTacgt", "TGCAtgca"))[::-1]
+                                rec["ins"].append({"len": ins["len"], "pos": ins["qs_before"],
+                                                   "seq": seq, "cluster": None})
+                    examined[n_split].append(rec)
+                    for j, ins in enumerate(rec["ins"]):
+                        if len(ins["seq"]) >= 200:
+                            flat_seqs.append(ins["seq"])
+                            flat_ref.append(ins)
+            # 2. ONE clustering over all levels, so that cluster ids can be
+            #    compared between levels (each level used to be clustered on
+            #    its own: "cluster 0" of V1 and of V2 were unrelated)
+            cluster_ids, _ = cluster_sequences(flat_seqs, args.cluster_identity, args.threads)
+            for ins, cid in zip(flat_ref, cluster_ids):
+                ins["cluster"] = cid
+            n_extra = 0
+            for recs in examined.values():
+                for rec in recs:
+                    for ins in rec["ins"]:
+                        if ins["cluster"] is None:        # too short to cluster: its own group
+                            n_extra += 1
+                            ins["cluster"] = -n_extra
+            # 3. nesting: an observation with N insertions is supported by one
+            #    with N-1 if it contains all of that one's insertions
+            edges = 0
+            reach = {}                         # (level, idx) -> length of supported path ending here
+            for n_split in sorted(examined):
+                for i, rec in enumerate(examined[n_split]):
+                    rec["parent"] = None
+                    reach[(n_split, i)] = 1
+                    prev = examined.get(n_split - 1)
+                    if not rec["ok"] or not prev:
                         continue
-                    contig_seq = load_contig_sequence(zst, o["tname"])
-                    if not contig_seq:
+                    cand = [(k, p) for k, p in enumerate(prev) if p["ok"]]
+                    key = [(x["cluster"], x["pos"]) for x in rec["ins"]]
+                    k = nesting_parent(key, [[(x["cluster"], x["pos"]) for x in p["ins"]]
+                                             for _, p in cand])
+                    if k is not None:
+                        rec["parent"] = cand[k][0]
+                        edges += 1
+                        reach[(n_split, i)] = reach[(n_split - 1, cand[k][0])] + 1
+            depth = max(reach.values()) if reach else 0
+            support[qname] = (depth, edges)
+            print(f"  supported nesting edges: {edges}; longest supported chain: {depth} levels")
+            for n_split in sorted(examined):
+                for i, rec in enumerate(examined[n_split]):
+                    o = rec["o"]
+                    if n_split == 0:
+                        out.write(f"{qname}\t{max(levels)}\t0\t{i}\t{o['tname']}\t{o['strand']}\t"
+                                  f"intact\tintact\t\t\t\n")
                         continue
-                    inss = extract_insertions(o["segments"], o["strand"])
-                    ins_seqs = []
-                    ins_lens = []
-                    for ins in inss:
-                        ins_lens.append(ins["len"])
-                        s = contig_seq[ins["ts"]:ins["te"]]
-                        if o["strand"] == "-":
-                            comp = str.maketrans("ACGTacgt", "TGCAtgca")
-                            s = s.translate(comp)[::-1]
-                        ins_seqs.append(s)
-                    all_ins_seqs.append((i, o, ins_seqs, ins_lens))
+                    if not rec["ok"]:
+                        out.write(f"{qname}\t{max(levels)}\t{n_split}\t{i}\t{o['tname']}\t{o['strand']}\t"
+                                  f"NA\tNA\tNA\tcontig_not_found\t\n")
+                        continue
+                    par = "" if rec["parent"] is None else str(rec["parent"])
+                    out.write(
+                        f"{qname}\t{max(levels)}\t{n_split}\t{i}\t{o['tname']}\t{o['strand']}\t"
+                        + ",".join(str(x["len"]) for x in rec["ins"]) + "\t"
+                        + ",".join(str(x["cluster"]) for x in rec["ins"]) + "\t"
+                        + ",".join(str(x["pos"]) for x in rec["ins"]) + "\t" + par + "\t"
+                        + ";".join(x["seq"][:40] + ("..." if len(x["seq"]) > 40 else "")
+                                   for x in rec["ins"]) + "\n")
 
-                if not all_ins_seqs:
-                    continue
-
-                # Flatten all insertion sequences across this level
-                flat_seqs = []
-                index_map = []  # (obs_idx, within_obs_idx)
-                for obs_idx, o, seqs, _ in all_ins_seqs:
-                    for j, s in enumerate(seqs):
-                        if len(s) >= 200:
-                            flat_seqs.append(s)
-                            index_map.append((obs_idx, j))
-
-                # Cluster them
-                cluster_ids, reps = cluster_sequences(flat_seqs, args.cluster_identity, args.threads)
-
-                # Report
-                print(f"\n  V{n_split}: {len(levels[n_split])} observations (examples: {len(obs)})")
-                cluster_summary = Counter(cluster_ids) if cluster_ids else Counter()
-                print(f"    Inserted sequence clusters: {len(cluster_summary)}")
-                for cid, cnt in cluster_summary.most_common():
-                    print(f"      Cluster {cid}: {cnt} occurrences (rep len={len(reps[cid])})")
-
-                # Write per-observation row
-                # Build cluster membership per observation
-                per_obs_clusters = defaultdict(list)
-                for idx, (obs_idx, j) in enumerate(index_map):
-                    per_obs_clusters[obs_idx].append(cluster_ids[idx])
-
-                for obs_idx, o, seqs, ins_lens in all_ins_seqs:
-                    clusters_str = ",".join(str(c) for c in per_obs_clusters.get(obs_idx, []))
-                    lens_str = ",".join(str(l) for l in ins_lens)
-                    seqs_preview = ";".join(s[:40] + "..." if len(s) > 40 else s for s in seqs)
-                    out.write(f"{qname}\t{max(levels.keys())}\t{n_split}\t{obs_idx}\t"
-                              f"{o['tname']}\t{o['strand']}\t{lens_str}\t{clusters_str}\t{seqs_preview}\n")
-
-    print(f"\nNesting details: {nesting_path}")
+    # Ladder summary. `supported_depth` = longest chain of observations in
+    # which each contains all insertions of the one before plus one (only for
+    # the 30 deepest candidates, and only among the first --max-ins-examples
+    # observations per level; NA = not examined).
+    ladder_path = f"{args.output_prefix}_ladders_summary.tsv"
+    with open(ladder_path, "w") as f:
+        f.write("query\tmax_splits\tn_split_levels\tobs_per_level\ttotal_observations\t"
+                "supported_depth\tsupported_edges\n")
+        for qname, levels in order:
+            obs_counts = ",".join(f"V{k}:{len(v)}" for k, v in levels.items())
+            total = sum(len(v) for v in levels.values())
+            d, e = support.get(qname, ("NA", "NA"))
+            f.write(f"{qname}\t{max(levels.keys())}\t{len(levels)}\t{obs_counts}\t{total}\t{d}\t{e}\n")
+    print(f"\nLadder summary: {ladder_path}")
+    n_sup = sum(1 for d, _ in support.values() if d >= args.min_ladder_depth)
+    print(f"Candidate ladders examined: {len(support)}; with a supported chain of "
+          f">= {args.min_ladder_depth} levels: {n_sup}")
+    print(f"Nesting details: {nesting_path}")
 
 
 if __name__ == "__main__":
